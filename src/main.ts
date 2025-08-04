@@ -802,24 +802,26 @@ function animate(time: number): void {
   if (eventQueue) {
     handleJumping();
     handleMovement();
-    let collisionCount = 0;
+    let processedHexagon = false;
     eventQueue.drainCollisionEvents((handle1: number, handle2: number, started: boolean) => {
-      if (started && collisionCount < 10) {
-        collisionCount++;
+      if (started && !processedHexagon && ballCollider) {
         const collider1: RAPIER.Collider = world!.getCollider(handle1);
         const collider2: RAPIER.Collider = world!.getCollider(handle2);
-        const hexagon = hexagonsClient.find((h) => h.collider === collider1 || h.collider === collider2);
-        if (hexagon && !hexagon.isBreaking) {
-          hexagon.collisionCount++;
-          canJump = true;
-          if (hexagon.collisionCount === 1 && ballCollider) {
-            ballCollider.setRestitution(0);
-          }
-          if (hexagon.collisionCount >= 3) {
-            breakHexagon(hexagon);
-            if (socket && gameId) {
-              const index = hexagonsClient.indexOf(hexagon);
-              socket.emit('break-hexagon', { gameId, index });
+        if (collider1 === ballCollider || collider2 === ballCollider) {
+          const hexagon = hexagonsClient.find((h) => h.collider === (collider1 === ballCollider ? collider2 : collider1));
+          if (hexagon && !hexagon.isBreaking) {
+            processedHexagon = true; // Process only one hexagon collision per frame
+            hexagon.collisionCount++;
+            canJump = true;
+            if (hexagon.collisionCount === 1) {
+              ballCollider.setRestitution(0);
+            }
+            if (hexagon.collisionCount >= 3) {
+              breakHexagon(hexagon);
+              if (socket && gameId) {
+                const index = hexagonsClient.indexOf(hexagon);
+                socket.emit('break-hexagon', { gameId, index });
+              }
             }
           }
         } else {
