@@ -802,15 +802,14 @@ function animate(time: number): void {
   if (eventQueue) {
     handleJumping();
     handleMovement();
-    let processedHexagon = false;
     eventQueue.drainCollisionEvents((handle1: number, handle2: number, started: boolean) => {
-      if (started && !processedHexagon && ballCollider) {
+      if (started && ballCollider && !isSpectating) {
         const collider1: RAPIER.Collider = world!.getCollider(handle1);
         const collider2: RAPIER.Collider = world!.getCollider(handle2);
         if (collider1 === ballCollider || collider2 === ballCollider) {
-          const hexagon = hexagonsClient.find((h) => h.collider === (collider1 === ballCollider ? collider2 : collider1));
-          if (hexagon && !hexagon.isBreaking) {
-            processedHexagon = true; // Process only one hexagon collision per frame
+          const hexagonCollider = collider1 === ballCollider ? collider2 : collider1;
+          const hexagon = hexagonsClient.find((h) => h.collider === hexagonCollider && !h.isBreaking);
+          if (hexagon) {
             hexagon.collisionCount++;
             canJump = true;
             if (hexagon.collisionCount === 1) {
@@ -823,6 +822,7 @@ function animate(time: number): void {
                 socket.emit('break-hexagon', { gameId, index });
               }
             }
+            return; // Exit loop after processing one valid player-hexagon collision
           }
         } else {
           const player1 = Object.values(playersClient).find((p) => p.collider === collider1);
