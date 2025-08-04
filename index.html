@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="icon" type="image/png" href="/images/logo.png">
+  <title>Bounce Royale</title>
+  <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    *[lang="fa"] {
+      font-family: 'Vazirmatn', sans-serif !important;
+    }
+
+    *[lang="en"] {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html,
+    body {
+      height: 100%;
+      background: radial-gradient(circle at center, #7b1fa2 0%, #4a0072 100%);
+      color: white;
+      overflow: hidden;
+      transition: direction 0.3s;
+    }
+
+    body {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      grid-template-columns: auto 1fr;
+      grid-template-areas:
+        "header header"
+        "sidebar main";
+    }
+
+    header {
+      grid-area: header;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.75rem 1.5rem;
+      background-color: #ab47d0;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+      z-index: 10;
+    }
+
+    #logo {
+      height: 108px;
+    }
+
+    #lang-switch {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    .lang-btn {
+      cursor: pointer;
+      background: rgba(255, 255, 255, 0.1);
+      border: none;
+      color: white;
+      padding: 0.5rem 1rem;
+      font-size: 1rem;
+      font-weight: bold;
+      border-radius: 6px;
+      touch-action: manipulation;
+      min-width: 48px;
+      min-height: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.3s;
+    }
+
+    .lang-btn:hover {
+      background: rgba(255, 255, 255, 0.3);
+    }
+
+    .star {
+      position: absolute;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: radial-gradient(white, rgba(255, 255, 255, 0.2));
+      box-shadow:
+        0 0 12px rgba(255, 255, 255, 0.8),
+        0 0 24px rgba(255, 255, 255, 0.5),
+        0 0 48px rgba(255, 255, 255, 0.2);
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+      transition: transform 0.05s ease-out;
+      animation: twinkle 2s infinite ease-in-out alternate;
+      mix-blend-mode: screen;
+    }
+
+    @keyframes twinkle {
+      0% {
+        transform: scale(1) translate(-50%, -50%);
+        opacity: 0.9;
+      }
+
+      100% {
+        transform: scale(1.4) translate(-50%, -50%);
+        opacity: 1;
+      }
+    }
+
+    aside {
+      grid-area: sidebar;
+      background-color: rgba(255, 255, 255, 0.05);
+      width: 260px;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      padding: 1.5rem 1rem;
+      backdrop-filter: blur(10px);
+      border-right: 2px solid rgba(255, 255, 255, 0.1);
+    }
+
+    nav ul {
+      list-style: none;
+      width: 100%;
+    }
+
+    nav li {
+      font-size: 1.25rem;
+      padding: 1rem 1.5rem;
+      margin-bottom: 0.75rem;
+      background-color: rgba(255, 255, 255, 0.08);
+      border-radius: 8px;
+      transition: background-color 0.3s, transform 0.2s;
+      cursor: pointer;
+      touch-action: manipulation;
+      min-height: 48px;
+      display: flex;
+      align-items: center;
+    }
+
+    nav li:hover {
+      background-color: rgba(255, 255, 255, 0.15);
+      transform: translateX(6px);
+    }
+
+    nav li:active {
+      background-color: rgba(255, 255, 255, 0.25);
+    }
+
+    main {
+      grid-area: main;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+
+    .content-box {
+      text-align: center;
+      max-width: 500px;
+    }
+
+    .content-box h1 {
+      font-size: 2rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .content-box p {
+      font-size: 1rem;
+      color: #ddd;
+      margin-bottom: 1rem;
+    }
+
+    .content-box nav {
+      display: none;
+    }
+
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 5;
+    }
+
+    .joystick,
+    .jump-button {
+      position: absolute;
+      background: rgba(0, 0, 0, 0.3);
+      border: 2px solid rgba(255, 255, 255, 0.5);
+      border-radius: 50%;
+      touch-action: none;
+      z-index: 10;
+    }
+
+    .joystick {
+      left: 20px;
+      bottom: 20px;
+      width: 100px;
+      height: 100px;
+    }
+
+    .joystick-inner {
+      width: 40px;
+      height: 40px;
+      background: rgba(255, 255, 255, 0.7);
+      border-radius: 50%;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      transition: transform 0.1s;
+    }
+
+    .jump-button {
+      bottom: 20px;
+      right: 20px;
+      width: 70px;
+      height: 70px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-size: 1rem;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+
+    .modal {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.7);
+      z-index: 20;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .modal-content {
+      background: #2e004f;
+      padding: 2rem;
+      border-radius: 12px;
+      max-width: 90%;
+      width: 400px;
+      text-align: center;
+      color: white;
+    }
+
+    .modal-content h2 {
+      font-size: 1.5rem;
+      margin-bottom: 1rem;
+    }
+
+    .modal-content button {
+      display: block;
+      width: 100%;
+      padding: 0.75rem;
+      margin: 0.5rem 0;
+      background: rgba(255, 255, 255, 0.1);
+      border: none;
+      color: white;
+      font-size: 1rem;
+      border-radius: 8px;
+      cursor: pointer;
+      touch-action: manipulation;
+      min-height: 48px;
+    }
+
+    .modal-content button:hover {
+      background: rgba(255, 255, 255, 0.3);
+    }
+
+    .modal-content input {
+      width: 100%;
+      padding: 0.5rem;
+      margin: 0.5rem 0;
+      border: none;
+      border-radius: 8px;
+      font-size: 1rem;
+      background: rgba(255, 255, 255, 0.1);
+      color: white;
+    }
+
+    .modal-content input::placeholder {
+      color: #aaa;
+    }
+
+    .modal-content ul {
+      list-style: none;
+      max-height: 200px;
+      overflow-y: auto;
+      margin: 1rem 0;
+    }
+
+    .modal-content li {
+      padding: 0.5rem;
+      background: rgba(255, 255, 255, 0.08);
+      margin-bottom: 0.5rem;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+
+    .modal-content li:hover {
+      background: rgba(255, 255, 255, 0.15);
+    }
+
+    .countdown {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 3rem;
+      color: white;
+      text-shadow: 0 0 10px rgba(0, 0, 0, 0.8);
+      z-index: 30;
+      display: block;
+      opacity: 1;
+      pointer-events: none;
+    }
+
+    [dir="rtl"] {
+      direction: rtl;
+    }
+
+    [dir="rtl"] aside {
+      border-right: none;
+      border-left: 2px solid rgba(255, 255, 255, 0.1);
+      align-items: flex-end;
+    }
+
+    [dir="rtl"] nav li {
+      text-align: right;
+    }
+
+    [dir="rtl"] main .content-box {
+      text-align: right;
+    }
+
+    [dir="rtl"] .modal-content {
+      text-align: right;
+    }
+
+    @media (max-width: 768px) {
+      body {
+        display: flex;
+        flex-direction: column;
+      }
+
+      header {
+        padding: 0.5rem 1rem;
+        justify-content: space-between;
+      }
+
+      #logo {
+        height: 64px;
+      }
+
+      aside {
+        display: none;
+      }
+
+      main {
+        padding: 1rem;
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 1rem;
+      }
+
+      .content-box {
+        text-align: center;
+        max-width: 100%;
+      }
+
+      .content-box h1 {
+        font-size: 1.5rem;
+      }
+
+      .content-box p {
+        font-size: 0.9rem;
+      }
+
+      .content-box nav {
+        display: block;
+        width: 100%;
+        max-width: 300px;
+      }
+
+      .content-box nav ul {
+        padding: 0;
+        margin: 0;
+      }
+
+      .content-box nav li {
+        font-size: 1rem;
+        padding: 0.75rem 1rem;
+        margin-bottom: 0.5rem;
+        min-height: 44px;
+        text-align: center;
+      }
+
+      canvas {
+        z-index: 5;
+      }
+
+      .modal-content {
+        padding: 1.5rem;
+        width: 90%;
+      }
+
+      .modal-content h2 {
+        font-size: 1.25rem;
+      }
+
+      .modal-content button {
+        font-size: 0.9rem;
+      }
+
+      .modal-content input {
+        font-size: 0.9rem;
+      }
+
+      .countdown {
+        font-size: 2rem;
+      }
+    }
+
+    @media (min-width: 769px) {
+      .content-box nav {
+        display: none;
+      }
+    }
+
+    .hidden {
+      display: none !important;
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <img src="/images/logo.png" alt="Bounce Royale Logo" id="logo" />
+    <div id="lang-switch">
+      <button class="lang-btn" data-lang="en">EN</button>
+      <button class="lang-btn" data-lang="fa">فا</button>
+    </div>
+    <div class="star" id="star"></div>
+  </header>
+
+  <aside>
+    <nav>
+      <ul>
+        <li id="start-game" data-en="🏁 Start Game" data-fa="🏁 شروع بازی">🏁 Start Game</li>
+        <li data-en="⚙️ Settings" data-fa="⚙️ تنظیمات">⚙️ Settings</li>
+        <li data-en="❓ About" data-fa="❓ درباره بازی">❓ About</li>
+        <li data-en="📜 Credits" data-fa="📜 سازندگان">📜 Credits</li>
+        <li data-en="🚪 Exit" data-fa="🚪 خروج">🚪 Exit</li>
+      </ul>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-box">
+      <h1 id="main-title" data-en="Welcome to Bounce Royale!" data-fa="به بونس رویال خوش آمدید!">Welcome to Bounce
+        Royale!</h1>
+      <p id="main-desc" data-en="Prepare to bounce, survive, and become the last one standing!"
+        data-fa="بپر، زنده بمون، و آخرین نفر باقی‌مونده باش!">Prepare to bounce, survive, and become the last one
+        standing!</p>
+      <nav>
+        <ul>
+          <li id="start-game-mobile" data-en="🏁 Start Game" data-fa="🏁 شروع بازی">🏁 Start Game</li>
+          <li data-en="⚙️ Settings" data-fa="⚙️ تنظیمات">⚙️ Settings</li>
+          <li data-en="❓ About" data-fa="❓ درباره بازی">❓ About</li>
+          <li data-en="📜 Credits" data-fa="📜 سازندگان">📜 Credits</li>
+          <li data-en="🚪 Exit" data-fa="🚪 خروج">🚪 Exit</li>
+        </ul>
+      </nav>
+    </div>
+  </main>
+
+  <div class="modal" id="game-mode-modal">
+    <div class="modal-content">
+      <h2 data-en="Select Game Mode" data-fa="انتخاب حالت بازی">Select Game Mode</h2>
+      <button id="single-player" data-en="Single Player" data-fa="تک‌نفره">Single Player</button>
+      <button id="join-game" data-en="Join Game" data-fa="پیوستن به بازی">Join Game</button>
+      <button id="create-game" data-en="Create Game" data-fa="ایجاد بازی">Create Game</button>
+    </div>
+  </div>
+
+  <div class="modal" id="join-game-modal">
+    <div class="modal-content">
+      <h2 data-en="Join Game" data-fa="پیوستن به بازی">Join Game</h2>
+      <h3 data-en="LAN Games" data-fa="بازی‌های شبکه محلی">LAN Games</h3>
+      <ul id="lan-games"></ul>
+      <h3 data-en="Manual Connect" data-fa="اتصال دستی">Manual Connect</h3>
+      <input type="text" id="server-ip" placeholder="Enter IP (e.g., 192.168.1.100:8443)"
+        data-en="Enter IP (e.g., 192.168.1.100:8443)" data-fa="آی‌پی را وارد کنید (مثال: 192.168.1.100:8443)">
+      <button id="connect-manual" data-en="Connect" data-fa="اتصال">Connect</button>
+      <button id="join-cancel" data-en="Cancel" data-fa="لغو">Cancel</button>
+    </div>
+  </div>
+
+  <div class="modal" id="create-game-modal">
+    <div class="modal-content">
+      <h2 data-en="Create Game" data-fa="ایجاد بازی">Create Game</h2>
+      <label for="start-timer" data-en="Start Timer (seconds, 5-60):" data-fa="تایمر شروع (ثانیه، 5-60):">Start Timer
+        (seconds, 5-60):</label>
+      <input type="number" id="start-timer" min="5" max="60" value="30" data-en="Enter seconds"
+        data-fa="ثانیه را وارد کنید">
+      <button id="start-game-confirm" data-en="Start Game" data-fa="شروع بازی">Start Game</button>
+      <button id="create-cancel" data-en="Cancel" data-fa="لغو">Cancel</button>
+    </div>
+  </div>
+
+  <div class="modal" id="pause-modal">
+    <div class="modal-content">
+      <h2 data-en="Game Paused" data-fa="بازی متوقف شده است">Game Paused</h2>
+      <button id="resume-game" data-en="Resume" data-fa="ادامه">Resume</button>
+      <button id="exit-game" data-en="Exit to Menu" data-fa="خروج به منو">Exit to Menu</button>
+    </div>
+  </div>
+
+  <div class="countdown" id="countdown"></div>
+
+  <script>
+    // Star effect for header
+    const header = document.querySelector('header');
+    const star = document.getElementById('star');
+
+    function updateStarPosition(x, y) {
+      const rect = header.getBoundingClientRect();
+      const clampedX = Math.max(rect.left, Math.min(rect.right, x));
+      const clampedY = Math.max(rect.top, Math.min(rect.bottom, y));
+      star.style.left = `${clampedX - rect.left}px`;
+      star.style.top = `${clampedY - rect.top}px`;
+    }
+
+    header.addEventListener('mousemove', (e) => {
+      updateStarPosition(e.clientX, e.clientY);
+    });
+
+    header.addEventListener('touchmove', (e) => {
+      e.preventDefault();
+      const touch = e.touches[0];
+      updateStarPosition(touch.clientX, touch.clientY);
+    }, { passive: false });
+
+    // Language switch logic
+    const langButtons = document.querySelectorAll('.lang-btn');
+    langButtons.forEach(btn => {
+      btn.addEventListener('click', () => {
+        const lang = btn.getAttribute('data-lang');
+        document.documentElement.lang = lang;
+        document.documentElement.dir = lang === 'fa' ? 'rtl' : 'ltr';
+        document.querySelectorAll('[data-en]').forEach(el => {
+          el.textContent = el.getAttribute(`data-${lang}`);
+          if (el.tagName === 'INPUT') {
+            el.placeholder = el.getAttribute(`data-${lang}`);
+          }
+        });
+      });
+    });
+
+    // Game mode modal
+    const gameModeModal = document.getElementById('game-mode-modal');
+    const joinGameModal = document.getElementById('join-game-modal');
+    const createGameModal = document.getElementById('create-game-modal');
+    const pauseModal = document.getElementById('pause-modal');
+    const startGameBtn = document.getElementById('start-game');
+    const startGameMobileBtn = document.getElementById('start-game-mobile');
+    const singlePlayerBtn = document.getElementById('single-player');
+    const joinGameBtn = document.getElementById('join-game');
+    const createGameBtn = document.getElementById('create-game');
+    const connectManualBtn = document.getElementById('connect-manual');
+    const joinCancelBtn = document.getElementById('join-cancel');
+    const startGameConfirmBtn = document.getElementById('start-game-confirm');
+    const createCancelBtn = document.getElementById('create-cancel');
+    const resumeGameBtn = document.getElementById('resume-game');
+    const exitGameBtn = document.getElementById('exit-game');
+    const serverIpInput = document.getElementById('server-ip');
+    const startTimerInput = document.getElementById('start-timer');
+    const lanGamesList = document.getElementById('lan-games');
+
+    startGameBtn.addEventListener('click', () => {
+      gameModeModal.style.display = 'flex';
+    });
+
+    startGameMobileBtn.addEventListener('click', () => {
+      gameModeModal.style.display = 'flex';
+    });
+
+    singlePlayerBtn.addEventListener('click', () => {
+      gameModeModal.style.displayH
+      start('single');
+    });
+
+    joinGameBtn.addEventListener('click', () => {
+      gameModeModal.style.display = 'none';
+      joinGameModal.style.display = 'flex';
+      discoverLAN();
+    });
+
+    createGameBtn.addEventListener('click', () => {
+      gameModeModal.style.display = 'none';
+      createGameModal.style.display = 'flex';
+    });
+
+    connectManualBtn.addEventListener('click', () => {
+      const ip = serverIpInput.value.trim();
+      if (ip) {
+        joinGameModal.style.display = 'none';
+        start('join', ip);
+      }
+    });
+
+    joinCancelBtn.addEventListener('click', () => {
+      joinGameModal.style.display = 'none';
+    });
+
+    startGameConfirmBtn.addEventListener('click', () => {
+      const timer = parseInt(startTimerInput.value) || 30;
+      createGameModal.style.display = 'none';
+      start('create', null, timer);
+    });
+
+    createCancelBtn.addEventListener('click', () => {
+      createGameModal.style.display = 'none';
+    });
+
+    resumeGameBtn.addEventListener('click', () => {
+      pauseModal.style.display = 'none';
+      if (window.resumeGame) window.resumeGame();
+    });
+
+    exitGameBtn.addEventListener('click', () => {
+      pauseModal.style.display = 'none';
+      if (window.exitGame) window.exitGame();
+    });
+
+    // LAN discovery
+    function discoverLAN() {
+      const lang = document.documentElement.lang || 'en';
+      lanGamesList.innerHTML = `<li data-en="Searching..." data-fa="در حال جستجو...">${lang === 'en' ? 'Searching...' : 'در حال جستجو...'}</li>`;
+
+      fetch('https://game.safahanbattery.ir:8443/discover-lan')
+        .then(response => {
+          if (!response.ok) {
+            throw new Error('Network response was not ok');
+          }
+          return response.json();
+        })
+        .then(servers => {
+          lanGamesList.innerHTML = '';
+          if (!servers || servers.length === 0) {
+            lanGamesList.innerHTML = `<li data-en="No games found. Try manual connect." data-fa="بازی یافت نشد. اتصال دستی را امتحان کنید.">${lang === 'en' ? 'No games found. Try manual connect.' : 'بازی یافت نشد. اتصال دستی را امتحان کنید.'}</li>`;
+          } else {
+            servers.forEach(server => {
+              const li = document.createElement('li');
+              li.textContent = server.name || `Game at ${server.address}`;
+              li.setAttribute('data-en', server.name || `Game at ${server.address}`);
+              li.setAttribute('data-fa', server.name || `بازی در ${server.address}`);
+              li.addEventListener('click', () => {
+                joinGameModal.style.display = 'none';
+                start('join', server.address, null, server.gameId);
+              });
+              lanGamesList.appendChild(li);
+            });
+          }
+        })
+        .catch(error => {
+          console.error('LAN discovery error:', error);
+          lanGamesList.innerHTML = `<li data-en="Failed to search for games. Try manual connect." data-fa="خطا در جستجوی بازی‌ها. اتصال دستی را امتحان کنید.">${lang === 'en' ? 'Failed to search for games. Try manual connect.' : 'خطا در جستجوی بازی‌ها. اتصال دستی را امتحان کنید.'}</li>`;
+        });
+
+      setTimeout(() => {
+        if (lanGamesList.innerHTML.includes('Searching...') || lanGamesList.innerHTML.includes('در حال جستجو...')) {
+          lanGamesList.innerHTML = `<li data-en="No games found. Try manual connect." data-fa="بازی یافت نشد. اتصال دستی را امتحان کنید.">${lang === 'en' ? 'No games found. Try manual connect.' : 'بازی یافت نشد. اتصال دستی را امتحان کنید.'}</li>`;
+        }
+      }, 5000);
+    }
+
+    // Prevent default scrolling when game is active
+    document.addEventListener('touchmove', (e) => {
+      if (document.querySelector('canvas')) {
+        e.preventDefault();
+      }
+    }, { passive: false });
+  </script>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+
+</html>
