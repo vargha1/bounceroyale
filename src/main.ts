@@ -23,7 +23,9 @@ let eliminationCheckInterval: NodeJS.Timeout | null = null;
 let lastMovePosition: { x: number; y: number; z: number } | null = null;
 let lastMoveRotation: { x: number; y: number; z: number; w: number } | null = null;
 let lastFrameTime: number = performance.now();
-lastFrameTime == 1;
+lastFrameTime == null;
+let lastJumpTime: number = 0;
+const JUMP_COOLDOWN: number = 500;
 
 // Three.js and Rapier setup
 let scene: THREE.Scene;
@@ -34,6 +36,7 @@ let world: RAPIER.World | null = null;
 let eventQueue: RAPIER.EventQueue | null = null;
 let rigidBodies: { mesh: THREE.Mesh; rigidBody?: RAPIER.RigidBody; collider?: RAPIER.Collider }[] = [];
 let hexagonsClient: {
+  id: string;
   mesh: THREE.Mesh;
   rigidBody?: RAPIER.RigidBody;
   collider?: RAPIER.Collider;
@@ -74,9 +77,9 @@ const hexagonMaterial = new THREE.MeshStandardMaterial({
 });
 
 // Collision groups
-const ALL_INTERACTION = 0x00010001; // All objects (balls and hexagons) interact
+const ALL_INTERACTION = 0x00010001;
 
-function isMobileUserAgent() {
+function isMobileUserAgent(): boolean {
   const userAgent = navigator.userAgent;
   return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(userAgent);
 }
@@ -109,7 +112,6 @@ window.start = function start(gameMode: string, ip?: string, timer?: number, sel
   startTimer = timer || 30;
   gameId = selectedGameId || null;
 
-  // Hide UI elements
   document.querySelector('header')!.classList.add('hidden');
   document.querySelector('aside')!.classList.add('hidden');
   document.querySelector('main')!.classList.add('hidden');
@@ -117,14 +119,12 @@ window.start = function start(gameMode: string, ip?: string, timer?: number, sel
   document.getElementById('join-game-modal')!.style.display = 'none';
   document.getElementById('create-game-modal')!.style.display = 'none';
 
-  // Initialize Three.js
   scene = new THREE.Scene();
   camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
   renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
   renderer.setSize(window.innerWidth, window.innerHeight);
   document.body.appendChild(renderer.domElement);
 
-  // Initialize audio
   audioListener = new THREE.AudioListener();
   camera.add(audioListener);
   jumpSound = new THREE.Audio(audioListener);
@@ -139,18 +139,15 @@ window.start = function start(gameMode: string, ip?: string, timer?: number, sel
   camera.position.set(0, 5, 10);
   camera.lookAt(0, 0, 0);
 
-  // Add lighting
   const ambientLight: THREE.AmbientLight = new THREE.AmbientLight(0x404040);
   scene.add(ambientLight);
   const directionalLight: THREE.DirectionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
   directionalLight.position.set(0, 1, 0);
   scene.add(directionalLight);
 
-  // Initialize client
   init();
 };
 
-// Physics and rendering functions
 function initPhysics(): void {
   const gravity = { x: 0, y: -9.81, z: 0 };
   world = new RAPIER.World(gravity);
@@ -204,21 +201,23 @@ function createHexagon(position: { x: number; y: number; z: number }, isLocal: b
   mesh.position.set(position.x, position.y, position.z);
   scene.add(mesh);
 
+  const id = `hex-${position.x}-${position.y}-${position.z}-${Date.now()}-${Math.random()}`;
+
   if (isLocal && world) {
     const vertices: Float32Array = new Float32Array(geometry.attributes.position.array);
     const colliderDesc: RAPIER.ColliderDesc = RAPIER.ColliderDesc.convexHull(vertices)!
-      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
+      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS | RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS)
       .setCollisionGroups(ALL_INTERACTION)
       .setSolverGroups(ALL_INTERACTION);
     const rigidBodyDesc: RAPIER.RigidBodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(position.x, position.y, position.z);
     const rigidBody: RAPIER.RigidBody = world.createRigidBody(rigidBodyDesc);
     const collider: RAPIER.Collider = world.createCollider(colliderDesc, rigidBody);
 
-    const hexagon = { mesh, rigidBody, collider, collisionCount: 0, isBreaking: false };
+    const hexagon = { id, mesh, rigidBody, collider, collisionCount: 0, isBreaking: false };
     hexagonsClient.push(hexagon);
     rigidBodies.push({ mesh, rigidBody, collider });
   } else {
-    const hexagon = { mesh, collisionCount: 0, isBreaking: false };
+    const hexagon = { id, mesh, collisionCount: 0, isBreaking: false };
     hexagonsClient.push(hexagon);
     rigidBodies.push({ mesh });
   }
@@ -238,7 +237,7 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
     const rigidBody: RAPIER.RigidBody = world.createRigidBody(rigidBodyDesc);
     const colliderDesc: RAPIER.ColliderDesc = RAPIER.ColliderDesc.ball(0.5)
       .setRestitution(0.8)
-      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
+      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS | RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS)
       .setCollisionGroups(ALL_INTERACTION)
       .setSolverGroups(ALL_INTERACTION);
     const collider: RAPIER.Collider = world.createCollider(colliderDesc, rigidBody);
@@ -256,6 +255,7 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
 
 function breakHexagon(
   hexagon: {
+    id: string;
     mesh: THREE.Mesh;
     rigidBody?: RAPIER.RigidBody;
     collider?: RAPIER.Collider;
@@ -299,22 +299,18 @@ function breakHexagon(
     });
   tweenGroup.add(tween);
   tween.start();
-
-  setTimeout(() => {
-    material.opacity = 0;
-    hexagon.mesh.position.y = initialPosition.y - 1;
-  }, 1000);
 }
 
 function handleJumping(): void {
   if (!ballRigidBody || !canJump || isSpectating) return;
-  if (keys.space) {
+  if (keys.space && performance.now() - lastJumpTime > JUMP_COOLDOWN) {
     const jumpImpulse: number = isJumpOnBroken ? 10 : 4;
     ballRigidBody.applyImpulse({ x: 0, y: jumpImpulse, z: 0 }, true);
     if (ballCollider) ballCollider.setRestitution(0);
     jumpSound.play();
     keys.space = false;
     canJump = false;
+    lastJumpTime = performance.now();
     if (socket && playerId && gameId) socket.emit('jump', { gameId, id: playerId });
   }
 }
@@ -517,7 +513,6 @@ function checkPlayerElimination(): void {
     }
   });
 
-  // Check if game is over (multiplayer only)
   if (mode !== 'single') {
     const remainingPlayers = Object.entries(playersClient).filter(([_, player]) => !player.eliminated);
     if (remainingPlayers.length === 1 && !isSpectating) {
@@ -568,7 +563,6 @@ function showEndGameModal(): void {
       window.exitGame();
     });
 
-    // Update language
     const lang = document.documentElement.lang || 'en';
     modalContent.querySelectorAll('[data-en]').forEach(el => {
       el.textContent = el.getAttribute(`data-${lang}`);
@@ -774,6 +768,7 @@ window.exitGame = function exitGame(): void {
   serverStartTime = null;
   lastMovePosition = null;
   lastMoveRotation = null;
+  lastJumpTime = 0;
   const canvas = renderer.domElement;
   if (canvas && canvas.parentNode) {
     canvas.parentNode.removeChild(canvas);
@@ -799,21 +794,28 @@ function animate(time: number): void {
 
   lastFrameTime = time;
 
-  if (eventQueue) {
+  if (eventQueue && ballCollider && !isSpectating && physicsEnabled) {
     handleJumping();
     handleMovement();
-    eventQueue.drainCollisionEvents((handle1: number, handle2: number, started: boolean) => {
-      if (started && ballCollider && !isSpectating) {
-        const collider1: RAPIER.Collider = world!.getCollider(handle1);
-        const collider2: RAPIER.Collider = world!.getCollider(handle2);
-        if (collider1 === ballCollider || collider2 === ballCollider) {
-          const hexagonCollider = collider1 === ballCollider ? collider2 : collider1;
-          const hexagon = hexagonsClient.find((h) => h.collider === hexagonCollider && !h.isBreaking);
-          if (hexagon) {
+
+    // Process contact force events to detect significant collisions
+    const processedHexagons = new Set<string>();
+    eventQueue.drainContactForceEvents((event) => {
+      const collider1 = world!.getCollider(event.collider1());
+      const collider2 = world!.getCollider(event.collider2());
+      if (collider1 === ballCollider || collider2 === ballCollider) {
+        const hexagonCollider = collider1 === ballCollider ? collider2 : collider1;
+        const hexagon = hexagonsClient.find((h) => h.collider === hexagonCollider && !h.isBreaking);
+        if (hexagon && !processedHexagons.has(hexagon.id) && performance.now() - lastJumpTime >= JUMP_COOLDOWN) {
+          const ballPos = ballRigidBody!.translation();
+          const hexPos = hexagon.rigidBody!.translation();
+          if (ballPos.y > hexPos.y) {
+            processedHexagons.add(hexagon.id);
             hexagon.collisionCount++;
             canJump = true;
             if (hexagon.collisionCount === 1) {
               ballCollider.setRestitution(0);
+              collisionSound.play();
             }
             if (hexagon.collisionCount >= 3) {
               breakHexagon(hexagon);
@@ -822,17 +824,17 @@ function animate(time: number): void {
                 socket.emit('break-hexagon', { gameId, index });
               }
             }
-            return; // Exit loop after processing one valid player-hexagon collision
           }
-        } else {
-          const player1 = Object.values(playersClient).find((p) => p.collider === collider1);
-          const player2 = Object.values(playersClient).find((p) => p.collider === collider2);
-          if (player1 && player2 && player1 !== player2) {
-            collisionSound.play();
-          }
+        }
+      } else {
+        const player1 = Object.values(playersClient).find((p) => p.collider === collider1);
+        const player2 = Object.values(playersClient).find((p) => p.collider === collider2);
+        if (player1 && player2 && player1 !== player2) {
+          collisionSound.play();
         }
       }
     });
+
     if (physicsEnabled) {
       world.step(eventQueue);
     }
@@ -874,7 +876,6 @@ function animate(time: number): void {
     });
   }
 
-  // Camera update
   let targetPlayerId: string | null = null;
   if (isSpectating) {
     const alivePlayers = Object.entries(playersClient).filter(([_, player]) => !player.eliminated);
@@ -912,7 +913,6 @@ function init(): void {
     initMultiplayer();
   }
 
-  // Add UI elements
   const style: HTMLStyleElement = document.createElement('style');
   style.textContent = `
     @media (min-width: 769px) {
