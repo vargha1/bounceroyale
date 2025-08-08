@@ -116,16 +116,14 @@ function breakHexagon(
   if (hexagon.isBreaking) return;
   hexagon.isBreaking = true;
   canJump = true;
-  console.log(performance.now())
   canJumpUntil = performance.now() + 1000;
-  console.log(canJumpUntil);
 
   try {
     if (hexagon.collider && world) {
       world.removeCollider(hexagon.collider, false);
     }
   } catch (e) {
-    // swallow if collider already removed
+    console.error('Error removing collider:', e);
   }
 
   if (breakSound && breakSound.isPlaying === false) {
@@ -145,12 +143,16 @@ function breakHexagon(
     .onComplete(() => {
       try {
         scene.remove(hexagon.mesh);
-      } catch (e) { }
+      } catch (e) {
+        console.error('Error removing hexagon mesh:', e);
+      }
       try {
         if (hexagon.rigidBody && world) {
           world.removeRigidBody(hexagon.rigidBody);
         }
-      } catch (e) { }
+      } catch (e) {
+        console.error('Error removing hexagon rigidBody:', e);
+      }
       rigidBodies = rigidBodies.filter((body) => body.mesh !== hexagon.mesh);
       hexagonsClient = hexagonsClient.filter((h) => h !== hexagon);
     });
@@ -159,21 +161,24 @@ function breakHexagon(
 }
 
 function handleJumping(): void {
-  if (!ballRigidBody || isSpectating) return;
+  if (!ballRigidBody || isSpectating || !physicsEnabled) return;
 
   if (keys.space && (canJump || canJumpUntil > performance.now())) {
-    let jumpPower = 4; // default jump power
-
+    let jumpPower = 4;
     if (canJumpUntil + 1600 > performance.now()) {
-      jumpPower = 10; // boosted jump power for breaking hex
+      jumpPower = 10;
     }
 
     try {
       ballRigidBody.applyImpulse({ x: 0, y: jumpPower, z: 0 }, true);
-    } catch (e) { }
+    } catch (e) {
+      console.error('Error applying jump impulse:', e);
+    }
 
     if (ballCollider) {
-      try { ballCollider.setRestitution(0); } catch (e) { }
+      try { ballCollider.setRestitution(0); } catch (e) {
+        console.error('Error setting restitution:', e);
+      }
     }
 
     if (jumpSound && jumpSound.isPlaying === false) jumpSound.play();
@@ -182,7 +187,9 @@ function handleJumping(): void {
     canJumpUntil = 0;
 
     if (socket && playerId && gameId) {
-      try { socket.emit('jump', { gameId, id: playerId }); } catch (e) { }
+      try { socket.emit('jump', { gameId, id: playerId }); } catch (e) {
+        console.error('Error emitting jump event:', e);
+      }
     }
   }
 }
@@ -190,35 +197,31 @@ function handleJumping(): void {
 let physicsEnabled: boolean = false;
 
 function animate(time: number): void {
-  // keep the loop alive
   animationFrameId = requestAnimationFrame(animate);
-
   lastFrameTime = time;
 
-  // Basic guards
   if (!scene || !camera || !renderer) return;
 
-  // If single-player and paused, render a static frame and don't advance physics
   if (isPaused && mode === 'single') {
     renderer.render(scene, camera);
     return;
   }
 
-  // Step physics only when world exists and physics is enabled
   if (world && physicsEnabled) {
     try {
       if (eventQueue) {
-        // some Rapier builds accept an EventQueue
         world.step(eventQueue);
       } else {
         world.step();
       }
     } catch (e) {
-      try { world.step(); } catch (err) { /* ignore */ }
+      console.error('Error stepping physics world:', e);
+      try { world.step(); } catch (err) {
+        console.error('Fallback physics step failed:', err);
+      }
     }
   }
 
-  // --- Update meshes from rigid bodies ---
   for (const entry of rigidBodies) {
     const { mesh, rigidBody } = entry;
     if (rigidBody) {
@@ -228,12 +231,11 @@ function animate(time: number): void {
         mesh.position.set(pos.x, pos.y, pos.z);
         mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
       } catch (e) {
-        // reading translation/rotation might fail if body removed; ignore
+        console.error('Error updating mesh from rigidBody:', e);
       }
     }
   }
 
-  // --- Landing / grounding detection (proximity-based) ---
   let isGrounded = false;
   let contactedHexagon: typeof hexagonsClient[0] | null = null;
 
@@ -242,47 +244,42 @@ function animate(time: number): void {
     if (contactedHexagon) isGrounded = true;
   }
 
-  // update canJump from grounding state (so player can press space to jump)
   canJump = isGrounded;
 
-  // detect a *new landing* (was not grounded last frame, now is)
   if (isGrounded && contactedHexagon) {
     if (lastGroundedHexId !== contactedHexagon.id) {
-      // new landing on this hex
-      contactedHexagon.collisionCount = (contactedHexagon.collisionCount || 0) + 1;
-      console.log(`Landed on ${contactedHexagon.id} count=${contactedHexagon.collisionCount}`);
-
-      if (contactedHexagon.collisionCount === 1) {
-        try { collisionSound.play(); } catch (e) { }
+      if (collisionSound && collisionSound.isPlaying === false) {
+        try { collisionSound.play(); } catch (e) {
+          console.error('Error playing collision sound:', e);
+        }
       }
-
-      if (contactedHexagon.collisionCount >= 3) {
-        breakHexagon(contactedHexagon);
-
-        // emit break event only for this hex index (multiplayer sync)
-        if (socket && gameId) {
+      if (!contactedHexagon.isBreaking) {
+        contactedHexagon.collisionCount += 1;
+        if (socket && gameId && playerId && mode !== 'single') {
           const index = hexagonsClient.indexOf(contactedHexagon);
           if (index >= 0) {
-            try { socket.emit('break-hexagon', { gameId, index, playerId }); } catch (e) { }
+            try {
+              socket.emit('hexagon-collided', { gameId, index, playerId });
+            } catch (e) {
+              console.error('Error emitting hexagon-collided event:', e);
+            }
           }
         }
-
-        // reset counter for safety
-        contactedHexagon.collisionCount = 0;
+        if (contactedHexagon.collisionCount >= 3 && mode === 'single') {
+          breakHexagon(contactedHexagon);
+        }
       }
+      lastGroundedHexId = contactedHexagon.id;
     }
-    // remember current grounded hex id
-    lastGroundedHexId = contactedHexagon.id;
   } else {
-    // not grounded -> clear last grounded so next landing counts
     lastGroundedHexId = null;
   }
 
-  // --- Input handling (jump & movement) ---
   handleJumping();
-  try { handleMovement(); } catch (e) { }
+  try { handleMovement(); } catch (e) {
+    console.error('Error in handleMovement:', e);
+  }
 
-  // --- Send movement updates for our player in multiplayer ---
   if (mode !== 'single' && socket && playerId && ballRigidBody) {
     try {
       const pos = ballRigidBody.translation();
@@ -303,16 +300,17 @@ function animate(time: number): void {
         Math.abs(roundedRotation.w - lastMoveRotation.w) > 0.01;
 
       if (positionChanged || rotationChanged) {
-        try { socket.emit('move', { gameId, id: playerId, position: roundedPosition, rotation: roundedRotation }); } catch (e) { }
+        try { socket.emit('move', { gameId, id: playerId, position: roundedPosition, rotation: roundedRotation }); } catch (e) {
+          console.error('Error emitting move event:', e);
+        }
         lastMovePosition = roundedPosition;
         lastMoveRotation = roundedRotation;
       }
     } catch (e) {
-      // ignore translation/rotation read errors
+      console.error('Error reading translation/rotation:', e);
     }
   }
 
-  // --- Camera follow logic ---
   let targetPlayerId: string | null = null;
   if (isSpectating) {
     const alivePlayers = Object.entries(playersClient).filter(([_, p]) => !p.eliminated);
@@ -336,24 +334,23 @@ function animate(time: number): void {
   );
   camera.lookAt(spherePosition.x, spherePosition.y, spherePosition.z);
 
-  // update tweens and render
-  try { tweenGroup.update(time); } catch (e) { }
+  try { tweenGroup.update(time); } catch (e) {
+    console.error('Error updating tween:', e);
+  }
   renderer.render(scene, camera);
 }
 
-
-// Other functions (mostly unchanged)
 function initPhysics(): void {
   const gravity = { x: 0, y: -9.81, z: 0 };
   world = new RAPIER.World(gravity);
   try {
     eventQueue = new RAPIER.EventQueue(true);
   } catch (e) {
-    // some builds might not accept parameter; try fallback
     try {
       // @ts-ignore
       eventQueue = new RAPIER.EventQueue();
     } catch (err) {
+      console.error('Error creating event queue:', err);
       eventQueue = null;
     }
   }
@@ -365,35 +362,29 @@ function createHexagonShape(radius: number = 2, height: number = 1): THREE.Buffe
   const indices: number[] = [];
   const angle: number = Math.PI / 3;
 
-  // top ring (0..5)
   for (let i = 0; i < 6; i++) {
     const x: number = radius * Math.cos(i * angle);
     const z: number = radius * Math.sin(i * angle);
     vertices.push(x, height / 2, z);
   }
 
-  // bottom ring (6..11)
   for (let i = 0; i < 6; i++) {
     const x: number = radius * Math.cos(i * angle);
     const z: number = radius * Math.sin(i * angle);
     vertices.push(x, -height / 2, z);
   }
 
-  // center top (12) and center bottom (13)
   vertices.push(0, height / 2, 0);
   vertices.push(0, -height / 2, 0);
 
-  // top faces (fan from center top 12)
   for (let i = 0; i < 6; i++) {
     indices.push(12, i, (i + 1) % 6);
   }
 
-  // bottom faces (fan from center bottom 13) -- note winding order reversed
   for (let i = 0; i < 6; i++) {
     indices.push(13, 6 + ((i + 1) % 6), 6 + i);
   }
 
-  // side faces
   for (let i = 0; i < 6; i++) {
     const next: number = (i + 1) % 6;
     indices.push(i, next, 6 + i);
@@ -418,19 +409,19 @@ function createHexagon(position: { x: number; y: number; z: number }, isLocal: b
     const vertices: Float32Array = new Float32Array(geometry.attributes.position.array as Iterable<number>);
     let colliderDesc: RAPIER.ColliderDesc | null = null;
     try {
-      // try convex hull
       colliderDesc = RAPIER.ColliderDesc.convexHull(vertices)!
         .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
         .setCollisionGroups(ALL_INTERACTION)
         .setSolverGroups(ALL_INTERACTION);
     } catch (e) {
-      // fallback to triangle mesh or cuboid if convexHull not available
+      console.error('Error creating convex hull collider:', e);
       try {
         colliderDesc = RAPIER.ColliderDesc.cuboid(2, 0.5, 2)
           .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
           .setCollisionGroups(ALL_INTERACTION)
           .setSolverGroups(ALL_INTERACTION);
       } catch (err) {
+        console.error('Error creating cuboid collider:', err);
         colliderDesc = null;
       }
     }
@@ -459,7 +450,7 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
   mesh.position.set(position.x, position.y, position.z);
   scene.add(mesh);
 
-  if (world) {
+  if (world && (id === playerId || (mode === 'single' && id === 'local'))) {
     const rigidBodyDesc: RAPIER.RigidBodyDesc = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(position.x, position.y, position.z)
       .setLinearDamping(0.3);
@@ -475,10 +466,11 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
     if (id === playerId || (mode === 'single' && id === 'local')) {
       ballRigidBody = rigidBody;
       ballCollider = collider;
-      // disable until countdown ends
       try {
         ballRigidBody.setEnabled(false);
-      } catch (e) { }
+      } catch (e) {
+        console.error('Error disabling ballRigidBody:', e);
+      }
     }
   } else {
     playersClient[id] = { mesh, eliminated: false };
@@ -510,7 +502,9 @@ function handleMovement(): void {
   if (impulseX !== 0 || impulseZ !== 0) {
     try {
       ballRigidBody.applyImpulse({ x: impulseX, y: 0, z: impulseZ }, true);
-    } catch (e) { }
+    } catch (e) {
+      console.error('Error applying movement impulse:', e);
+    }
   }
 }
 
@@ -520,24 +514,20 @@ function getContactedHexagon(): typeof hexagonsClient[0] | null {
     const ballPos = ballRigidBody.translation();
     for (const hex of hexagonsClient) {
       if (!hex || hex.isBreaking) continue;
-      // horizontal distance (x,z)
       const dx = ballPos.x - hex.mesh.position.x;
       const dz = ballPos.z - hex.mesh.position.z;
       const horizontalDist = Math.sqrt(dx * dx + dz * dz);
-      // vertical difference: ball above/below hex center
       const verticalDiff = ballPos.y - hex.mesh.position.y;
-      // thresholds: tune as needed (hex radius ~2, ball radius 0.5)
       if (horizontalDist < 2.5 && verticalDiff <= 1.1 && verticalDiff >= -1.0) {
         return hex;
       }
     }
   } catch (e) {
-    // if anything goes wrong with reading translation, treat as no contact
+    console.error('Error reading ball position:', e);
     return null;
   }
   return null;
 }
-
 
 function isTouchInJoystick(touch: Touch): boolean {
   const joystick = document.querySelector('.joystick') as HTMLElement | null;
@@ -593,7 +583,6 @@ function handleTouchMove(event: TouchEvent): void {
       joystickY = Math.max(-1, Math.min(1, deltaY));
       const joystickInner = document.querySelector('.joystick-inner') as HTMLElement | null;
       if (joystickInner) {
-        // use pixel transform to avoid percentage math confusion
         joystickInner.style.transform = `translate(${joystickX * 30}px, ${joystickY * 30}px)`;
       }
     } else if (touch.identifier === rotationTouchId) {
@@ -603,7 +592,9 @@ function handleTouchMove(event: TouchEvent): void {
       if (socket && playerId && gameId) {
         try {
           socket.emit('rotate', { gameId, id: playerId, cameraAzimuth: Number(cameraAzimuth.toFixed(2)) });
-        } catch (e) { }
+        } catch (e) {
+          console.error('Error emitting rotate event:', e);
+        }
       }
     }
   }
@@ -639,7 +630,9 @@ function handleMouseMove(event: MouseEvent): void {
   if (socket && playerId && gameId) {
     try {
       socket.emit('rotate', { gameId, id: playerId, cameraAzimuth: Number(cameraAzimuth.toFixed(2)) });
-    } catch (e) { }
+    } catch (e) {
+      console.error('Error emitting rotate event:', e);
+    }
   }
 }
 
@@ -660,97 +653,16 @@ function startCountdown(seconds: number, serverTime?: number): void {
       if (ballRigidBody) {
         try {
           ballRigidBody.setEnabled(true);
-        } catch (e) { }
+        } catch (e) {
+          console.error('Error enabling ballRigidBody:', e);
+        }
       }
-      if (eliminationCheckInterval) clearInterval(eliminationCheckInterval);
-      eliminationCheckInterval = setInterval(checkPlayerElimination, 100);
       return;
     }
     countdownElement.textContent = timeLeft.toString();
     setTimeout(countdown, 100);
   };
   countdown();
-}
-
-function checkPlayerElimination(): void {
-  if (!world || !physicsEnabled) return;
-
-  const alivePlayers = Object.entries(playersClient).filter(([_, player]) => !player.eliminated);
-  totalPlayers = Math.max(totalPlayers, alivePlayers.length);
-
-  Object.entries(playersClient).forEach(([id, player]) => {
-    if (!player.eliminated && player.mesh.position.y < -5) {
-      player.eliminated = true;
-      const rank = mode === 'single' ? 1 : alivePlayers.length;
-      player.rank = rank;
-      if (id === playerId || (mode === 'single' && id === 'local')) {
-        playerRank = rank;
-        isSpectating = true;
-        if (ballRigidBody) {
-          try {
-            ballRigidBody.setEnabled(false);
-          } catch (e) { }
-          try {
-            scene.remove(player.mesh);
-          } catch (e) { }
-          rigidBodies = rigidBodies.filter((body) => body.mesh !== player.mesh);
-        }
-        const joystick = document.querySelector('.joystick') as HTMLElement | null;
-        const jumpButton = document.querySelector('.jump-button') as HTMLElement | null;
-        if (joystick) joystick.style.display = 'none';
-        if (jumpButton) jumpButton.style.display = 'none';
-        if (socket && playerId && gameId) {
-          try {
-            socket.emit('player-eliminated', { gameId, id: playerId, rank });
-          } catch (e) { }
-        }
-        if (mode === 'single') {
-          showEndGameModal();
-        }
-      } else if (player.rigidBody) {
-        try {
-          world!.removeRigidBody(player.rigidBody);
-        } catch (e) { }
-        try {
-          scene.remove(player.mesh);
-        } catch (e) { }
-        rigidBodies = rigidBodies.filter((body) => body.mesh !== player.mesh);
-      }
-    }
-  });
-
-  if (mode !== 'single') {
-    const remainingPlayers = Object.entries(playersClient).filter(([_, player]) => !player.eliminated);
-    if (remainingPlayers.length === 1 && !isSpectating) {
-      const [id, player] = remainingPlayers[0];
-      player.rank = 1;
-      if (id === playerId) {
-        playerRank = 1;
-        isSpectating = true;
-        if (ballRigidBody) {
-          try {
-            ballRigidBody.setEnabled(false);
-          } catch (e) { }
-          try {
-            scene.remove(player.mesh);
-          } catch (e) { }
-          rigidBodies = rigidBodies.filter((body) => body.mesh !== player.mesh);
-        }
-        const joystick = document.querySelector('.joystick') as HTMLElement | null;
-        const jumpButton = document.querySelector('.jump-button') as HTMLElement | null;
-        if (joystick) joystick.style.display = 'none';
-        if (jumpButton) jumpButton.style.display = 'none';
-        if (socket && playerId && gameId) {
-          try {
-            socket.emit('player-eliminated', { gameId, id: playerId, rank: 1 });
-          } catch (e) { }
-        }
-      }
-      showEndGameModal();
-    } else if (remainingPlayers.length === 0) {
-      showEndGameModal();
-    }
-  }
 }
 
 function showEndGameModal(): void {
@@ -815,11 +727,15 @@ function initMultiplayer(): void {
       serverStartTime = Date.now() + startTimer * 1000;
       try {
         socket!.emit('create-game', { startTimer, serverStartTime });
-      } catch (e) { }
+      } catch (e) {
+        console.error('Error emitting create-game:', e);
+      }
     } else {
       try {
         socket!.emit('join-game', { gameId });
-      } catch (e) { }
+      } catch (e) {
+        console.error('Error emitting join-game:', e);
+      }
     }
   });
 
@@ -830,7 +746,9 @@ function initMultiplayer(): void {
     serverStartTime = data.serverStartTime;
     data.hexagons.forEach((pos) => createHexagon(pos, true));
     data.players.forEach((player) => {
-      if (player.id !== playerId && !playersClient[player.id]) {
+      if (player.id === playerId) {
+        createSphere(player.id, player.position, player.id === creatorId);
+      } else if (!playersClient[player.id]) {
         createSphere(player.id, player.position, player.id === creatorId);
       }
     });
@@ -839,7 +757,9 @@ function initMultiplayer(): void {
     if (ballRigidBody) {
       try {
         ballRigidBody.setEnabled(false);
-      } catch (e) { }
+      } catch (e) {
+        console.error('Error disabling ballRigidBody:', e);
+      }
     }
     startCountdown(startTimer, serverStartTime);
   });
@@ -856,12 +776,6 @@ function initMultiplayer(): void {
     if (player && data.id !== playerId && !player.eliminated) {
       player.mesh.position.set(data.position.x, data.position.y, data.position.z);
       player.mesh.quaternion.set(data.rotation.x, data.rotation.y, data.rotation.z, data.rotation.w);
-      if (player.rigidBody) {
-        try {
-          player.rigidBody.setTranslation({ x: data.position.x, y: data.position.y, z: data.position.z }, true);
-          player.rigidBody.setRotation({ x: data.rotation.x, y: data.rotation.y, z: data.rotation.z, w: data.rotation.w }, true);
-        } catch (e) { }
-      }
     }
   });
 
@@ -871,7 +785,18 @@ function initMultiplayer(): void {
       if (player && !player.eliminated && player.rigidBody) {
         try {
           player.rigidBody.applyImpulse({ x: 0, y: 4, z: 0 }, true);
-        } catch (e) { }
+        } catch (e) {
+          console.error('Error applying jump impulse for other player:', e);
+        }
+      }
+    }
+  });
+
+  socket.on('player-rotated', (data: { id: string; cameraAzimuth: number }) => {
+    if (data.id !== playerId) {
+      const player = playersClient[data.id];
+      if (player && !player.eliminated) {
+        // Optionally use cameraAzimuth for visual effects
       }
     }
   });
@@ -883,15 +808,22 @@ function initMultiplayer(): void {
       player.rank = Object.entries(playersClient).filter(([_, p]) => !p.eliminated).length + 1;
       try {
         scene.remove(player.mesh);
-      } catch (e) { }
+      } catch (e) {
+        console.error('Error removing disconnected player mesh:', e);
+      }
       if (player.rigidBody && world) {
         try {
           world.removeRigidBody(player.rigidBody);
-        } catch (e) { }
+        } catch (e) {
+          console.error('Error removing disconnected player rigidBody:', e);
+        }
       }
       rigidBodies = rigidBodies.filter((body) => body.mesh !== player.mesh);
       delete playersClient[data.id];
-      checkPlayerElimination();
+      const remainingPlayers = Object.entries(playersClient).filter(([_, p]) => !p.eliminated);
+      if (remainingPlayers.length <= 1) {
+        showEndGameModal();
+      }
     }
   });
 
@@ -900,27 +832,67 @@ function initMultiplayer(): void {
     if (player && !player.eliminated) {
       player.eliminated = true;
       player.rank = data.rank;
-      if (data.id !== playerId) {
+      if (data.id === playerId) {
+        playerRank = data.rank;
+        isSpectating = true;
+        if (ballRigidBody) {
+          try {
+            ballRigidBody.setEnabled(false);
+          } catch (e) {
+            console.error('Error disabling eliminated player rigidBody:', e);
+          }
+          try {
+            scene.remove(player.mesh);
+          } catch (e) {
+            console.error('Error removing eliminated player mesh:', e);
+          }
+          rigidBodies = rigidBodies.filter((body) => body.mesh !== player.mesh);
+        }
+        const joystick = document.querySelector('.joystick') as HTMLElement | null;
+        const jumpButton = document.querySelector('.jump-button') as HTMLElement | null;
+        if (joystick) joystick.style.display = 'none';
+        if (jumpButton) jumpButton.style.display = 'none';
+        showEndGameModal();
+      } else {
         try {
           scene.remove(player.mesh);
-        } catch (e) { }
+        } catch (e) {
+          console.error('Error removing eliminated player mesh:', e);
+        }
         if (player.rigidBody && world) {
           try {
             world.removeRigidBody(player.rigidBody);
-          } catch (e) { }
+          } catch (e) {
+            console.error('Error removing eliminated player rigidBody:', e);
+          }
         }
         rigidBodies = rigidBodies.filter((body) => body.mesh !== player.mesh);
       }
-      checkPlayerElimination();
+      const remainingPlayers = Object.entries(playersClient).filter(([_, p]) => !p.eliminated);
+      if (remainingPlayers.length <= 1) {
+        showEndGameModal();
+      }
     }
   });
 
   socket.on('hexagon-broken', (data: { index: number; playerId: string }) => {
     const hexagon = hexagonsClient[data.index];
-    if (hexagon && !hexagon.isBreaking && data.playerId !== playerId) {
+    if (hexagon && !hexagon.isBreaking) {
       console.log(`Received hexagon-broken event for hexagon ${hexagon.id} from player ${data.playerId}`);
       breakHexagon(hexagon);
     }
+  });
+
+  socket.on('sync', (data: { players: { id: string; position: { x: number; y: number; z: number }; rotation: { x: number; y: number; z: number; w: number } }[] }) => {
+    data.players.forEach((playerData) => {
+      if (playerData.id !== playerId) {
+        const player = playersClient[playerData.id];
+        if (player && !player.eliminated) {
+          player.mesh.position.set(playerData.position.x, playerData.position.y, playerData.position.z);
+          player.mesh.quaternion.set(playerData.rotation.x, playerData.rotation.y, playerData.rotation.z, playerData.rotation.w);
+        }
+      }
+    });
   });
 
   socket.on('game-ended', () => {
@@ -947,7 +919,9 @@ function togglePause(): void {
     if (ballRigidBody) {
       try {
         ballRigidBody.setEnabled(false);
-      } catch (e) { }
+      } catch (e) {
+        console.error('Error disabling ballRigidBody on pause:', e);
+      }
     }
     if (animationFrameId && mode === 'single') {
       cancelAnimationFrame(animationFrameId);
@@ -955,23 +929,29 @@ function togglePause(): void {
     }
     try {
       if (document.exitPointerLock) document.exitPointerLock();
-    } catch (e) { }
+    } catch (e) {
+      console.error('Error exiting pointer lock:', e);
+    }
   } else if (isPaused) {
     isPaused = false;
     pauseModal.style.display = 'none';
     if (ballRigidBody) {
       try {
         ballRigidBody.setEnabled(true);
-      } catch (e) { }
+      } catch (e) {
+        console.error('Error enabling ballRigidBody on resume:', e);
+      }
     }
     if (mode === 'single' && !animationFrameId) {
       animate(performance.now());
     }
     try {
-      if (!isMobileUserAgent() && renderer && renderer.domElement && (renderer.domElement.requestPointerLock)) {
+      if (!isMobileUserAgent() && renderer && renderer.domElement && renderer.domElement.requestPointerLock) {
         renderer.domElement.requestPointerLock();
       }
-    } catch (e) { }
+    } catch (e) {
+      console.error('Error requesting pointer lock:', e);
+    }
   }
 }
 
@@ -983,16 +963,20 @@ window.resumeGame = function resumeGame(): void {
   if (ballRigidBody) {
     try {
       ballRigidBody.setEnabled(true);
-    } catch (e) { }
+    } catch (e) {
+      console.error('Error enabling ballRigidBody on resume:', e);
+    }
   }
   if (mode === 'single' && !animationFrameId) {
     animate(performance.now());
   }
   try {
-    if (!isMobileUserAgent() && renderer && renderer.domElement && (renderer.domElement.requestPointerLock)) {
+    if (!isMobileUserAgent() && renderer && renderer.domElement && renderer.domElement.requestPointerLock) {
       renderer.domElement.requestPointerLock();
     }
-  } catch (e) { }
+  } catch (e) {
+    console.error('Error requesting pointer lock:', e);
+  }
 };
 
 window.exitGame = function exitGame(): void {
@@ -1005,7 +989,9 @@ window.exitGame = function exitGame(): void {
   if (socket) {
     try {
       socket.disconnect();
-    } catch (e) { }
+    } catch (e) {
+      console.error('Error disconnecting socket:', e);
+    }
     socket = null;
   }
   if (animationFrameId) {
@@ -1013,7 +999,9 @@ window.exitGame = function exitGame(): void {
     animationFrameId = null;
   }
   if (scene) {
-    try { scene.clear(); } catch (e) { }
+    try { scene.clear(); } catch (e) {
+      console.error('Error clearing scene:', e);
+    }
   }
   rigidBodies = [];
   hexagonsClient = [];
@@ -1038,7 +1026,7 @@ window.exitGame = function exitGame(): void {
   const main = document.querySelector('main');
   if (header) header.classList.remove('hidden');
   if (aside) aside.classList.remove('hidden');
-  if (main) main.classList.remove('hidden');
+  if (main) main.classList.add('hidden');
   const countdownElement = document.getElementById('countdown') as HTMLElement | null;
   if (countdownElement) countdownElement.style.display = 'none';
   const endGameModal = document.getElementById('end-game-modal');
@@ -1050,7 +1038,9 @@ window.exitGame = function exitGame(): void {
   document.body.style.cursor = 'default';
   try {
     if (document.exitPointerLock) document.exitPointerLock();
-  } catch (e) { }
+  } catch (e) {
+    console.error('Error exiting pointer lock:', e);
+  }
 };
 
 function init(): void {
@@ -1122,10 +1112,12 @@ function init(): void {
         break;
     }
     try {
-      if (!isPaused && !isMobileUserAgent() && renderer && renderer.domElement && (renderer.domElement.requestPointerLock)) {
+      if (!isPaused && !isMobileUserAgent() && renderer && renderer.domElement && renderer.domElement.requestPointerLock) {
         renderer.domElement.requestPointerLock();
       }
-    } catch (e) { }
+    } catch (e) {
+      console.error('Error requesting pointer lock on keydown:', e);
+    }
   });
 
   window.addEventListener('keyup', (event: KeyboardEvent) => {
@@ -1159,9 +1151,13 @@ function init(): void {
   const canvas = renderer.domElement;
   try {
     if (!isMobileUserAgent() && canvas.requestPointerLock) canvas.requestPointerLock();
-  } catch (e) { }
+  } catch (e) {
+    console.error('Error requesting pointer lock on init:', e);
+  }
 
-  document.addEventListener('pointerlockerror', () => { });
+  document.addEventListener('pointerlockerror', () => {
+    console.error('Pointer lock error occurred');
+  });
 
   window.addEventListener('resize', () => {
     if (!camera || !renderer) return;
@@ -1172,11 +1168,9 @@ function init(): void {
   });
 
   lastFrameTime = performance.now();
-  // start the animation loop
   if (!animationFrameId) animate(performance.now());
 }
 
-// Start function (unchanged logic but safe)
 window.start = function start(gameMode: string, ip?: string, timer?: number, selectedGameId?: string): void {
   mode = gameMode;
   serverIp = ip || null;
@@ -1213,17 +1207,23 @@ window.start = function start(gameMode: string, ip?: string, timer?: number, sel
   audioLoader.load('/sounds/jump.mp3', (buffer) => {
     try {
       jumpSound.setBuffer(buffer).setVolume(0.5);
-    } catch (e) { }
+    } catch (e) {
+      console.error('Error loading jump sound:', e);
+    }
   });
   audioLoader.load('/sounds/collision.mp3', (buffer) => {
     try {
       collisionSound.setBuffer(buffer).setVolume(0.5);
-    } catch (e) { }
+    } catch (e) {
+      console.error('Error loading collision sound:', e);
+    }
   });
   audioLoader.load('/sounds/break.mp3', (buffer) => {
     try {
       breakSound.setBuffer(buffer).setVolume(0.5);
-    } catch (e) { }
+    } catch (e) {
+      console.error('Error loading break sound:', e);
+    }
   });
 
   camera.position.set(0, 5, 10);
