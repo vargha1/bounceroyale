@@ -47,7 +47,7 @@ let joystickCenterX: number = 0;
 let joystickCenterY: number = 0;
 let touchStartX: number = 0;
 const tweenGroup: Group = new Group();
-let playersClient: { [id: string]: { mesh: THREE.Mesh; rigidBody?: RAPIER.RigidBody; collider?: RAPIER.Collider; eliminated?: boolean; rank?: number } } = {};
+let playersClient: { [id: string]: { mesh: THREE.Mesh; rigidBody?: RAPIER.RigidBody; collider?: RAPIER.Collider; eliminated?: boolean; rank?: number; targetPosition?: { x: number; y: number; z: number }; targetRotation?: { x: number; y: number; z: number; w: number } } } = {};
 let jumpSound!: THREE.Audio;
 let collisionSound!: THREE.Audio;
 let breakSound!: THREE.Audio;
@@ -73,7 +73,7 @@ let hexagonsClient: {
   mesh: THREE.Mesh;
   rigidBody?: RAPIER.RigidBody;
   collider?: RAPIER.Collider;
-  collisionCount: number;
+  collisionCount?: number;
   isBreaking: boolean;
 }[] = [];
 
@@ -109,7 +109,6 @@ function breakHexagon(
     mesh: THREE.Mesh;
     rigidBody?: RAPIER.RigidBody;
     collider?: RAPIER.Collider;
-    collisionCount: number;
     isBreaking: boolean;
   }
 ): void {
@@ -187,14 +186,25 @@ function handleJumping(): void {
     canJumpUntil = 0;
 
     if (socket && playerId && gameId) {
-      try { socket.emit('jump', { gameId, id: playerId }); } catch (e) {
+      const jumpEventId = Date.now().toString();
+      try {
+        socket.emit('jump', { gameId, id: playerId, eventId: jumpEventId });
+        setTimeout(() => {
+          if (!jumpAcknowledged[jumpEventId]) {
+            console.warn(`Jump event ${jumpEventId} not acknowledged, retrying...`);
+            socket!.emit('jump', { gameId, id: playerId, eventId: jumpEventId });
+          }
+        }, 1000);
+      } catch (e) {
         console.error('Error emitting jump event:', e);
       }
+      jumpAcknowledged[jumpEventId] = false;
     }
   }
 }
 
 let physicsEnabled: boolean = false;
+const jumpAcknowledged: { [eventId: string]: boolean } = {};
 
 function animate(time: number): void {
   animationFrameId = requestAnimationFrame(animate);
@@ -222,17 +232,25 @@ function animate(time: number): void {
     }
   }
 
-  for (const entry of rigidBodies) {
-    const { mesh, rigidBody } = entry;
-    if (rigidBody) {
-      try {
-        const pos = rigidBody.translation();
-        const rot = rigidBody.rotation();
-        mesh.position.set(pos.x, pos.y, pos.z);
-        mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
-      } catch (e) {
-        console.error('Error updating mesh from rigidBody:', e);
-      }
+  // Update local player
+  if (ballRigidBody) {
+    try {
+      const pos = ballRigidBody.translation();
+      const rot = ballRigidBody.rotation();
+      playersClient[playerId!].mesh.position.set(pos.x, pos.y, pos.z);
+      playersClient[playerId!].mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+    } catch (e) {
+      console.error('Error updating local player mesh:', e);
+    }
+  }
+
+  // Smoothly interpolate non-local players
+  for (const [id, player] of Object.entries(playersClient)) {
+    if (id !== playerId && player.targetPosition && player.targetRotation && !player.eliminated) {
+      const targetPos = new THREE.Vector3(player.targetPosition.x, player.targetPosition.y, player.targetPosition.z);
+      const targetQuat = new THREE.Quaternion(player.targetRotation.x, player.targetRotation.y, player.targetRotation.z, player.targetRotation.w);
+      player.mesh.position.lerp(targetPos, 0.1);
+      player.mesh.quaternion.slerp(targetQuat, 0.1);
     }
   }
 
@@ -253,19 +271,26 @@ function animate(time: number): void {
           console.error('Error playing collision sound:', e);
         }
       }
-      if (!contactedHexagon.isBreaking) {
-        contactedHexagon.collisionCount += 1;
-        if (socket && gameId && playerId && mode !== 'single') {
-          const index = hexagonsClient.indexOf(contactedHexagon);
-          if (index >= 0) {
-            try {
-              socket.emit('hexagon-collided', { gameId, index, playerId });
-            } catch (e) {
-              console.error('Error emitting hexagon-collided event:', e);
-            }
+      if (!contactedHexagon.isBreaking && socket && gameId && playerId && mode !== 'single') {
+        const index = hexagonsClient.indexOf(contactedHexagon);
+        if (index >= 0) {
+          const collisionEventId = Date.now().toString();
+          try {
+            socket.emit('hexagon-collided', { gameId, index, playerId, eventId: collisionEventId });
+            setTimeout(() => {
+              if (!collisionAcknowledged[collisionEventId]) {
+                console.warn(`Collision event ${collisionEventId} not acknowledged, retrying...`);
+                socket!.emit('hexagon-collided', { gameId, index, playerId, eventId: collisionEventId });
+              }
+            }, 1000);
+          } catch (e) {
+            console.error('Error emitting hexagon-collided event:', e);
           }
+          collisionAcknowledged[collisionEventId] = false;
         }
-        if (contactedHexagon.collisionCount >= 3 && mode === 'single') {
+      } else if (mode === 'single' && !contactedHexagon.isBreaking) {
+        contactedHexagon.collisionCount = (contactedHexagon.collisionCount || 0) + 1;
+        if (contactedHexagon.collisionCount >= 3) {
           breakHexagon(contactedHexagon);
         }
       }
@@ -433,11 +458,12 @@ function createHexagon(position: { x: number; y: number; z: number }, isLocal: b
       collider = world.createCollider(colliderDesc, rigidBody);
     }
 
-    const hexagon = { id, mesh, rigidBody, collider, collisionCount: 0, isBreaking: false };
+    let collisionCount = 0;
+    const hexagon = { id, mesh, rigidBody, collider, collisionCount, isBreaking: false };
     hexagonsClient.push(hexagon);
     rigidBodies.push({ mesh, rigidBody, collider });
   } else {
-    const hexagon = { id, mesh, collisionCount: 0, isBreaking: false };
+    const hexagon = { id, mesh, isBreaking: false };
     hexagonsClient.push(hexagon);
     rigidBodies.push({ mesh });
   }
@@ -462,7 +488,7 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
       .setSolverGroups(ALL_INTERACTION);
     const collider: RAPIER.Collider = world.createCollider(colliderDesc, rigidBody);
     rigidBodies.push({ mesh, rigidBody, collider });
-    playersClient[id] = { mesh, rigidBody, collider, eliminated: false };
+    playersClient[id] = { mesh, rigidBody, collider, eliminated: false, targetPosition: position, targetRotation: { x: 0, y: 0, z: 0, w: 1 } };
     if (id === playerId || (mode === 'single' && id === 'local')) {
       ballRigidBody = rigidBody;
       ballCollider = collider;
@@ -473,7 +499,7 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
       }
     }
   } else {
-    playersClient[id] = { mesh, eliminated: false };
+    playersClient[id] = { mesh, eliminated: false, targetPosition: position, targetRotation: { x: 0, y: 0, z: 0, w: 1 } };
     rigidBodies.push({ mesh });
   }
 }
@@ -649,14 +675,6 @@ function startCountdown(seconds: number, serverTime?: number): void {
     const timeLeft = Math.max(0, Math.floor((endTime - Date.now()) / 1000));
     if (timeLeft <= 0) {
       countdownElement.style.display = 'none';
-      physicsEnabled = true;
-      if (ballRigidBody) {
-        try {
-          ballRigidBody.setEnabled(true);
-        } catch (e) {
-          console.error('Error enabling ballRigidBody:', e);
-        }
-      }
       return;
     }
     countdownElement.textContent = timeLeft.toString();
@@ -712,13 +730,18 @@ function showEndGameModal(): void {
   modal.style.display = 'flex';
 }
 
+const collisionAcknowledged: { [eventId: string]: boolean } = {};
+
 function initMultiplayer(): void {
   const serverUrl = serverIp || 'https://game.safahanbattery.ir:8443';
   socket = io(serverUrl, {
     transports: ['websocket'],
+    reconnectionAttempts: 3,
+    reconnectionDelay: 1000,
   });
 
   socket.on('connect', () => {
+    console.log('Connected to server:', socket!.id);
     playerId = socket!.id;
     creatorId = mode === 'create' ? playerId : null;
     if (mode === 'create') {
@@ -740,6 +763,7 @@ function initMultiplayer(): void {
   });
 
   socket.on('init', (data: { gameId: string; creatorId: string; players: { id: string; position: { x: number; y: number; z: number } }[]; hexagons: { x: number; y: number; z: number }[]; startTimer: number; serverStartTime: number }) => {
+    console.log('Received init:', data);
     gameId = data.gameId;
     creatorId = data.creatorId;
     startTimer = data.startTimer;
@@ -764,31 +788,43 @@ function initMultiplayer(): void {
     startCountdown(startTimer, serverStartTime);
   });
 
+  socket.on('game-started', () => {
+    physicsEnabled = true;
+    if (ballRigidBody) {
+      try {
+        ballRigidBody.setEnabled(true);
+      } catch (e) {
+        console.error('Error enabling ballRigidBody:', e);
+      }
+    }
+    console.log('Game started, physics enabled');
+  });
+
   socket.on('new-player', (data: { id: string; position: { x: number; y: number; z: number } }) => {
     if (data.id !== playerId && !playersClient[data.id]) {
       createSphere(data.id, data.position, data.id === creatorId);
       totalPlayers++;
+      console.log(`New player joined: ${data.id}`);
     }
   });
 
   socket.on('player-moved', (data: { id: string; position: { x: number; y: number; z: number }; rotation: { x: number; y: number; z: number; w: number } }) => {
     const player = playersClient[data.id];
     if (player && data.id !== playerId && !player.eliminated) {
-      player.mesh.position.set(data.position.x, data.position.y, data.position.z);
-      player.mesh.quaternion.set(data.rotation.x, data.rotation.y, data.rotation.z, data.rotation.w);
+      player.targetPosition = data.position;
+      player.targetRotation = data.rotation;
     }
   });
 
-  socket.on('player-jumped', (data: { id: string }) => {
+  socket.on('player-jumped', (data: { id: string; eventId: string }) => {
     if (data.id !== playerId) {
       const player = playersClient[data.id];
-      if (player && !player.eliminated && player.rigidBody) {
-        try {
-          player.rigidBody.applyImpulse({ x: 0, y: 4, z: 0 }, true);
-        } catch (e) {
-          console.error('Error applying jump impulse for other player:', e);
-        }
+      if (player && !player.eliminated) {
+        player.mesh.position.y += 0.1; // Visual feedback for jump
       }
+    }
+    if (data.eventId && jumpAcknowledged[data.eventId] !== undefined) {
+      jumpAcknowledged[data.eventId] = true;
     }
   });
 
@@ -824,6 +860,7 @@ function initMultiplayer(): void {
       if (remainingPlayers.length <= 1) {
         showEndGameModal();
       }
+      console.log(`Player disconnected: ${data.id}`);
     }
   });
 
@@ -872,24 +909,49 @@ function initMultiplayer(): void {
       if (remainingPlayers.length <= 1) {
         showEndGameModal();
       }
+      console.log(`Player eliminated: ${data.id} with rank ${data.rank}`);
+    }
+  });
+
+  socket.on('hexagon-collided-ack', (data: { eventId: string }) => {
+    if (data.eventId && collisionAcknowledged[data.eventId] !== undefined) {
+      collisionAcknowledged[data.eventId] = true;
     }
   });
 
   socket.on('hexagon-broken', (data: { index: number; playerId: string }) => {
     const hexagon = hexagonsClient[data.index];
     if (hexagon && !hexagon.isBreaking) {
-      console.log(`Received hexagon-broken event for hexagon ${hexagon.id} from player ${data.playerId}`);
+      console.log(`Breaking hexagon ${hexagon.id} by player ${data.playerId}`);
       breakHexagon(hexagon);
     }
   });
 
   socket.on('sync', (data: { players: { id: string; position: { x: number; y: number; z: number }; rotation: { x: number; y: number; z: number; w: number } }[] }) => {
     data.players.forEach((playerData) => {
-      if (playerData.id !== playerId) {
+      if (playerData.id === playerId && ballRigidBody) {
+        try {
+          const serverPos = playerData.position;
+          const localPos = ballRigidBody.translation();
+          const delta = {
+            x: serverPos.x - localPos.x,
+            y: serverPos.y - localPos.y,
+            z: serverPos.z - localPos.z,
+          };
+          const distance = Math.sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+          if (distance > 0.5) {
+            console.log(`Reconciling position for player ${playerId}: server=${JSON.stringify(serverPos)}, local=${JSON.stringify(localPos)}`);
+            ballRigidBody.setTranslation(serverPos, true);
+            ballRigidBody.setRotation(playerData.rotation, true);
+          }
+        } catch (e) {
+          console.error('Error reconciling player position:', e);
+        }
+      } else {
         const player = playersClient[playerData.id];
         if (player && !player.eliminated) {
-          player.mesh.position.set(playerData.position.x, playerData.position.y, playerData.position.z);
-          player.mesh.quaternion.set(playerData.rotation.x, playerData.rotation.y, playerData.rotation.z, playerData.rotation.w);
+          player.targetPosition = playerData.position;
+          player.targetRotation = playerData.rotation;
         }
       }
     });
@@ -901,10 +963,12 @@ function initMultiplayer(): void {
   });
 
   socket.on('error', (data: { message: string }) => {
+    console.error('Server error:', data.message);
     alert(data.message);
   });
 
   socket.on('connect_error', () => {
+    console.error('Connection error');
     alert('Failed to connect to server. Please try again.');
   });
 }
@@ -1050,6 +1114,14 @@ function init(): void {
     createSphere('local', { x: 0, y: 5, z: 0 }, true);
     totalPlayers = 1;
     startCountdown(5);
+    physicsEnabled = true;
+    if (ballRigidBody) {
+      try {
+        ballRigidBody.setEnabled(true);
+      } catch (e) {
+        console.error('Error enabling ballRigidBody:', e);
+      }
+    }
   } else {
     initMultiplayer();
   }
