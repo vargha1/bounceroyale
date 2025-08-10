@@ -15,7 +15,6 @@ let creatorId: string | null = null;
 let isPaused: boolean = false;
 let animationFrameId: number | null = null;
 let playerRank: number | null = null;
-playerRank == null;
 let isSpectating: boolean = false;
 let totalPlayers: number = 0;
 let serverStartTime: number | null = null;
@@ -23,7 +22,6 @@ let eliminationCheckInterval: NodeJS.Timeout | null = null;
 let lastMovePosition: { x: number; y: number; z: number } | null = null;
 let lastMoveRotation: { x: number; y: number; z: number; w: number } | null = null;
 let lastFrameTime: number = performance.now();
-lastFrameTime == 0;
 let lastGroundedHexId: string | null = null;
 let canJump: boolean = true;
 let canJumpUntil: number = 0;
@@ -237,8 +235,9 @@ function animate(time: number): void {
     try {
       const pos = ballRigidBody.translation();
       const rot = ballRigidBody.rotation();
-      playersClient[playerId!].mesh.position.set(pos.x, pos.y, pos.z);
-      playersClient[playerId!].mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+      const localId = mode === 'single' ? 'local' : playerId;
+      playersClient[localId!].mesh.position.set(pos.x, pos.y, pos.z);
+      playersClient[localId!].mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
     } catch (e) {
       console.error('Error updating local player mesh:', e);
     }
@@ -246,7 +245,7 @@ function animate(time: number): void {
 
   // Smoothly interpolate non-local players
   for (const [id, player] of Object.entries(playersClient)) {
-    if (id !== playerId && player.targetPosition && player.targetRotation && !player.eliminated) {
+    if (id !== (mode === 'single' ? 'local' : playerId) && player.targetPosition && player.targetRotation && !player.eliminated) {
       const targetPos = new THREE.Vector3(player.targetPosition.x, player.targetPosition.y, player.targetPosition.z);
       const targetQuat = new THREE.Quaternion(player.targetRotation.x, player.targetRotation.y, player.targetRotation.z, player.targetRotation.w);
       player.mesh.position.lerp(targetPos, 0.1);
@@ -662,7 +661,7 @@ function handleMouseMove(event: MouseEvent): void {
   }
 }
 
-function startCountdown(seconds: number, serverTime?: number): void {
+function startCountdown(seconds: number, serverTime?: number, callback?: () => void): void {
   const countdownElement = document.getElementById('countdown') as HTMLElement | null;
   if (!countdownElement) return;
   countdownElement.style.display = 'block';
@@ -675,6 +674,7 @@ function startCountdown(seconds: number, serverTime?: number): void {
     const timeLeft = Math.max(0, Math.floor((endTime - Date.now()) / 1000));
     if (timeLeft <= 0) {
       countdownElement.style.display = 'none';
+      if (callback) callback();
       return;
     }
     countdownElement.textContent = timeLeft.toString();
@@ -785,7 +785,16 @@ function initMultiplayer(): void {
         console.error('Error disabling ballRigidBody:', e);
       }
     }
-    startCountdown(startTimer, serverStartTime);
+    startCountdown(startTimer, serverStartTime, () => {
+      physicsEnabled = true;
+      if (ballRigidBody) {
+        try {
+          ballRigidBody.setEnabled(true);
+        } catch (e) {
+          console.error('Error enabling ballRigidBody:', e);
+        }
+      }
+    });
   });
 
   socket.on('game-started', () => {
@@ -1113,15 +1122,16 @@ function init(): void {
     hexagons.forEach((pos) => createHexagon(pos));
     createSphere('local', { x: 0, y: 5, z: 0 }, true);
     totalPlayers = 1;
-    startCountdown(5);
-    physicsEnabled = true;
-    if (ballRigidBody) {
-      try {
-        ballRigidBody.setEnabled(true);
-      } catch (e) {
-        console.error('Error enabling ballRigidBody:', e);
+    startCountdown(5, Date.now(), () => {
+      physicsEnabled = true;
+      if (ballRigidBody) {
+        try {
+          ballRigidBody.setEnabled(true);
+        } catch (e) {
+          console.error('Error enabling ballRigidBody:', e);
+        }
       }
-    }
+    });
   } else {
     initMultiplayer();
   }
