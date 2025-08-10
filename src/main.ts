@@ -206,176 +206,196 @@ function handleJumping(): void {
 let physicsEnabled: boolean = false;
 const jumpAcknowledged: { [eventId: string]: boolean } = {};
 
+// Add a variable to track the last frame time for FPS limiting
+let lastFrameUpdate: number = performance.now();
+const targetFrameTime: number = 1000 / 30; // 33.33ms for 30 FPS
+
 function animate(time: number): void {
   animationFrameId = requestAnimationFrame(animate);
-  lastFrameTime = time;
 
-  if (!scene || !camera || !renderer) return;
+  let shouldRender = true; // Flag to determine if rendering is needed
 
-  if (isPaused && mode === 'single') {
-    renderer.render(scene, camera);
-    return;
-  }
+  // Calculate time since last update
+  const deltaTime = time - lastFrameUpdate;
+  if (deltaTime < targetFrameTime) {
+    // Skip game logic but still render to maintain smooth visuals
+    shouldRender = true;
+  } else {
+    // Process game logic
+    lastFrameUpdate = time;
+    lastFrameTime = time;
 
-  if (world && physicsEnabled) {
-    try {
-      if (eventQueue) {
-        world.step(eventQueue);
-      } else {
-        world.step();
-      }
-    } catch (e) {
-      console.error('Error stepping physics world:', e);
-      try { world.step(); } catch (err) {
-        console.error('Fallback physics step failed:', err);
-      }
-    }
-  }
+    if (!scene || !camera || !renderer) return;
 
-  // Update local player
-  if (ballRigidBody) {
-    try {
-      const pos = ballRigidBody.translation();
-      const rot = ballRigidBody.rotation();
-      const localId = mode === 'single' ? 'local' : playerId;
-      playersClient[localId!].mesh.position.set(pos.x, pos.y, pos.z);
-      playersClient[localId!].mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
-    } catch (e) {
-      console.error('Error updating local player mesh:', e);
-    }
-  }
-
-  // Smoothly interpolate non-local players
-  for (const [id, player] of Object.entries(playersClient)) {
-    if (id !== (mode === 'single' ? 'local' : playerId) && player.targetPosition && player.targetRotation && !player.eliminated) {
-      const targetPos = new THREE.Vector3(player.targetPosition.x, player.targetPosition.y, player.targetPosition.z);
-      const targetQuat = new THREE.Quaternion(player.targetRotation.x, player.targetRotation.y, player.targetRotation.z, player.targetRotation.w);
-      player.mesh.position.lerp(targetPos, 0.1);
-      player.mesh.quaternion.slerp(targetQuat, 0.1);
-    }
-  }
-
-  let isGrounded = false;
-  let contactedHexagon: typeof hexagonsClient[0] | null = null;
-
-  if (ballRigidBody) {
-    contactedHexagon = getContactedHexagon();
-    if (contactedHexagon) isGrounded = true;
-  }
-
-  canJump = isGrounded;
-
-  if (isGrounded && contactedHexagon && !contactedHexagon.isBreaking) {
-    if (lastGroundedHexId !== contactedHexagon.id) {
-      if (collisionSound && collisionSound.isPlaying === false) {
-        try { collisionSound.play(); } catch (e) {
-          console.error('Error playing collision sound:', e);
-        }
-      }
-      if (socket && gameId && playerId && mode !== 'single') {
-        const index = hexagonsClient.indexOf(contactedHexagon);
-        if (index >= 0) {
-          const collisionEventId = Date.now().toString();
-          try {
-            socket.emit('hexagon-collided', { gameId, index, playerId, eventId: collisionEventId });
-            setTimeout(() => {
-              if (!collisionAcknowledged[collisionEventId]) {
-                console.warn(`Collision event ${collisionEventId} not acknowledged, retrying...`);
-                socket!.emit('hexagon-collided', { gameId, index, playerId, eventId: collisionEventId });
-              }
-            }, 1000);
-          } catch (e) {
-            console.error('Error emitting hexagon-collided event:', e);
+    if (isPaused && mode === 'single') {
+      shouldRender = true;
+      // Skip game logic updates
+    } else {
+      if (world && physicsEnabled) {
+        try {
+          if (eventQueue) {
+            world.step(eventQueue);
+          } else {
+            world.step();
           }
-          collisionAcknowledged[collisionEventId] = false;
-        }
-      } else if (mode === 'single') {
-        contactedHexagon.collisionCount = (contactedHexagon.collisionCount || 0) + 1;
-        if (contactedHexagon.collisionCount >= 3) {
-          breakHexagon(contactedHexagon);
+        } catch (e) {
+          console.error('Error stepping physics world:', e);
+          try { world.step(); } catch (err) {
+            console.error('Fallback physics step failed:', err);
+          }
         }
       }
-      lastGroundedHexId = contactedHexagon.id;
-    }
-  } else {
-    lastGroundedHexId = null;
-  }
 
-  handleJumping();
-  try { handleMovement(); } catch (e) {
-    console.error('Error in handleMovement:', e);
-  }
-
-  if (mode !== 'single' && socket && playerId && ballRigidBody) {
-    try {
-      const pos = ballRigidBody.translation();
-      const rot = ballRigidBody.rotation();
-      const roundedPosition = { x: Number(pos.x.toFixed(2)), y: Number(pos.y.toFixed(2)), z: Number(pos.z.toFixed(2)) };
-      const roundedRotation = { x: Number(rot.x.toFixed(2)), y: Number(rot.y.toFixed(2)), z: Number(rot.z.toFixed(2)), w: Number(rot.w.toFixed(2)) };
-
-      const positionChanged =
-        !lastMovePosition ||
-        Math.abs(roundedPosition.x - lastMovePosition.x) > 0.01 ||
-        Math.abs(roundedPosition.y - lastMovePosition.y) > 0.01 ||
-        Math.abs(roundedPosition.z - lastMovePosition.z) > 0.01;
-      const rotationChanged =
-        !lastMoveRotation ||
-        Math.abs(roundedRotation.x - lastMoveRotation.x) > 0.01 ||
-        Math.abs(roundedRotation.y - lastMoveRotation.y) > 0.01 ||
-        Math.abs(roundedRotation.z - lastMoveRotation.z) > 0.01 ||
-        Math.abs(roundedRotation.w - lastMoveRotation.w) > 0.01;
-
-      if (positionChanged || rotationChanged) {
-        try { socket.emit('move', { gameId, id: playerId, position: roundedPosition, rotation: roundedRotation }); } catch (e) {
-          console.error('Error emitting move event:', e);
+      // Update local player
+      if (ballRigidBody) {
+        try {
+          const pos = ballRigidBody.translation();
+          const rot = ballRigidBody.rotation();
+          const localId = mode === 'single' ? 'local' : playerId;
+          playersClient[localId!].mesh.position.set(pos.x, pos.y, pos.z);
+          playersClient[localId!].mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+        } catch (e) {
+          console.error('Error updating local player mesh:', e);
         }
-        lastMovePosition = roundedPosition;
-        lastMoveRotation = roundedRotation;
       }
-    } catch (e) {
-      console.error('Error reading translation/rotation:', e);
+
+      // Smoothly interpolate non-local players
+      for (const [id, player] of Object.entries(playersClient)) {
+        if (id !== (mode === 'single' ? 'local' : playerId) && player.targetPosition && player.targetRotation && !player.eliminated) {
+          const targetPos = new THREE.Vector3(player.targetPosition.x, player.targetPosition.y, player.targetPosition.z);
+          const targetQuat = new THREE.Quaternion(player.targetRotation.x, player.targetRotation.y, player.targetRotation.z, player.targetRotation.w);
+          player.mesh.position.lerp(targetPos, 0.1);
+          player.mesh.quaternion.slerp(targetQuat, 0.1);
+        }
+      }
+
+      let isGrounded = false;
+      let contactedHexagon: typeof hexagonsClient[0] | null = null;
+
+      if (ballRigidBody) {
+        contactedHexagon = getContactedHexagon();
+        if (contactedHexagon) isGrounded = true;
+      }
+
+      canJump = isGrounded;
+
+      if (isGrounded && contactedHexagon && !contactedHexagon.isBreaking) {
+        if (lastGroundedHexId !== contactedHexagon.id) {
+          if (collisionSound && collisionSound.isPlaying === false) {
+            try { collisionSound.play(); } catch (e) {
+              console.error('Error playing collision sound:', e);
+            }
+          }
+          if (socket && gameId && playerId && mode !== 'single') {
+            const index = hexagonsClient.indexOf(contactedHexagon);
+            if (index >= 0) {
+              const collisionEventId = Date.now().toString();
+              try {
+                socket.emit('hexagon-collided', { gameId, index, playerId, eventId: collisionEventId });
+                setTimeout(() => {
+                  if (!collisionAcknowledged[collisionEventId]) {
+                    console.warn(`Collision event ${collisionEventId} not acknowledged, retrying...`);
+                    socket!.emit('hexagon-collided', { gameId, index, playerId, eventId: collisionEventId });
+                  }
+                }, 1000);
+              } catch (e) {
+                console.error('Error emitting hexagon-collided event:', e);
+              }
+              collisionAcknowledged[collisionEventId] = false;
+            }
+          } else if (mode === 'single') {
+            contactedHexagon.collisionCount = (contactedHexagon.collisionCount || 0) + 1;
+            if (contactedHexagon.collisionCount >= 3) {
+              breakHexagon(contactedHexagon);
+            }
+          }
+          lastGroundedHexId = contactedHexagon.id;
+        }
+      } else {
+        lastGroundedHexId = null;
+      }
+
+      handleJumping();
+      try { handleMovement(); } catch (e) {
+        console.error('Error in handleMovement:', e);
+      }
+
+      if (mode !== 'single' && socket && playerId && ballRigidBody) {
+        try {
+          const pos = ballRigidBody.translation();
+          const rot = ballRigidBody.rotation();
+          const roundedPosition = { x: Number(pos.x.toFixed(2)), y: Number(pos.y.toFixed(2)), z: Number(pos.z.toFixed(2)) };
+          const roundedRotation = { x: Number(rot.x.toFixed(2)), y: Number(rot.y.toFixed(2)), z: Number(rot.z.toFixed(2)), w: Number(rot.w.toFixed(2)) };
+
+          const positionChanged =
+            !lastMovePosition ||
+            Math.abs(roundedPosition.x - lastMovePosition.x) > 0.01 ||
+            Math.abs(roundedPosition.y - lastMovePosition.y) > 0.01 ||
+            Math.abs(roundedPosition.z - lastMovePosition.z) > 0.01;
+          const rotationChanged =
+            !lastMoveRotation ||
+            Math.abs(roundedRotation.x - lastMoveRotation.x) > 0.01 ||
+            Math.abs(roundedRotation.y - lastMoveRotation.y) > 0.01 ||
+            Math.abs(roundedRotation.z - lastMoveRotation.z) > 0.01 ||
+            Math.abs(roundedRotation.w - lastMoveRotation.w) > 0.01;
+
+          if (positionChanged || rotationChanged) {
+            try { socket.emit('move', { gameId, id: playerId, position: roundedPosition, rotation: roundedRotation }); } catch (e) {
+              console.error('Error emitting move event:', e);
+            }
+            lastMovePosition = roundedPosition;
+            lastMoveRotation = roundedRotation;
+          }
+        } catch (e) {
+          console.error('Error reading translation/rotation:', e);
+        }
+      }
+
+      // Check for player elimination
+      if (ballRigidBody && physicsEnabled && !isSpectating && playerId && gameId) {
+        try {
+          const pos = ballRigidBody.translation();
+          if (pos.y < -5 && !playersClient[playerId].eliminated) {
+            socket!.emit('request-elimination', { gameId, id: playerId });
+          }
+        } catch (e) {
+          console.error('Error checking elimination:', e);
+        }
+      }
+    }
+
+    let targetPlayerId: string | null = null;
+    if (isSpectating) {
+      const alivePlayers = Object.entries(playersClient).filter(([_, p]) => !p.eliminated);
+      targetPlayerId = alivePlayers.length > 0 ? alivePlayers[0][0] : null;
+    } else {
+      targetPlayerId = mode === 'single' ? 'local' : playerId;
+    }
+
+    let spherePosition = { x: 0, y: 0, z: 0 };
+    if (targetPlayerId && playersClient[targetPlayerId]) {
+      const mp = playersClient[targetPlayerId].mesh.position;
+      spherePosition = { x: mp.x, y: mp.y, z: mp.z };
+    }
+
+    const offsetDistance = 10;
+    const offsetHeight = 5;
+    camera.position.set(
+      spherePosition.x - offsetDistance * Math.cos(cameraAzimuth),
+      spherePosition.y + offsetHeight,
+      spherePosition.z - offsetDistance * Math.sin(cameraAzimuth)
+    );
+    camera.lookAt(spherePosition.x, spherePosition.y, spherePosition.z);
+
+    try { tweenGroup.update(time); } catch (e) {
+      console.error('Error updating tween:', e);
     }
   }
 
-  // Check for player elimination
-  if (ballRigidBody && physicsEnabled && !isSpectating && playerId && gameId) {
-    try {
-      const pos = ballRigidBody.translation();
-      if (pos.y < -5 && !playersClient[playerId].eliminated) {
-        socket!.emit('request-elimination', { gameId, id: playerId });
-      }
-    } catch (e) {
-      console.error('Error checking elimination:', e);
-    }
+  // Render the scene
+  if (shouldRender) {
+    renderer.render(scene, camera);
   }
-
-  let targetPlayerId: string | null = null;
-  if (isSpectating) {
-    const alivePlayers = Object.entries(playersClient).filter(([_, p]) => !p.eliminated);
-    targetPlayerId = alivePlayers.length > 0 ? alivePlayers[0][0] : null;
-  } else {
-    targetPlayerId = mode === 'single' ? 'local' : playerId;
-  }
-
-  let spherePosition = { x: 0, y: 0, z: 0 };
-  if (targetPlayerId && playersClient[targetPlayerId]) {
-    const mp = playersClient[targetPlayerId].mesh.position;
-    spherePosition = { x: mp.x, y: mp.y, z: mp.z };
-  }
-
-  const offsetDistance = 10;
-  const offsetHeight = 5;
-  camera.position.set(
-    spherePosition.x - offsetDistance * Math.cos(cameraAzimuth),
-    spherePosition.y + offsetHeight,
-    spherePosition.z - offsetDistance * Math.sin(cameraAzimuth)
-  );
-  camera.lookAt(spherePosition.x, spherePosition.y, spherePosition.z);
-
-  try { tweenGroup.update(time); } catch (e) {
-    console.error('Error updating tween:', e);
-  }
-  renderer.render(scene, camera);
 }
 
 function initPhysics(): void {
