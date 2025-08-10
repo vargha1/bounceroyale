@@ -205,197 +205,178 @@ function handleJumping(): void {
 
 let physicsEnabled: boolean = false;
 const jumpAcknowledged: { [eventId: string]: boolean } = {};
-
-// Add a variable to track the last frame time for FPS limiting
-let lastFrameUpdate: number = performance.now();
-const targetFrameTime: number = 1000 / 30; // 33.33ms for 30 FPS
+let lastSendTime: number = 0;
+const sendInterval = 33; // ~30 updates per second
 
 function animate(time: number): void {
   animationFrameId = requestAnimationFrame(animate);
+  lastFrameTime = time;
 
-  let shouldRender = true; // Flag to determine if rendering is needed
+  if (!scene || !camera || !renderer) return;
 
-  // Calculate time since last update
-  const deltaTime = time - lastFrameUpdate;
-  if (deltaTime < targetFrameTime) {
-    // Skip game logic but still render to maintain smooth visuals
-    shouldRender = true;
-  } else {
-    // Process game logic
-    lastFrameUpdate = time;
-    lastFrameTime = time;
-
-    if (!scene || !camera || !renderer) return;
-
-    if (isPaused && mode === 'single') {
-      shouldRender = true;
-      // Skip game logic updates
-    } else {
-      if (world && physicsEnabled) {
-        try {
-          if (eventQueue) {
-            world.step(eventQueue);
-          } else {
-            world.step();
-          }
-        } catch (e) {
-          console.error('Error stepping physics world:', e);
-          try { world.step(); } catch (err) {
-            console.error('Fallback physics step failed:', err);
-          }
-        }
-      }
-
-      // Update local player
-      if (ballRigidBody) {
-        try {
-          const pos = ballRigidBody.translation();
-          const rot = ballRigidBody.rotation();
-          const localId = mode === 'single' ? 'local' : playerId;
-          playersClient[localId!].mesh.position.set(pos.x, pos.y, pos.z);
-          playersClient[localId!].mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
-        } catch (e) {
-          console.error('Error updating local player mesh:', e);
-        }
-      }
-
-      // Smoothly interpolate non-local players
-      for (const [id, player] of Object.entries(playersClient)) {
-        if (id !== (mode === 'single' ? 'local' : playerId) && player.targetPosition && player.targetRotation && !player.eliminated) {
-          const targetPos = new THREE.Vector3(player.targetPosition.x, player.targetPosition.y, player.targetPosition.z);
-          const targetQuat = new THREE.Quaternion(player.targetRotation.x, player.targetRotation.y, player.targetRotation.z, player.targetRotation.w);
-          player.mesh.position.lerp(targetPos, 0.1);
-          player.mesh.quaternion.slerp(targetQuat, 0.1);
-        }
-      }
-
-      let isGrounded = false;
-      let contactedHexagon: typeof hexagonsClient[0] | null = null;
-
-      if (ballRigidBody) {
-        contactedHexagon = getContactedHexagon();
-        if (contactedHexagon) isGrounded = true;
-      }
-
-      canJump = isGrounded;
-
-      if (isGrounded && contactedHexagon && !contactedHexagon.isBreaking) {
-        if (lastGroundedHexId !== contactedHexagon.id) {
-          if (collisionSound && collisionSound.isPlaying === false) {
-            try { collisionSound.play(); } catch (e) {
-              console.error('Error playing collision sound:', e);
-            }
-          }
-          if (socket && gameId && playerId && mode !== 'single') {
-            const index = hexagonsClient.indexOf(contactedHexagon);
-            if (index >= 0) {
-              const collisionEventId = Date.now().toString();
-              try {
-                socket.emit('hexagon-collided', { gameId, index, playerId, eventId: collisionEventId });
-                setTimeout(() => {
-                  if (!collisionAcknowledged[collisionEventId]) {
-                    console.warn(`Collision event ${collisionEventId} not acknowledged, retrying...`);
-                    socket!.emit('hexagon-collided', { gameId, index, playerId, eventId: collisionEventId });
-                  }
-                }, 1000);
-              } catch (e) {
-                console.error('Error emitting hexagon-collided event:', e);
-              }
-              collisionAcknowledged[collisionEventId] = false;
-            }
-          } else if (mode === 'single') {
-            contactedHexagon.collisionCount = (contactedHexagon.collisionCount || 0) + 1;
-            if (contactedHexagon.collisionCount >= 3) {
-              breakHexagon(contactedHexagon);
-            }
-          }
-          lastGroundedHexId = contactedHexagon.id;
-        }
-      } else {
-        lastGroundedHexId = null;
-      }
-
-      handleJumping();
-      try { handleMovement(); } catch (e) {
-        console.error('Error in handleMovement:', e);
-      }
-
-      if (mode !== 'single' && socket && playerId && ballRigidBody) {
-        try {
-          const pos = ballRigidBody.translation();
-          const rot = ballRigidBody.rotation();
-          const roundedPosition = { x: Number(pos.x.toFixed(2)), y: Number(pos.y.toFixed(2)), z: Number(pos.z.toFixed(2)) };
-          const roundedRotation = { x: Number(rot.x.toFixed(2)), y: Number(rot.y.toFixed(2)), z: Number(rot.z.toFixed(2)), w: Number(rot.w.toFixed(2)) };
-
-          const positionChanged =
-            !lastMovePosition ||
-            Math.abs(roundedPosition.x - lastMovePosition.x) > 0.01 ||
-            Math.abs(roundedPosition.y - lastMovePosition.y) > 0.01 ||
-            Math.abs(roundedPosition.z - lastMovePosition.z) > 0.01;
-          const rotationChanged =
-            !lastMoveRotation ||
-            Math.abs(roundedRotation.x - lastMoveRotation.x) > 0.01 ||
-            Math.abs(roundedRotation.y - lastMoveRotation.y) > 0.01 ||
-            Math.abs(roundedRotation.z - lastMoveRotation.z) > 0.01 ||
-            Math.abs(roundedRotation.w - lastMoveRotation.w) > 0.01;
-
-          if (positionChanged || rotationChanged) {
-            try { socket.emit('move', { gameId, id: playerId, position: roundedPosition, rotation: roundedRotation }); } catch (e) {
-              console.error('Error emitting move event:', e);
-            }
-            lastMovePosition = roundedPosition;
-            lastMoveRotation = roundedRotation;
-          }
-        } catch (e) {
-          console.error('Error reading translation/rotation:', e);
-        }
-      }
-
-      // Check for player elimination
-      if (ballRigidBody && physicsEnabled && !isSpectating && playerId && gameId) {
-        try {
-          const pos = ballRigidBody.translation();
-          if (pos.y < -5 && !playersClient[playerId].eliminated) {
-            socket!.emit('request-elimination', { gameId, id: playerId });
-          }
-        } catch (e) {
-          console.error('Error checking elimination:', e);
-        }
-      }
-    }
-
-    let targetPlayerId: string | null = null;
-    if (isSpectating) {
-      const alivePlayers = Object.entries(playersClient).filter(([_, p]) => !p.eliminated);
-      targetPlayerId = alivePlayers.length > 0 ? alivePlayers[0][0] : null;
-    } else {
-      targetPlayerId = mode === 'single' ? 'local' : playerId;
-    }
-
-    let spherePosition = { x: 0, y: 0, z: 0 };
-    if (targetPlayerId && playersClient[targetPlayerId]) {
-      const mp = playersClient[targetPlayerId].mesh.position;
-      spherePosition = { x: mp.x, y: mp.y, z: mp.z };
-    }
-
-    const offsetDistance = 10;
-    const offsetHeight = 5;
-    camera.position.set(
-      spherePosition.x - offsetDistance * Math.cos(cameraAzimuth),
-      spherePosition.y + offsetHeight,
-      spherePosition.z - offsetDistance * Math.sin(cameraAzimuth)
-    );
-    camera.lookAt(spherePosition.x, spherePosition.y, spherePosition.z);
-
-    try { tweenGroup.update(time); } catch (e) {
-      console.error('Error updating tween:', e);
-    }
-  }
-
-  // Render the scene
-  if (shouldRender) {
+  if (isPaused && mode === 'single') {
     renderer.render(scene, camera);
+    return;
   }
+
+  if (world && physicsEnabled) {
+    // Update kinematic bodies for remote players before stepping
+    for (const [id, player] of Object.entries(playersClient)) {
+      if (id !== (mode === 'single' ? 'local' : playerId) && player.rigidBody && !player.eliminated) {
+        const pos = player.mesh.position;
+        const quat = player.mesh.quaternion;
+        player.rigidBody.setNextKinematicTranslation({ x: pos.x, y: pos.y, z: pos.z });
+        player.rigidBody.setNextKinematicRotation({ x: quat.x, y: quat.y, z: quat.z, w: quat.w });
+      }
+    }
+
+    try {
+      if (eventQueue) {
+        world.step(eventQueue);
+      } else {
+        world.step();
+      }
+    } catch (e) {
+      console.error('Error stepping physics world:', e);
+      try { world.step(); } catch (err) {
+        console.error('Fallback physics step failed:', err);
+      }
+    }
+  }
+
+  // Update local player
+  if (ballRigidBody) {
+    try {
+      const pos = ballRigidBody.translation();
+      const rot = ballRigidBody.rotation();
+      const localId = mode === 'single' ? 'local' : playerId;
+      playersClient[localId!].mesh.position.set(pos.x, pos.y, pos.z);
+      playersClient[localId!].mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+    } catch (e) {
+      console.error('Error updating local player mesh:', e);
+    }
+  }
+
+  // Smoothly interpolate non-local players
+  for (const [id, player] of Object.entries(playersClient)) {
+    if (id !== (mode === 'single' ? 'local' : playerId) && player.targetPosition && player.targetRotation && !player.eliminated) {
+      const targetPos = new THREE.Vector3(player.targetPosition.x, player.targetPosition.y, player.targetPosition.z);
+      const targetQuat = new THREE.Quaternion(player.targetRotation.x, player.targetRotation.y, player.targetRotation.z, player.targetRotation.w);
+      player.mesh.position.lerp(targetPos, 0.1);
+      player.mesh.quaternion.slerp(targetQuat, 0.1);
+    }
+  }
+
+  let isGrounded = false;
+  let contactedHexagon: typeof hexagonsClient[0] | null = null;
+
+  if (ballRigidBody) {
+    contactedHexagon = getContactedHexagon();
+    if (contactedHexagon) isGrounded = true;
+  }
+
+  canJump = isGrounded;
+
+  if (isGrounded && contactedHexagon) {
+    if (lastGroundedHexId !== contactedHexagon.id) {
+      if (collisionSound && collisionSound.isPlaying === false) {
+        try { collisionSound.play(); } catch (e) {
+          console.error('Error playing collision sound:', e);
+        }
+      }
+      if (!contactedHexagon.isBreaking && socket && gameId && playerId && mode !== 'single') {
+        const index = hexagonsClient.indexOf(contactedHexagon);
+        if (index >= 0) {
+          const collisionEventId = Date.now().toString();
+          try {
+            socket.emit('hexagon-collided', { gameId, index, playerId, eventId: collisionEventId });
+            setTimeout(() => {
+              if (!collisionAcknowledged[collisionEventId]) {
+                console.warn(`Collision event ${collisionEventId} not acknowledged, retrying...`);
+                socket!.emit('hexagon-collided', { gameId, index, playerId, eventId: collisionEventId });
+              }
+            }, 1000);
+          } catch (e) {
+            console.error('Error emitting hexagon-collided event:', e);
+          }
+          collisionAcknowledged[collisionEventId] = false;
+        }
+      } else if (mode === 'single' && !contactedHexagon.isBreaking) {
+        contactedHexagon.collisionCount = (contactedHexagon.collisionCount || 0) + 1;
+        if (contactedHexagon.collisionCount >= 3) {
+          breakHexagon(contactedHexagon);
+        }
+      }
+      lastGroundedHexId = contactedHexagon.id;
+    }
+  } else {
+    lastGroundedHexId = null;
+  }
+
+  handleJumping();
+  try { handleMovement(); } catch (e) {
+    console.error('Error in handleMovement:', e);
+  }
+
+  if (mode !== 'single' && socket && playerId && ballRigidBody && (time - lastSendTime >= sendInterval)) {
+    try {
+      const pos = ballRigidBody.translation();
+      const rot = ballRigidBody.rotation();
+      const roundedPosition = { x: Number(pos.x.toFixed(2)), y: Number(pos.y.toFixed(2)), z: Number(pos.z.toFixed(2)) };
+      const roundedRotation = { x: Number(rot.x.toFixed(2)), y: Number(rot.y.toFixed(2)), z: Number(rot.z.toFixed(2)), w: Number(rot.w.toFixed(2)) };
+
+      const positionChanged =
+        !lastMovePosition ||
+        Math.abs(roundedPosition.x - lastMovePosition.x) > 0.01 ||
+        Math.abs(roundedPosition.y - lastMovePosition.y) > 0.01 ||
+        Math.abs(roundedPosition.z - lastMovePosition.z) > 0.01;
+      const rotationChanged =
+        !lastMoveRotation ||
+        Math.abs(roundedRotation.x - lastMoveRotation.x) > 0.01 ||
+        Math.abs(roundedRotation.y - lastMoveRotation.y) > 0.01 ||
+        Math.abs(roundedRotation.z - lastMoveRotation.z) > 0.01 ||
+        Math.abs(roundedRotation.w - lastMoveRotation.w) > 0.01;
+
+      if (positionChanged || rotationChanged) {
+        try { socket.emit('move', { gameId, id: playerId, position: roundedPosition, rotation: roundedRotation }); } catch (e) {
+          console.error('Error emitting move event:', e);
+        }
+        lastMovePosition = roundedPosition;
+        lastMoveRotation = roundedRotation;
+        lastSendTime = time;
+      }
+    } catch (e) {
+      console.error('Error reading translation/rotation:', e);
+    }
+  }
+
+  let targetPlayerId: string | null = null;
+  if (isSpectating) {
+    const alivePlayers = Object.entries(playersClient).filter(([_, p]) => !p.eliminated);
+    targetPlayerId = alivePlayers.length > 0 ? alivePlayers[0][0] : null;
+  } else {
+    targetPlayerId = mode === 'single' ? 'local' : playerId;
+  }
+
+  let spherePosition = { x: 0, y: 0, z: 0 };
+  if (targetPlayerId && playersClient[targetPlayerId]) {
+    const mp = playersClient[targetPlayerId].mesh.position;
+    spherePosition = { x: mp.x, y: mp.y, z: mp.z };
+  }
+
+  const offsetDistance = 10;
+  const offsetHeight = 5;
+  camera.position.set(
+    spherePosition.x - offsetDistance * Math.cos(cameraAzimuth),
+    spherePosition.y + offsetHeight,
+    spherePosition.z - offsetDistance * Math.sin(cameraAzimuth)
+  );
+  camera.lookAt(spherePosition.x, spherePosition.y, spherePosition.z);
+
+  try { tweenGroup.update(time); } catch (e) {
+    console.error('Error updating tween:', e);
+  }
+  renderer.render(scene, camera);
 }
 
 function initPhysics(): void {
@@ -510,28 +491,41 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
   mesh.position.set(position.x, position.y, position.z);
   scene.add(mesh);
 
-  if (world && (id === playerId || (mode === 'single' && id === 'local'))) {
-    const rigidBodyDesc: RAPIER.RigidBodyDesc = RAPIER.RigidBodyDesc.dynamic()
-      .setTranslation(position.x, position.y, position.z)
-      .setLinearDamping(0.3);
-    const rigidBody: RAPIER.RigidBody = world.createRigidBody(rigidBodyDesc);
-    const colliderDesc: RAPIER.ColliderDesc = RAPIER.ColliderDesc.ball(0.5)
-      .setRestitution(0.8)
-      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
-      .setCollisionGroups(ALL_INTERACTION)
-      .setSolverGroups(ALL_INTERACTION);
-    const collider: RAPIER.Collider = world.createCollider(colliderDesc, rigidBody);
+  if (world) {
+    let rigidBody: RAPIER.RigidBody | undefined;
+    let collider: RAPIER.Collider | undefined;
+    if (id === playerId || (mode === 'single' && id === 'local')) {
+      const rigidBodyDesc: RAPIER.RigidBodyDesc = RAPIER.RigidBodyDesc.dynamic()
+        .setTranslation(position.x, position.y, position.z)
+        .setLinearDamping(0.3);
+      rigidBody = world.createRigidBody(rigidBodyDesc);
+      const colliderDesc: RAPIER.ColliderDesc = RAPIER.ColliderDesc.ball(0.5)
+        .setRestitution(0.8)
+        .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
+        .setCollisionGroups(ALL_INTERACTION)
+        .setSolverGroups(ALL_INTERACTION);
+      collider = world.createCollider(colliderDesc, rigidBody);
+      if (id === playerId || (mode === 'single' && id === 'local')) {
+        ballRigidBody = rigidBody;
+        ballCollider = collider;
+        try {
+          ballRigidBody.setEnabled(false);
+        } catch (e) {
+          console.error('Error disabling ballRigidBody:', e);
+        }
+      }
+    } else {
+      const rigidBodyDesc: RAPIER.RigidBodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased()
+        .setTranslation(position.x, position.y, position.z);
+      rigidBody = world.createRigidBody(rigidBodyDesc);
+      const colliderDesc: RAPIER.ColliderDesc = RAPIER.ColliderDesc.ball(0.5)
+        .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
+        .setCollisionGroups(ALL_INTERACTION)
+        .setSolverGroups(ALL_INTERACTION);
+      collider = world.createCollider(colliderDesc, rigidBody);
+    }
     rigidBodies.push({ mesh, rigidBody, collider });
     playersClient[id] = { mesh, rigidBody, collider, eliminated: false, targetPosition: position, targetRotation: { x: 0, y: 0, z: 0, w: 1 } };
-    if (id === playerId || (mode === 'single' && id === 'local')) {
-      ballRigidBody = rigidBody;
-      ballCollider = collider;
-      try {
-        ballRigidBody.setEnabled(false);
-      } catch (e) {
-        console.error('Error disabling ballRigidBody:', e);
-      }
-    }
   } else {
     playersClient[id] = { mesh, eliminated: false, targetPosition: position, targetRotation: { x: 0, y: 0, z: 0, w: 1 } };
     rigidBodies.push({ mesh });
@@ -696,7 +690,7 @@ function handleMouseMove(event: MouseEvent): void {
   }
 }
 
-function startCountdown(seconds: number, serverTime?: number, callback?: () => void): void {
+function startCountdown(seconds: number, serverTime?: number): void {
   const countdownElement = document.getElementById('countdown') as HTMLElement | null;
   if (!countdownElement) return;
   countdownElement.style.display = 'block';
@@ -709,7 +703,6 @@ function startCountdown(seconds: number, serverTime?: number, callback?: () => v
     const timeLeft = Math.max(0, Math.floor((endTime - Date.now()) / 1000));
     if (timeLeft <= 0) {
       countdownElement.style.display = 'none';
-      if (callback) callback();
       return;
     }
     countdownElement.textContent = timeLeft.toString();
@@ -805,7 +798,9 @@ function initMultiplayer(): void {
     serverStartTime = data.serverStartTime;
     data.hexagons.forEach((pos) => createHexagon(pos, true));
     data.players.forEach((player) => {
-      if (!playersClient[player.id]) {
+      if (player.id === playerId) {
+        createSphere(player.id, player.position, player.id === creatorId);
+      } else if (!playersClient[player.id]) {
         createSphere(player.id, player.position, player.id === creatorId);
       }
     });
@@ -818,16 +813,7 @@ function initMultiplayer(): void {
         console.error('Error disabling ballRigidBody:', e);
       }
     }
-    startCountdown(startTimer, serverStartTime, () => {
-      physicsEnabled = true;
-      if (ballRigidBody) {
-        try {
-          ballRigidBody.setEnabled(true);
-        } catch (e) {
-          console.error('Error enabling ballRigidBody:', e);
-        }
-      }
-    });
+    startCountdown(startTimer, serverStartTime);
   });
 
   socket.on('game-started', () => {
@@ -843,7 +829,7 @@ function initMultiplayer(): void {
   });
 
   socket.on('new-player', (data: { id: string; position: { x: number; y: number; z: number } }) => {
-    if (!playersClient[data.id]) {
+    if (data.id !== playerId && !playersClient[data.id]) {
       createSphere(data.id, data.position, data.id === creatorId);
       totalPlayers++;
       console.log(`New player joined: ${data.id}`);
@@ -929,7 +915,6 @@ function initMultiplayer(): void {
         }
         const joystick = document.querySelector('.joystick') as HTMLElement | null;
         const jumpButton = document.querySelector('.jump-button') as HTMLElement | null;
-        72
         if (joystick) joystick.style.display = 'none';
         if (jumpButton) jumpButton.style.display = 'none';
         showEndGameModal();
@@ -1156,16 +1141,15 @@ function init(): void {
     hexagons.forEach((pos) => createHexagon(pos));
     createSphere('local', { x: 0, y: 5, z: 0 }, true);
     totalPlayers = 1;
-    startCountdown(5, Date.now(), () => {
-      physicsEnabled = true;
-      if (ballRigidBody) {
-        try {
-          ballRigidBody.setEnabled(true);
-        } catch (e) {
-          console.error('Error enabling ballRigidBody:', e);
-        }
+    startCountdown(5);
+    physicsEnabled = true;
+    if (ballRigidBody) {
+      try {
+        ballRigidBody.setEnabled(true);
+      } catch (e) {
+        console.error('Error enabling ballRigidBody:', e);
       }
-    });
+    }
   } else {
     initMultiplayer();
   }
