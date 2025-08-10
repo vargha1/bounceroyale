@@ -690,7 +690,7 @@ function handleMouseMove(event: MouseEvent): void {
   }
 }
 
-function startCountdown(seconds: number, serverTime?: number): void {
+function startCountdown(seconds: number, serverTime?: number, callback?: () => void): void {
   const countdownElement = document.getElementById('countdown') as HTMLElement | null;
   if (!countdownElement) return;
   countdownElement.style.display = 'block';
@@ -703,6 +703,7 @@ function startCountdown(seconds: number, serverTime?: number): void {
     const timeLeft = Math.max(0, Math.floor((endTime - Date.now()) / 1000));
     if (timeLeft <= 0) {
       countdownElement.style.display = 'none';
+      if (callback) callback();
       return;
     }
     countdownElement.textContent = timeLeft.toString();
@@ -813,7 +814,16 @@ function initMultiplayer(): void {
         console.error('Error disabling ballRigidBody:', e);
       }
     }
-    startCountdown(startTimer, serverStartTime);
+    startCountdown(startTimer, serverStartTime, () => {
+      physicsEnabled = true;
+      if (ballRigidBody) {
+        try {
+          ballRigidBody.setEnabled(true);
+        } catch (e) {
+          console.error('Error enabling ballRigidBody:', e);
+        }
+      }
+    });
   });
 
   socket.on('game-started', () => {
@@ -1141,15 +1151,16 @@ function init(): void {
     hexagons.forEach((pos) => createHexagon(pos));
     createSphere('local', { x: 0, y: 5, z: 0 }, true);
     totalPlayers = 1;
-    startCountdown(5);
-    physicsEnabled = true;
-    if (ballRigidBody) {
-      try {
-        ballRigidBody.setEnabled(true);
-      } catch (e) {
-        console.error('Error enabling ballRigidBody:', e);
+    startCountdown(5, Date.now(), () => {
+      physicsEnabled = true;
+      if (ballRigidBody) {
+        try {
+          ballRigidBody.setEnabled(true);
+        } catch (e) {
+          console.error('Error enabling ballRigidBody:', e);
+        }
       }
-    }
+    });
   } else {
     initMultiplayer();
   }
