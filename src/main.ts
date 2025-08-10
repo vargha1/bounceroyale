@@ -265,14 +265,14 @@ function animate(time: number): void {
 
   canJump = isGrounded;
 
-  if (isGrounded && contactedHexagon) {
+  if (isGrounded && contactedHexagon && !contactedHexagon.isBreaking) {
     if (lastGroundedHexId !== contactedHexagon.id) {
       if (collisionSound && collisionSound.isPlaying === false) {
         try { collisionSound.play(); } catch (e) {
           console.error('Error playing collision sound:', e);
         }
       }
-      if (!contactedHexagon.isBreaking && socket && gameId && playerId && mode !== 'single') {
+      if (socket && gameId && playerId && mode !== 'single') {
         const index = hexagonsClient.indexOf(contactedHexagon);
         if (index >= 0) {
           const collisionEventId = Date.now().toString();
@@ -289,7 +289,7 @@ function animate(time: number): void {
           }
           collisionAcknowledged[collisionEventId] = false;
         }
-      } else if (mode === 'single' && !contactedHexagon.isBreaking) {
+      } else if (mode === 'single') {
         contactedHexagon.collisionCount = (contactedHexagon.collisionCount || 0) + 1;
         if (contactedHexagon.collisionCount >= 3) {
           breakHexagon(contactedHexagon);
@@ -334,6 +334,18 @@ function animate(time: number): void {
       }
     } catch (e) {
       console.error('Error reading translation/rotation:', e);
+    }
+  }
+
+  // Check for player elimination
+  if (ballRigidBody && physicsEnabled && !isSpectating && playerId && gameId) {
+    try {
+      const pos = ballRigidBody.translation();
+      if (pos.y < -5 && !playersClient[playerId].eliminated) {
+        socket!.emit('request-elimination', { gameId, id: playerId });
+      }
+    } catch (e) {
+      console.error('Error checking elimination:', e);
     }
   }
 
@@ -471,6 +483,7 @@ function createHexagon(position: { x: number; y: number; z: number }, isLocal: b
 }
 
 function createSphere(id: string, position: { x: number; y: number; z: number }, isCreator: boolean = false): void {
+  if (playersClient[id]) return; // Prevent creating duplicate spheres
   const geometry: THREE.SphereGeometry = new THREE.SphereGeometry(0.5, 16, 16);
   const material: THREE.MeshStandardMaterial = new THREE.MeshStandardMaterial({ color: isCreator ? 0xff0000 : 0x0000ff });
   const mesh: THREE.Mesh = new THREE.Mesh(geometry, material);
@@ -772,9 +785,7 @@ function initMultiplayer(): void {
     serverStartTime = data.serverStartTime;
     data.hexagons.forEach((pos) => createHexagon(pos, true));
     data.players.forEach((player) => {
-      if (player.id === playerId) {
-        createSphere(player.id, player.position, player.id === creatorId);
-      } else if (!playersClient[player.id]) {
+      if (!playersClient[player.id]) {
         createSphere(player.id, player.position, player.id === creatorId);
       }
     });
@@ -812,7 +823,7 @@ function initMultiplayer(): void {
   });
 
   socket.on('new-player', (data: { id: string; position: { x: number; y: number; z: number } }) => {
-    if (data.id !== playerId && !playersClient[data.id]) {
+    if (!playersClient[data.id]) {
       createSphere(data.id, data.position, data.id === creatorId);
       totalPlayers++;
       console.log(`New player joined: ${data.id}`);
@@ -898,6 +909,7 @@ function initMultiplayer(): void {
         }
         const joystick = document.querySelector('.joystick') as HTMLElement | null;
         const jumpButton = document.querySelector('.jump-button') as HTMLElement | null;
+        72
         if (joystick) joystick.style.display = 'none';
         if (jumpButton) jumpButton.style.display = 'none';
         showEndGameModal();
