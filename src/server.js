@@ -245,6 +245,33 @@ io.on('connection', (socket) => {
         }
     });
 
+    socket.on('player-eliminated', (data) => {
+        const gameId = data.gameId;
+        if (games[gameId] && games[gameId].players[data.playerId]) {
+            // Mark player as eliminated
+            games[gameId].players[data.playerId].eliminated = true;
+            games[gameId].players[data.playerId].rank = data.rank;
+            
+            // Notify all players in the game
+            io.to(gameId).emit('player-eliminated', {
+                id: data.playerId,
+                rank: data.rank
+            });
+            
+            console.log('Player eliminated:', { gameId, playerId: data.playerId, rank: data.rank });
+            
+            // Check if game should end
+            const alivePlayers = Object.values(games[gameId].players).filter(p => !p.eliminated);
+            if (alivePlayers.length <= 1) {
+                // Game ended
+                const winner = alivePlayers.length === 1 ? Object.keys(games[gameId].players).find(id => !games[gameId].players[id].eliminated) : null;
+                io.to(gameId).emit('game-ended', { winner });
+                delete games[gameId];
+                console.log('Game ended:', { gameId, winner });
+            }
+        }
+    });
+
     socket.on('disconnect', () => {
         console.log('User disconnected:', socket.id);
         for (const gameId in games) {

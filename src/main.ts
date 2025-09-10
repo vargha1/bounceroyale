@@ -20,6 +20,7 @@ let isSpectating: boolean = false;
 let totalPlayers: number = 0;
 let serverStartTime: number | null = null;
 let eliminationCheckInterval: NodeJS.Timeout | null = null;
+const DEATH_Y_LEVEL = -10; // Players die if they fall below this Y level
 let lastMovePosition: { x: number; y: number; z: number } | null = null;
 let lastMoveRotation: { x: number; y: number; z: number; w: number } | null = null;
 let lastFrameTime: number = performance.now();
@@ -51,6 +52,13 @@ let playersClient: { [id: string]: { mesh: THREE.Mesh; rigidBody?: RAPIER.RigidB
 let jumpSound!: THREE.Audio;
 let collisionSound!: THREE.Audio;
 let breakSound!: THREE.Audio;
+let audioContextInitialized: boolean = false;
+
+// Game features
+let playerScore: number = 0;
+let playerHealth: number = 100;
+let powerUps: { [id: string]: { type: string; duration: number; startTime: number; active: boolean } } = {};
+let particles: { mesh: THREE.Mesh; velocity: THREE.Vector3; life: number; maxLife: number }[] = [];
 const hexagonMaterial = new THREE.MeshStandardMaterial({
   color: 0x00ff00,
   side: THREE.DoubleSide,
@@ -60,6 +68,7 @@ const hexagonMaterial = new THREE.MeshStandardMaterial({
 
 // Collision groups
 const ALL_INTERACTION = 0x00010001;
+const PLAYER_COLLISION_GROUP = 0x00020002;
 
 let scene!: THREE.Scene;
 let camera!: THREE.PerspectiveCamera;
@@ -103,6 +112,201 @@ declare global {
   }
 }
 
+function initializeAudioContext(): void {
+  if (audioContextInitialized) return;
+  
+  try {
+    // Try to resume audio context if it's suspended
+    if (audioListener.context.state === 'suspended') {
+      audioListener.context.resume();
+    }
+    audioContextInitialized = true;
+    console.log('Audio context initialized');
+  } catch (e) {
+    console.error('Error initializing audio context:', e);
+  }
+}
+
+function playSound(sound: THREE.Audio, volume: number = 0.5): void {
+  if (!sound || !audioContextInitialized) return;
+  
+  try {
+    initializeAudioContext();
+    sound.setVolume(volume);
+    if (!sound.isPlaying) {
+      sound.play();
+    }
+  } catch (e) {
+    console.error('Error playing sound:', e);
+  }
+}
+
+function createParticleEffect(position: THREE.Vector3, color: number = 0xffffff, count: number = 10): void {
+  for (let i = 0; i < count; i++) {
+    const geometry = new THREE.SphereGeometry(0.1, 4, 4);
+    const material = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.8 });
+    const particle = new THREE.Mesh(geometry, material);
+    
+    particle.position.copy(position);
+    particle.position.add(new THREE.Vector3(
+      (Math.random() - 0.5) * 2,
+      Math.random() * 2,
+      (Math.random() - 0.5) * 2
+    ));
+    
+    const velocity = new THREE.Vector3(
+      (Math.random() - 0.5) * 10,
+      Math.random() * 10 + 5,
+      (Math.random() - 0.5) * 10
+    );
+    
+    const life = 1.0 + Math.random() * 0.5;
+    particles.push({ mesh: particle, velocity, life, maxLife: life });
+    scene.add(particle);
+  }
+}
+
+function updateParticles(deltaTime: number): void {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const particle = particles[i];
+    particle.life -= deltaTime;
+    
+    if (particle.life <= 0) {
+      scene.remove(particle.mesh);
+      particles.splice(i, 1);
+      continue;
+    }
+    
+    // Update position
+    particle.mesh.position.add(particle.velocity.clone().multiplyScalar(deltaTime));
+    
+    // Apply gravity
+    particle.velocity.y -= 9.81 * deltaTime;
+    
+    // Update opacity
+    const material = particle.mesh.material as THREE.MeshBasicMaterial;
+    material.opacity = particle.life / particle.maxLife;
+  }
+}
+
+function addPowerUp(type: string, duration: number = 10000): void {
+  const powerUpId = `${type}_${Date.now()}`;
+  powerUps[powerUpId] = {
+    type,
+    duration,
+    startTime: performance.now(),
+    active: true
+  };
+  
+  console.log(`Power-up activated: ${type} for ${duration}ms`);
+  updatePowerUpUI();
+}
+
+function updatePowerUps(): void {
+  const currentTime = performance.now();
+  
+  for (const [id, powerUp] of Object.entries(powerUps)) {
+    if (currentTime - powerUp.startTime > powerUp.duration) {
+      powerUp.active = false;
+      delete powerUps[id];
+      console.log(`Power-up expired: ${powerUp.type}`);
+    }
+  }
+  
+  // Apply health regeneration
+  if (hasPowerUp('health_regen')) {
+    updateHealth(0.5); // Regenerate 0.5 health per frame
+  }
+  
+  updatePowerUpUI();
+}
+
+function hasPowerUp(type: string): boolean {
+  return Object.values(powerUps).some(p => p.type === type && p.active);
+}
+
+function addScore(points: number): void {
+  playerScore += points;
+  updateScoreUI();
+}
+
+function updateHealth(change: number): void {
+  playerHealth = Math.max(0, Math.min(100, playerHealth + change));
+  updateScoreUI();
+  
+  if (playerHealth <= 0) {
+    const localId = mode === 'single' ? 'local' : playerId;
+    if (localId && !playersClient[localId]?.eliminated) {
+      eliminatePlayer(localId);
+    }
+  }
+}
+
+function updateScoreUI(): void {
+  let scoreUI = document.getElementById('score-ui');
+  if (!scoreUI) {
+    scoreUI = document.createElement('div');
+    scoreUI.id = 'score-ui';
+    scoreUI.style.cssText = `
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 10px 15px;
+      border-radius: 8px;
+      z-index: 100;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      font-size: 16px;
+    `;
+    document.body.appendChild(scoreUI);
+  }
+  scoreUI.innerHTML = `
+    <div>Score: ${playerScore}</div>
+    <div>Health: ${playerHealth}%</div>
+  `;
+}
+
+function updatePowerUpUI(): void {
+  let powerUpUI = document.getElementById('powerup-ui');
+  if (!powerUpUI) {
+    powerUpUI = document.createElement('div');
+    powerUpUI.id = 'powerup-ui';
+    powerUpUI.style.cssText = `
+      position: fixed;
+      top: 60px;
+      right: 20px;
+      background: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 10px 15px;
+      border-radius: 8px;
+      z-index: 100;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      font-size: 14px;
+    `;
+    document.body.appendChild(powerUpUI);
+  }
+  
+  const activePowerUps = Object.values(powerUps).filter(p => p.active);
+  if (activePowerUps.length > 0) {
+    powerUpUI.innerHTML = activePowerUps.map(p => {
+      const remaining = Math.max(0, p.duration - (performance.now() - p.startTime));
+      return `${p.type}: ${Math.ceil(remaining / 1000)}s`;
+    }).join('<br>');
+    powerUpUI.style.display = 'block';
+  } else {
+    powerUpUI.style.display = 'none';
+  }
+}
+
+function spawnRandomPowerUp(): void {
+  if (Math.random() < 0.1) { // 10% chance every call
+    const powerUpTypes = ['speed_boost', 'high_jump', 'invincibility', 'health_regen'];
+    const randomType = powerUpTypes[Math.floor(Math.random() * powerUpTypes.length)];
+    addPowerUp(randomType, 15000); // 15 seconds duration
+  }
+}
+
 function breakHexagon(
   hexagon: {
     id: string;
@@ -125,9 +329,13 @@ function breakHexagon(
     console.error('Error removing collider:', e);
   }
 
-  if (breakSound && breakSound.isPlaying === false) {
-    breakSound.play();
-  }
+  playSound(breakSound, 0.7);
+  
+  // Add particle effect
+  createParticleEffect(hexagon.mesh.position, 0x00ff00, 15);
+  
+  // Add score for breaking hexagon
+  addScore(10);
 
   const material: THREE.MeshStandardMaterial = hexagon.mesh.material as THREE.MeshStandardMaterial;
   const initialPosition: THREE.Vector3 = hexagon.mesh.position.clone();
@@ -167,6 +375,11 @@ function handleJumping(): void {
     if (canJumpUntil + 1600 > performance.now()) {
       jumpPower = 10;
     }
+    
+    // Apply power-up effects
+    if (hasPowerUp('high_jump')) {
+      jumpPower *= 1.5;
+    }
 
     try {
       ballRigidBody.applyImpulse({ x: 0, y: jumpPower, z: 0 }, true);
@@ -180,7 +393,7 @@ function handleJumping(): void {
       }
     }
 
-    if (jumpSound && jumpSound.isPlaying === false) jumpSound.play();
+    playSound(jumpSound, 0.6);
     keys.space = false;
     canJump = false;
     canJumpUntil = 0;
@@ -207,6 +420,141 @@ let physicsEnabled: boolean = false;
 const jumpAcknowledged: { [eventId: string]: boolean } = {};
 let lastSendTime: number = 0;
 const sendInterval = 33; // ~30 updates per second
+
+function eliminatePlayer(playerId: string): void {
+  const player = playersClient[playerId];
+  if (!player || player.eliminated) return;
+  
+  player.eliminated = true;
+  const remainingPlayers = Object.entries(playersClient).filter(([_, p]) => !p.eliminated);
+  player.rank = remainingPlayers.length + 1;
+  
+  console.log(`Player ${playerId} eliminated with rank ${player.rank}`);
+  
+  // Add particle effect for elimination
+  createParticleEffect(player.mesh.position, 0xff0000, 20);
+  
+  // Add score for elimination
+  addScore(50);
+  
+  if (playerId === (mode === 'single' ? 'local' : playerId)) {
+    // Local player eliminated
+    isSpectating = true;
+    if (ballRigidBody) {
+      try {
+        ballRigidBody.setEnabled(false);
+      } catch (e) {
+        console.error('Error disabling eliminated player rigidBody:', e);
+      }
+    }
+    
+    // Hide controls
+    const joystick = document.querySelector('.joystick') as HTMLElement | null;
+    const jumpButton = document.querySelector('.jump-button') as HTMLElement | null;
+    if (joystick) joystick.style.display = 'none';
+    if (jumpButton) jumpButton.style.display = 'none';
+    
+    // Show spectating UI
+    showSpectatingUI();
+  }
+  
+  // Remove player mesh from scene
+  try {
+    scene.remove(player.mesh);
+  } catch (e) {
+    console.error('Error removing eliminated player mesh:', e);
+  }
+  
+  // Remove physics body
+  if (player.rigidBody && world) {
+    try {
+      world.removeRigidBody(player.rigidBody);
+    } catch (e) {
+      console.error('Error removing eliminated player rigidBody:', e);
+    }
+  }
+  
+  // Clean up references
+  rigidBodies = rigidBodies.filter((body) => body.mesh !== player.mesh);
+  
+  // Check if game should end
+  const alivePlayers = Object.entries(playersClient).filter(([_, p]) => !p.eliminated);
+  if (alivePlayers.length <= 1) {
+    showEndGameModal();
+  }
+  
+  // Notify server in multiplayer mode
+  if (mode !== 'single' && socket && gameId) {
+    try {
+      socket.emit('player-eliminated', { gameId, playerId, rank: player.rank });
+    } catch (e) {
+      console.error('Error emitting player-eliminated event:', e);
+    }
+  }
+}
+
+function showSpectatingUI(): void {
+  // Create spectating UI if it doesn't exist
+  let spectatingUI = document.getElementById('spectating-ui');
+  if (!spectatingUI) {
+    spectatingUI = document.createElement('div');
+    spectatingUI.id = 'spectating-ui';
+    spectatingUI.style.cssText = `
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 10px 20px;
+      border-radius: 8px;
+      z-index: 100;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    `;
+    spectatingUI.innerHTML = `
+      <div>Spectating - Press TAB to switch players</div>
+    `;
+    document.body.appendChild(spectatingUI);
+  }
+  spectatingUI.style.display = 'block';
+}
+
+function hideSpectatingUI(): void {
+  const spectatingUI = document.getElementById('spectating-ui');
+  if (spectatingUI) {
+    spectatingUI.style.display = 'none';
+  }
+}
+
+function switchSpectatingPlayer(): void {
+  if (!isSpectating) return;
+  
+  const alivePlayers = Object.entries(playersClient).filter(([_, p]) => !p.eliminated);
+  if (alivePlayers.length === 0) return;
+  
+  // Find current spectating target
+  let currentIndex = 0;
+  const currentTarget = alivePlayers.find(([id, _]) => {
+    const player = playersClient[id];
+    return player && player.mesh.position.distanceTo(camera.position) < 15;
+  });
+  
+  if (currentTarget) {
+    currentIndex = alivePlayers.findIndex(([id, _]) => id === currentTarget[0]);
+  }
+  
+  // Switch to next player
+  const nextIndex = (currentIndex + 1) % alivePlayers.length;
+  const nextPlayerId = alivePlayers[nextIndex][0];
+  
+  // Update camera to follow next player
+  const nextPlayer = playersClient[nextPlayerId];
+  if (nextPlayer) {
+    const pos = nextPlayer.mesh.position;
+    camera.position.set(pos.x - 10, pos.y + 5, pos.z - 10);
+    camera.lookAt(pos.x, pos.y, pos.z);
+  }
+}
 
 function animate(time: number): void {
   animationFrameId = requestAnimationFrame(animate);
@@ -252,6 +600,19 @@ function animate(time: number): void {
       const localId = mode === 'single' ? 'local' : playerId;
       playersClient[localId!].mesh.position.set(pos.x, pos.y, pos.z);
       playersClient[localId!].mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+      
+      // Check for player death (falling below death level)
+      if (pos.y < DEATH_Y_LEVEL && !playersClient[localId!].eliminated) {
+        eliminatePlayer(localId!);
+      }
+      
+      // Reduce health when falling fast
+      if (pos.y < -5 && ballRigidBody) {
+        const velocity = ballRigidBody.linvel();
+        if (velocity.y < -10) {
+          updateHealth(-5);
+        }
+      }
     } catch (e) {
       console.error('Error updating local player mesh:', e);
     }
@@ -264,6 +625,11 @@ function animate(time: number): void {
       const targetQuat = new THREE.Quaternion(player.targetRotation.x, player.targetRotation.y, player.targetRotation.z, player.targetRotation.w);
       player.mesh.position.lerp(targetPos, 0.1);
       player.mesh.quaternion.slerp(targetQuat, 0.1);
+      
+      // Check for remote player death (falling below death level)
+      if (targetPos.y < DEATH_Y_LEVEL) {
+        eliminatePlayer(id);
+      }
     }
   }
 
@@ -279,11 +645,7 @@ function animate(time: number): void {
 
   if (isGrounded && contactedHexagon) {
     if (lastGroundedHexId !== contactedHexagon.id) {
-      if (collisionSound && collisionSound.isPlaying === false) {
-        try { collisionSound.play(); } catch (e) {
-          console.error('Error playing collision sound:', e);
-        }
-      }
+      playSound(collisionSound, 0.4);
       if (!contactedHexagon.isBreaking && socket && gameId && playerId && mode !== 'single') {
         const index = hexagonsClient.indexOf(contactedHexagon);
         if (index >= 0) {
@@ -364,18 +726,45 @@ function animate(time: number): void {
     spherePosition = { x: mp.x, y: mp.y, z: mp.z };
   }
 
-  const offsetDistance = 10;
-  const offsetHeight = 5;
-  camera.position.set(
-    spherePosition.x - offsetDistance * Math.cos(cameraAzimuth),
-    spherePosition.y + offsetHeight,
-    spherePosition.z - offsetDistance * Math.sin(cameraAzimuth)
-  );
-  camera.lookAt(spherePosition.x, spherePosition.y, spherePosition.z);
+  // Update camera position
+  if (!isSpectating) {
+    const offsetDistance = 10;
+    const offsetHeight = 5;
+    camera.position.set(
+      spherePosition.x - offsetDistance * Math.cos(cameraAzimuth),
+      spherePosition.y + offsetHeight,
+      spherePosition.z - offsetDistance * Math.sin(cameraAzimuth)
+    );
+    camera.lookAt(spherePosition.x, spherePosition.y, spherePosition.z);
+  } else {
+    // Spectating mode - follow the target player
+    const offsetDistance = 12;
+    const offsetHeight = 8;
+    camera.position.set(
+      spherePosition.x - offsetDistance * Math.cos(cameraAzimuth),
+      spherePosition.y + offsetHeight,
+      spherePosition.z - offsetDistance * Math.sin(cameraAzimuth)
+    );
+    camera.lookAt(spherePosition.x, spherePosition.y, spherePosition.z);
+  }
 
   try { tweenGroup.update(time); } catch (e) {
     console.error('Error updating tween:', e);
   }
+  
+  // Update particles
+  const deltaTime = (time - lastFrameTime) / 1000;
+  updateParticles(deltaTime);
+  
+  // Update power-ups
+  updatePowerUps();
+  
+  // Add survival score every second
+  if (Math.floor(time / 1000) !== Math.floor(lastFrameTime / 1000)) {
+    addScore(1);
+    spawnRandomPowerUp();
+  }
+  
   renderer.render(scene, camera);
 }
 
@@ -450,15 +839,15 @@ function createHexagon(position: { x: number; y: number; z: number }, isLocal: b
     try {
       colliderDesc = RAPIER.ColliderDesc.convexHull(vertices)!
         .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
-        .setCollisionGroups(ALL_INTERACTION)
-        .setSolverGroups(ALL_INTERACTION);
+        .setCollisionGroups(ALL_INTERACTION | PLAYER_COLLISION_GROUP)
+        .setSolverGroups(ALL_INTERACTION | PLAYER_COLLISION_GROUP);
     } catch (e) {
       console.error('Error creating convex hull collider:', e);
       try {
         colliderDesc = RAPIER.ColliderDesc.cuboid(2, 0.5, 2)
           .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
-          .setCollisionGroups(ALL_INTERACTION)
-          .setSolverGroups(ALL_INTERACTION);
+          .setCollisionGroups(ALL_INTERACTION | PLAYER_COLLISION_GROUP)
+          .setSolverGroups(ALL_INTERACTION | PLAYER_COLLISION_GROUP);
       } catch (err) {
         console.error('Error creating cuboid collider:', err);
         colliderDesc = null;
@@ -502,8 +891,8 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
       const colliderDesc: RAPIER.ColliderDesc = RAPIER.ColliderDesc.ball(0.5)
         .setRestitution(0.8)
         .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
-        .setCollisionGroups(ALL_INTERACTION)
-        .setSolverGroups(ALL_INTERACTION);
+        .setCollisionGroups(PLAYER_COLLISION_GROUP | ALL_INTERACTION)
+        .setSolverGroups(PLAYER_COLLISION_GROUP | ALL_INTERACTION);
       collider = world.createCollider(colliderDesc, rigidBody);
       if (id === playerId || (mode === 'single' && id === 'local')) {
         ballRigidBody = rigidBody;
@@ -519,9 +908,10 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
         .setTranslation(position.x, position.y, position.z);
       rigidBody = world.createRigidBody(rigidBodyDesc);
       const colliderDesc: RAPIER.ColliderDesc = RAPIER.ColliderDesc.ball(0.5)
+        .setRestitution(0.8)
         .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
-        .setCollisionGroups(ALL_INTERACTION)
-        .setSolverGroups(ALL_INTERACTION);
+        .setCollisionGroups(PLAYER_COLLISION_GROUP | ALL_INTERACTION)
+        .setSolverGroups(PLAYER_COLLISION_GROUP | ALL_INTERACTION);
       collider = world.createCollider(colliderDesc, rigidBody);
     }
     rigidBodies.push({ mesh, rigidBody, collider });
@@ -534,7 +924,12 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
 
 function handleMovement(): void {
   if (!ballRigidBody || isPaused || isSpectating || !physicsEnabled) return;
-  const moveImpulse: number = 0.05;
+  let moveImpulse: number = 0.05;
+  
+  // Apply speed power-up
+  if (hasPowerUp('speed_boost')) {
+    moveImpulse *= 1.5;
+  }
   let moveX: number = 0;
   let moveZ: number = 0;
 
@@ -797,7 +1192,9 @@ function initMultiplayer(): void {
     creatorId = data.creatorId;
     startTimer = data.startTimer;
     serverStartTime = data.serverStartTime;
-    data.hexagons.forEach((pos) => createHexagon(pos, true));
+    if (mode !== 'create') {
+      data.hexagons.forEach((pos) => createHexagon(pos, true));
+    }
     data.players.forEach((player) => {
       if (player.id === playerId) {
         createSphere(player.id, player.position, player.id === creatorId);
@@ -1137,6 +1534,19 @@ window.exitGame = function exitGame(): void {
   const jumpButton = document.querySelector('.jump-button') as HTMLElement | null;
   if (joystick) joystick.style.display = 'none';
   if (jumpButton) jumpButton.style.display = 'none';
+  hideSpectatingUI();
+  
+  // Clean up UI elements
+  const scoreUI = document.getElementById('score-ui');
+  const powerUpUI = document.getElementById('powerup-ui');
+  if (scoreUI) scoreUI.remove();
+  if (powerUpUI) powerUpUI.remove();
+  
+  // Reset game state
+  playerScore = 0;
+  playerHealth = 100;
+  powerUps = {};
+  particles = [];
   document.body.style.cursor = 'default';
   try {
     if (document.exitPointerLock) document.exitPointerLock();
@@ -1198,6 +1608,9 @@ function init(): void {
   document.body.appendChild(jumpButton);
 
   window.addEventListener('keydown', (event: KeyboardEvent) => {
+    // Initialize audio context on first key press
+    initializeAudioContext();
+    
     if (isSpectating) return;
     switch (event.key.toLowerCase()) {
       case 'w':
@@ -1219,6 +1632,11 @@ function init(): void {
         if (!keys.escape) {
           keys.escape = true;
           togglePause();
+        }
+        break;
+      case 'tab':
+        if (isSpectating) {
+          switchSpectatingPlayer();
         }
         break;
     }
@@ -1254,10 +1672,16 @@ function init(): void {
     }
   });
 
-  window.addEventListener('touchstart', handleTouchStart, { passive: false });
+  window.addEventListener('touchstart', (event) => {
+    initializeAudioContext();
+    handleTouchStart(event);
+  }, { passive: false });
   window.addEventListener('touchmove', handleTouchMove, { passive: false });
   window.addEventListener('touchend', handleTouchEnd, { passive: false });
-  window.addEventListener('mousemove', handleMouseMove);
+  window.addEventListener('mousemove', (event) => {
+    initializeAudioContext();
+    handleMouseMove(event);
+  });
 
   const canvas = renderer.domElement;
   try {
@@ -1313,6 +1737,9 @@ window.start = function start(gameMode: string, ip?: string, timer?: number, sel
   jumpSound = new THREE.Audio(audioListener);
   collisionSound = new THREE.Audio(audioListener);
   breakSound = new THREE.Audio(audioListener);
+  
+  // Initialize audio context on first user interaction
+  initializeAudioContext();
 
   const audioLoader = new THREE.AudioLoader();
   audioLoader.load('/sounds/jump.mp3', (buffer) => {
@@ -1347,4 +1774,7 @@ window.start = function start(gameMode: string, ip?: string, timer?: number, sel
   scene.add(directionalLight);
 
   init();
+  
+  // Initialize UI
+  updateScoreUI();
 };
