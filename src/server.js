@@ -1,10 +1,14 @@
 const express = require('express');
-const http = require('http');
+const https = require('https');
 const { Server } = require('socket.io');
 const MulticastDNS = require('multicast-dns');
 
 const app = express();
-const server = http.createServer(app);
+const options = {
+    cert: fs.readFileSync('/path/to/fullchain.pem'),
+    key: fs.readFileSync('/path/to/privkey.pem')
+};
+const server = https.createServer(options, app);
 const io = new Server(server, {
     cors: {
         origin: '*',
@@ -12,7 +16,7 @@ const io = new Server(server, {
     }
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 8443;
 
 // Game state: Map of game rooms
 const games = {};
