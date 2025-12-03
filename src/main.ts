@@ -426,10 +426,9 @@ function eliminatePlayer(playerId: string): void {
   if (!player || player.eliminated) return;
   
   player.eliminated = true;
-  const remainingPlayers = Object.entries(playersClient).filter(([_, p]) => !p.eliminated);
-  player.rank = remainingPlayers.length + 1;
+  // Rank will be set by the server via the player-eliminated event
   
-  console.log(`Player ${playerId} eliminated with rank ${player.rank}`);
+  console.log(`Player ${playerId} eliminated`);
   
   // Add particle effect for elimination
   createParticleEffect(player.mesh.position, 0xff0000, 20);
@@ -488,13 +487,18 @@ function eliminatePlayer(playerId: string): void {
     showEndGameModal();
   }
   
-  // Notify server in multiplayer mode
+  // Notify server in multiplayer mode (server will calculate and broadcast rank)
   if (mode !== 'single' && socket && gameId) {
     try {
-      socket.emit('player-eliminated', { gameId, playerId, rank: player.rank });
+      socket.emit('player-eliminated', { gameId, playerId });
     } catch (e) {
       console.error('Error emitting player-eliminated event:', e);
     }
+  } else if (mode === 'single') {
+    // In single player, calculate rank locally
+    const remainingPlayers = Object.entries(playersClient).filter(([_, p]) => !p.eliminated);
+    player.rank = remainingPlayers.length + 1;
+    console.log(`Player ${playerId} eliminated with rank ${player.rank}`);
   }
 }
 
@@ -953,7 +957,6 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
     let rigidBody: RAPIER.RigidBody | undefined;
     let collider: RAPIER.Collider | undefined;
     if (id === playerId || (mode === 'single' && id === 'local')) {
-      console.log(`Creating DYNAMIC rigid body for player ${id} (local player)`);
       const rigidBodyDesc: RAPIER.RigidBodyDesc = RAPIER.RigidBodyDesc.dynamic()
         .setTranslation(position.x, position.y, position.z)
         .setLinearDamping(0.3);
@@ -967,7 +970,6 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
       if (id === playerId || (mode === 'single' && id === 'local')) {
         ballRigidBody = rigidBody;
         ballCollider = collider;
-        console.log(`Disabling ballRigidBody for player ${id}`);
         try {
           ballRigidBody.setEnabled(false);
         } catch (e) {
@@ -1295,11 +1297,9 @@ function initMultiplayer(): void {
     
     // Disable physics initially - do this AFTER creating spheres
     physicsEnabled = false;
-    console.log(`Init handler: ballRigidBody exists? ${!!ballRigidBody}, disabling physics`);
     if (ballRigidBody) {
       try {
         ballRigidBody.setEnabled(false);
-        console.log(`Init handler: Successfully disabled ballRigidBody`);
       } catch (e) {
         console.error('Error disabling ballRigidBody:', e);
       }
@@ -1417,6 +1417,7 @@ function initMultiplayer(): void {
     if (player && !player.eliminated) {
       player.eliminated = true;
       player.rank = data.rank;
+      console.log(`Player ${data.id} eliminated with server-assigned rank ${data.rank}`);
       if (data.id === playerId) {
         playerRank = data.rank;
         isSpectating = true;

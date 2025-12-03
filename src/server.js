@@ -178,13 +178,17 @@ io.on('connection', (socket) => {
             startTimer = 30;
         }
 
+
+        const serverStartTime = Date.now() + startTimer * 1000;
+
         games[gameId] = {
             creatorId: socket.id,
             players: {
                 [socket.id]: { position: { x: 0, y: 5, z: 0 } }
             },
             hexagons: [...defaultHexagons],
-            startTimer
+            startTimer,
+            serverStartTime
         };
 
         socket.join(gameId);
@@ -196,7 +200,9 @@ io.on('connection', (socket) => {
                 position: games[gameId].players[id].position
             })),
             hexagons: games[gameId].hexagons,
-            startTimer
+            startTimer,
+            serverStartTime: games[gameId].serverStartTime,
+            remainingTime: Math.max(0, Math.ceil((games[gameId].serverStartTime - Date.now()) / 1000))
         });
         console.log('Game created:', { gameId, creatorId: socket.id, startTimer });
 
@@ -302,24 +308,26 @@ io.on('connection', (socket) => {
         if (games[gameId] && games[gameId].players[data.playerId]) {
             // Mark player as eliminated
             games[gameId].players[data.playerId].eliminated = true;
-            games[gameId].players[data.playerId].rank = data.rank;
 
-            // Notify all players in the game
+            // Calculate rank based on remaining alive players
+            const alivePlayers = Object.values(games[gameId].players).filter(p => !p.eliminated);
+            const rank = alivePlayers.length + 1;
+            games[gameId].players[data.playerId].rank = rank;
+
+            // Notify all players in the game with the server-calculated rank
             io.to(gameId).emit('player-eliminated', {
                 id: data.playerId,
-                rank: data.rank
+                rank: rank
             });
 
-            console.log('Player eliminated:', { gameId, playerId: data.playerId, rank: data.rank });
+            console.log('Player eliminated:', { gameId, playerId: data.playerId, rank: rank });
 
             // Check if game should end
-            const alivePlayers = Object.values(games[gameId].players).filter(p => !p.eliminated);
             if (alivePlayers.length <= 1) {
                 // Game ended
                 const winner = alivePlayers.length === 1 ? Object.keys(games[gameId].players).find(id => !games[gameId].players[id].eliminated) : null;
                 io.to(gameId).emit('game-ended', { winner });
                 delete games[gameId];
-                console.log('Game ended:', { gameId, winner });
             }
         }
     });
