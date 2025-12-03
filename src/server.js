@@ -162,7 +162,7 @@ function advertiseGame(gameId) {
 app.get('/discover-lan', (req, res) => {
     const availableGames = Object.keys(games).map(gameId => ({
         name: `Bounce Royale Game ${gameId}`,
-        address: `${req.headers.host || 'localhost'}:${PORT}`,
+        address: `${req.headers.host || 'localhost'}`,
         gameId
     }));
     res.json(availableGames.length ? availableGames : servers);
@@ -228,7 +228,8 @@ io.on('connection', (socket) => {
                 position: games[gameId].players[id].position
             })),
             hexagons: games[gameId].hexagons,
-            startTimer: games[gameId].startTimer
+            startTimer: games[gameId].startTimer,
+            remainingTime: Math.max(0, Math.ceil((games[gameId].serverStartTime - Date.now()) / 1000))
         });
         socket.to(gameId).emit('new-player', {
             id: socket.id,

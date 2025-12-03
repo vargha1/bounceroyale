@@ -1163,8 +1163,8 @@ function startCountdown(seconds: number, serverTime?: number, callback?: () => v
   countdownElement.style.display = 'block';
   countdownElement.style.opacity = '1';
 
-  const startTime = serverTime || Date.now();
-  const endTime = startTime + seconds * 1000;
+  // If serverTime is not provided, we assume 'seconds' is the remaining duration from NOW
+  const endTime = serverTime ? (serverTime + seconds * 1000) : (Date.now() + seconds * 1000);
 
   const countdown = () => {
     const timeLeft = Math.max(0, Math.floor((endTime - Date.now()) / 1000));
@@ -1273,7 +1273,7 @@ function initMultiplayer(): void {
     }
   });
 
-  socket!.on('init', (data: { gameId: string; creatorId: string; players: { id: string; position: { x: number; y: number; z: number } }[]; hexagons: { x: number; y: number; z: number }[]; startTimer: number; serverStartTime: number }) => {
+  socket!.on('init', (data: { gameId: string; creatorId: string; players: { id: string; position: { x: number; y: number; z: number } }[]; hexagons: { x: number; y: number; z: number }[]; startTimer: number; serverStartTime: number; remainingTime?: number }) => {
     console.log('Received init:', data);
     gameId = data.gameId;
     creatorId = data.creatorId;
@@ -1298,7 +1298,10 @@ function initMultiplayer(): void {
         console.error('Error disabling ballRigidBody:', e);
       }
     }
-    startCountdown(startTimer, serverStartTime, () => {
+    
+    // Use remainingTime if provided, otherwise fallback to calculating (which might be skewed)
+    const timeToStart = data.remainingTime !== undefined ? data.remainingTime : startTimer;
+    startCountdown(timeToStart, undefined, () => {
       physicsEnabled = true;
       if (ballRigidBody) {
         try {
@@ -1513,8 +1516,8 @@ function initMultiplayer(): void {
   });
 
   socket!.on('game-ended', () => {
-    window.exitGame();
-    alert('Game ended: Host disconnected');
+    showEndGameModal();
+    // alert('Game ended: Host disconnected');
   });
 
   socket!.on('error', (data: { message: string }) => {
@@ -1645,7 +1648,7 @@ window.exitGame = function exitGame(): void {
   const main = document.querySelector('main');
   if (header) header.classList.remove('hidden');
   if (aside) aside.classList.remove('hidden');
-  if (main) main.classList.add('hidden');
+  if (main) main.classList.remove('hidden');
   const countdownElement = document.getElementById('countdown') as HTMLElement | null;
   if (countdownElement) countdownElement.style.display = 'none';
   const endGameModal = document.getElementById('end-game-modal');
