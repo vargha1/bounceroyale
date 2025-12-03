@@ -953,6 +953,7 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
     let rigidBody: RAPIER.RigidBody | undefined;
     let collider: RAPIER.Collider | undefined;
     if (id === playerId || (mode === 'single' && id === 'local')) {
+      console.log(`Creating DYNAMIC rigid body for player ${id} (local player)`);
       const rigidBodyDesc: RAPIER.RigidBodyDesc = RAPIER.RigidBodyDesc.dynamic()
         .setTranslation(position.x, position.y, position.z)
         .setLinearDamping(0.3);
@@ -966,6 +967,7 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
       if (id === playerId || (mode === 'single' && id === 'local')) {
         ballRigidBody = rigidBody;
         ballCollider = collider;
+        console.log(`Disabling ballRigidBody for player ${id}`);
         try {
           ballRigidBody.setEnabled(false);
         } catch (e) {
@@ -1290,10 +1292,14 @@ function initMultiplayer(): void {
       }
     });
     totalPlayers = data.players.length;
+    
+    // Disable physics initially - do this AFTER creating spheres
     physicsEnabled = false;
+    console.log(`Init handler: ballRigidBody exists? ${!!ballRigidBody}, disabling physics`);
     if (ballRigidBody) {
       try {
         ballRigidBody.setEnabled(false);
+        console.log(`Init handler: Successfully disabled ballRigidBody`);
       } catch (e) {
         console.error('Error disabling ballRigidBody:', e);
       }
