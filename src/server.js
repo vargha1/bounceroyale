@@ -2,15 +2,17 @@ const express = require('express');
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
+const cors = require('cors');
 const { Server } = require('socket.io');
 const MulticastDNS = require('multicast-dns');
 
 const app = express();
+app.use(cors())
 
 // Configuration
-const PORT = process.env.PORT || 3000;
-const SSL_KEY_PATH = process.env.SSL_KEY_PATH || '/path/to/privkey.pem';
-const SSL_CERT_PATH = process.env.SSL_CERT_PATH || '/path/to/fullchain.pem';
+const PORT = process.env.PORT || 8443;
+const SSL_KEY_PATH = process.env.SSL_KEY_PATH || '/etc/letsencrypt/live/game.safahanbattery.ir/privkey.pem';
+const SSL_CERT_PATH = process.env.SSL_CERT_PATH || '/etc/letsencrypt/live/game.safahanbattery.ir/fullchain.pem';
 
 let server;
 let protocol = 'http';
@@ -18,7 +20,7 @@ let protocol = 'http';
 if (fs.existsSync(SSL_KEY_PATH) && fs.existsSync(SSL_CERT_PATH)) {
     const options = {
         key: fs.readFileSync(SSL_KEY_PATH),
-        cert: fs.readFileSync(SSL_CERT_PATH)
+        cert: fs.readFileSync(SSL_CERT_PATH),
     };
     server = https.createServer(options, app);
     protocol = 'https';

@@ -1160,7 +1160,7 @@ function initMultiplayer(): void {
   // If the page is served over HTTPS, use wss, otherwise ws
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
   const host = serverIp || window.location.hostname;
-  const port = serverIp ? '' : ':3000'; // Assume port 3000 for local dev if no IP provided
+  const port = serverIp ? '' : ':8443'; // Assume port 3000 for local dev if no IP provided
   
   // If serverIp contains a full URL (e.g. https://example.com), use it directly
   let serverUrl = '';
