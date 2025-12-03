@@ -84,6 +84,7 @@ let hexagonsClient: {
   collisionCount?: number;
   isBreaking: boolean;
 }[] = [];
+let colliderHandleToPlayerId: { [handle: number]: string } = {};
 
 function isMobileUserAgent(): boolean {
   const userAgent = navigator.userAgent;
@@ -473,6 +474,11 @@ function eliminatePlayer(playerId: string): void {
     }
   }
   
+  // Remove from collider map
+  if (player.collider) {
+    delete colliderHandleToPlayerId[player.collider.handle];
+  }
+  
   // Clean up references
   rigidBodies = rigidBodies.filter((body) => body.mesh !== player.mesh);
   
@@ -589,6 +595,54 @@ function animate(time: number): void {
         console.error('Fallback physics step failed:', err);
       }
     }
+    
+    // Handle collisions
+    if (eventQueue) {
+      eventQueue.drainCollisionEvents((handle1, handle2, started) => {
+        if (!started) return;
+        
+        let localColliderHandle = ballCollider ? ballCollider.handle : -1;
+        let otherHandle = -1;
+        
+        if (handle1 === localColliderHandle) otherHandle = handle2;
+        else if (handle2 === localColliderHandle) otherHandle = handle1;
+        
+        if (otherHandle !== -1) {
+          const otherPlayerId = colliderHandleToPlayerId[otherHandle];
+          if (otherPlayerId && otherPlayerId !== playerId) {
+            // Collision with another player
+            console.log(`Collided with player ${otherPlayerId}`);
+            
+            // Calculate impulse to push them away
+            if (ballRigidBody) {
+               const myPos = ballRigidBody.translation();
+               const otherPlayer = playersClient[otherPlayerId];
+               if (otherPlayer) {
+                 const otherPos = otherPlayer.mesh.position;
+                 const dx = otherPos.x - myPos.x;
+                 const dz = otherPos.z - myPos.z;
+                 const dist = Math.sqrt(dx*dx + dz*dz) || 0.01; // Avoid div by zero
+                 
+                 // Push force depends on our speed? Or just a fixed "bounce"
+                 // Let's use a fixed bounce + some velocity factor
+                 const pushForce = 5.0; 
+                 const impulse = {
+                   x: (dx / dist) * pushForce,
+                   y: 2.0, // Slight pop up
+                   z: (dz / dist) * pushForce
+                 };
+                 
+                 socket?.emit('player-hit', { 
+                   gameId, 
+                   targetId: otherPlayerId, 
+                   impulse 
+                 });
+               }
+            }
+          }
+        }
+      });
+    }
   }
 
   // Update local player
@@ -661,6 +715,22 @@ function animate(time: number): void {
             console.error('Error emitting hexagon-collided event:', e);
           }
           collisionAcknowledged[collisionEventId] = false;
+
+          // If we are the creator, we must also count our own collision locally
+          if (playerId === creatorId) {
+             const hexagon = hexagonsClient[index];
+             if (hexagon && !hexagon.isBreaking) {
+               hexagon.collisionCount = (hexagon.collisionCount || 0) + 1;
+               console.log(`(Local) Hexagon ${index} hit by creator. Count: ${hexagon.collisionCount}`);
+               if (hexagon.collisionCount >= 3) {
+                 try {
+                   socket.emit('break-hexagon', { gameId, index });
+                 } catch (e) {
+                   console.error('Error emitting break-hexagon:', e);
+                 }
+               }
+             }
+          }
         }
       } else if (mode === 'single' && !contactedHexagon.isBreaking) {
         contactedHexagon.collisionCount = (contactedHexagon.collisionCount || 0) + 1;
@@ -912,6 +982,9 @@ function createSphere(id: string, position: { x: number; y: number; z: number },
         .setCollisionGroups(PLAYER_COLLISION_GROUP | ALL_INTERACTION)
         .setSolverGroups(PLAYER_COLLISION_GROUP | ALL_INTERACTION);
       collider = world.createCollider(colliderDesc, rigidBody);
+    }
+    if (collider) {
+      colliderHandleToPlayerId[collider.handle] = id;
     }
     rigidBodies.push({ mesh, rigidBody, collider });
     playersClient[id] = { mesh, rigidBody, collider, eliminated: false, targetPosition: position, targetRotation: { x: 0, y: 0, z: 0, w: 1 } };
@@ -1303,6 +1376,9 @@ function initMultiplayer(): void {
           console.error('Error removing disconnected player rigidBody:', e);
         }
       }
+      if (player.collider) {
+        delete colliderHandleToPlayerId[player.collider.handle];
+      }
       rigidBodies = rigidBodies.filter((body) => body.mesh !== player.mesh);
       delete playersClient[data.id];
       const remainingPlayers = Object.entries(playersClient).filter(([_, p]) => !p.eliminated);
@@ -1423,6 +1499,17 @@ function initMultiplayer(): void {
         }
       }
     });
+  });
+
+  socket!.on('player-hit', (data: { targetId: string; impulse: { x: number; y: number; z: number } }) => {
+    if (data.targetId === playerId && ballRigidBody) {
+      console.log('I was hit! Applying impulse:', data.impulse);
+      try {
+        ballRigidBody.applyImpulse(data.impulse, true);
+      } catch (e) {
+        console.error('Error applying hit impulse:', e);
+      }
+    }
   });
 
   socket!.on('game-ended', () => {

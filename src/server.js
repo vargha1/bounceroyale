@@ -278,6 +278,14 @@ io.on('connection', (socket) => {
         }
     });
 
+    socket.on('player-hit', (data) => {
+        const gameId = data.gameId;
+        if (games[gameId]) {
+            // Forward hit to the target player
+            io.to(data.targetId).emit('player-hit', data);
+        }
+    });
+
     socket.on('break-hexagon', (data) => {
         const gameId = data.gameId;
         // Verify it's the creator
