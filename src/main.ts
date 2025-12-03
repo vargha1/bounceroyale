@@ -1368,6 +1368,25 @@ function initMultiplayer(): void {
     }
   });
 
+  socket!.on('hexagon-collided', (data: { index: number; playerId: string }) => {
+    // Only the creator manages game state (breaking hexagons)
+    if (playerId === creatorId) {
+      const hexagon = hexagonsClient[data.index];
+      if (hexagon && !hexagon.isBreaking) {
+        hexagon.collisionCount = (hexagon.collisionCount || 0) + 1;
+        console.log(`Hexagon ${data.index} hit by ${data.playerId}. Count: ${hexagon.collisionCount}`);
+        
+        if (hexagon.collisionCount >= 3) {
+          try {
+            socket!.emit('break-hexagon', { gameId, index: data.index });
+          } catch (e) {
+            console.error('Error emitting break-hexagon:', e);
+          }
+        }
+      }
+    }
+  });
+
   socket!.on('hexagon-broken', (data: { index: number; playerId: string }) => {
     const hexagon = hexagonsClient[data.index];
     if (hexagon && !hexagon.isBreaking) {

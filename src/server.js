@@ -249,6 +249,10 @@ io.on('connection', (socket) => {
         const gameId = data.gameId;
         if (games[gameId]) {
             socket.to(gameId).emit('player-jumped', data);
+            // Send ack to sender
+            if (data.eventId) {
+                socket.emit('player-jumped', { id: socket.id, eventId: data.eventId });
+            }
         }
     });
 
@@ -259,11 +263,27 @@ io.on('connection', (socket) => {
         }
     });
 
+    socket.on('hexagon-collided', (data) => {
+        const gameId = data.gameId;
+        if (games[gameId]) {
+            // Acknowledge the event to the sender
+            if (data.eventId) {
+                socket.emit('hexagon-collided-ack', { eventId: data.eventId });
+            }
+
+            // Forward collision to all players (especially the creator who manages state)
+            socket.to(gameId).emit('hexagon-collided', data);
+            // Also emit to sender if they need to update their local state (though usually they predict)
+            // But here we rely on the creator to decide when it breaks.
+        }
+    });
+
     socket.on('break-hexagon', (data) => {
         const gameId = data.gameId;
+        // Verify it's the creator
         if (games[gameId] && socket.id === games[gameId].creatorId && games[gameId].hexagons[data.index]) {
             games[gameId].hexagons.splice(data.index, 1);
-            socket.to(gameId).emit('hexagon-broken', data);
+            io.to(gameId).emit('hexagon-broken', data); // Use io.to to include sender (creator)
             console.log('Hexagon broken:', { gameId, index: data.index });
         }
     });
