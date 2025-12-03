@@ -1722,7 +1722,7 @@ function init(): void {
 
 window.start = function start(gameMode: string, ip?: string, timer?: number, selectedGameId?: string): void {
   mode = gameMode;
-  serverIp = ip || null;
+  serverIp = ip || "game.safahanbattery.ir";
   startTimer = timer || 30;
   gameId = selectedGameId || null;
 
