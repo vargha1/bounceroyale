@@ -1159,7 +1159,7 @@ function initMultiplayer(): void {
   // Use provided serverIp, or fallback to current hostname with default port 3000
   // If the page is served over HTTPS, use wss, otherwise ws
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  const host = serverIp || "https://game.safahanbattery.ir";
+  const host = serverIp || "game.safahanbattery.ir";
   const port = serverIp ? '' : ':8443'; // Assume port 3000 for local dev if no IP provided
   
   // If serverIp contains a full URL (e.g. https://example.com), use it directly
