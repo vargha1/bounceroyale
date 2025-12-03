@@ -1301,7 +1301,9 @@ function initMultiplayer(): void {
     
     // Use remainingTime if provided, otherwise fallback to calculating (which might be skewed)
     const timeToStart = data.remainingTime !== undefined ? data.remainingTime : startTimer;
-    startCountdown(timeToStart, undefined, () => {
+    
+    // If game has already started (remainingTime <= 0), enable physics immediately
+    if (timeToStart <= 0) {
       physicsEnabled = true;
       if (ballRigidBody) {
         try {
@@ -1310,7 +1312,19 @@ function initMultiplayer(): void {
           console.error('Error enabling ballRigidBody:', e);
         }
       }
-    });
+    } else {
+      // Otherwise, start countdown
+      startCountdown(timeToStart, undefined, () => {
+        physicsEnabled = true;
+        if (ballRigidBody) {
+          try {
+            ballRigidBody.setEnabled(true);
+          } catch (e) {
+            console.error('Error enabling ballRigidBody:', e);
+          }
+        }
+      });
+    }
   });
 
   socket!.on('game-started', () => {
