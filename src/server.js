@@ -1,22 +1,39 @@
 const express = require('express');
 const https = require('https');
+const http = require('http');
+const fs = require('fs');
 const { Server } = require('socket.io');
 const MulticastDNS = require('multicast-dns');
 
 const app = express();
-const options = {
-    cert: fs.readFileSync('/path/to/fullchain.pem'),
-    key: fs.readFileSync('/path/to/privkey.pem')
-};
-const server = https.createServer(options, app);
+
+// Configuration
+const PORT = process.env.PORT || 3000;
+const SSL_KEY_PATH = process.env.SSL_KEY_PATH || '/path/to/privkey.pem';
+const SSL_CERT_PATH = process.env.SSL_CERT_PATH || '/path/to/fullchain.pem';
+
+let server;
+let protocol = 'http';
+
+if (fs.existsSync(SSL_KEY_PATH) && fs.existsSync(SSL_CERT_PATH)) {
+    const options = {
+        key: fs.readFileSync(SSL_KEY_PATH),
+        cert: fs.readFileSync(SSL_CERT_PATH)
+    };
+    server = https.createServer(options, app);
+    protocol = 'https';
+    console.log('Starting HTTPS server...');
+} else {
+    server = http.createServer(app);
+    console.log('SSL certificates not found. Starting HTTP server...');
+}
+
 const io = new Server(server, {
     cors: {
         origin: '*',
         methods: ['GET', 'POST']
     }
 });
-
-const PORT = process.env.PORT || 8443;
 
 // Game state: Map of game rooms
 const games = {};
@@ -255,15 +272,15 @@ io.on('connection', (socket) => {
             // Mark player as eliminated
             games[gameId].players[data.playerId].eliminated = true;
             games[gameId].players[data.playerId].rank = data.rank;
-            
+
             // Notify all players in the game
             io.to(gameId).emit('player-eliminated', {
                 id: data.playerId,
                 rank: data.rank
             });
-            
+
             console.log('Player eliminated:', { gameId, playerId: data.playerId, rank: data.rank });
-            
+
             // Check if game should end
             const alivePlayers = Object.values(games[gameId].players).filter(p => !p.eliminated);
             if (alivePlayers.length <= 1) {

@@ -1,8 +1,7 @@
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d';
 import { Tween, Group, Easing } from '@tweenjs/tween.js';
-import { Socket } from 'socket.io-client';
-import io from 'socket.io-client';
+import io, { Socket } from 'socket.io-client';
 
 // Client setup
 let mode: string = 'single';
@@ -1157,14 +1156,29 @@ function showEndGameModal(): void {
 const collisionAcknowledged: { [eventId: string]: boolean } = {};
 
 function initMultiplayer(): void {
-  const serverUrl = serverIp || 'https://game.safahanbattery.ir:8443';
+  // Use provided serverIp, or fallback to current hostname with default port 3000
+  // If the page is served over HTTPS, use wss, otherwise ws
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const host = serverIp || window.location.hostname;
+  const port = serverIp ? '' : ':3000'; // Assume port 3000 for local dev if no IP provided
+  
+  // If serverIp contains a full URL (e.g. https://example.com), use it directly
+  let serverUrl = '';
+  if (serverIp && (serverIp.startsWith('http') || serverIp.startsWith('ws'))) {
+      serverUrl = serverIp;
+  } else {
+      serverUrl = `${protocol}://${host}${port}`;
+  }
+
+  console.log(`Connecting to server at: ${serverUrl}`);
+
   socket = io(serverUrl, {
     transports: ['websocket'],
-    reconnectionAttempts: 3,
+    reconnectionAttempts: 5,
     reconnectionDelay: 1000,
   });
 
-  socket.on('connect', () => {
+  socket!.on('connect', () => {
     console.log('Connected to server:', socket!.id);
     playerId = socket!.id;
     creatorId = mode === 'create' ? playerId : null;
@@ -1186,7 +1200,7 @@ function initMultiplayer(): void {
     }
   });
 
-  socket.on('init', (data: { gameId: string; creatorId: string; players: { id: string; position: { x: number; y: number; z: number } }[]; hexagons: { x: number; y: number; z: number }[]; startTimer: number; serverStartTime: number }) => {
+  socket!.on('init', (data: { gameId: string; creatorId: string; players: { id: string; position: { x: number; y: number; z: number } }[]; hexagons: { x: number; y: number; z: number }[]; startTimer: number; serverStartTime: number }) => {
     console.log('Received init:', data);
     gameId = data.gameId;
     creatorId = data.creatorId;
@@ -1223,7 +1237,7 @@ function initMultiplayer(): void {
     });
   });
 
-  socket.on('game-started', () => {
+  socket!.on('game-started', () => {
     physicsEnabled = true;
     if (ballRigidBody) {
       try {
@@ -1235,7 +1249,7 @@ function initMultiplayer(): void {
     console.log('Game started, physics enabled');
   });
 
-  socket.on('new-player', (data: { id: string; position: { x: number; y: number; z: number } }) => {
+  socket!.on('new-player', (data: { id: string; position: { x: number; y: number; z: number } }) => {
     if (data.id !== playerId && !playersClient[data.id]) {
       createSphere(data.id, data.position, data.id === creatorId);
       totalPlayers++;
@@ -1243,7 +1257,7 @@ function initMultiplayer(): void {
     }
   });
 
-  socket.on('player-moved', (data: { id: string; position: { x: number; y: number; z: number }; rotation: { x: number; y: number; z: number; w: number } }) => {
+  socket!.on('player-moved', (data: { id: string; position: { x: number; y: number; z: number }; rotation: { x: number; y: number; z: number; w: number } }) => {
     const player = playersClient[data.id];
     if (player && data.id !== playerId && !player.eliminated) {
       player.targetPosition = data.position;
@@ -1251,7 +1265,7 @@ function initMultiplayer(): void {
     }
   });
 
-  socket.on('player-jumped', (data: { id: string; eventId: string }) => {
+  socket!.on('player-jumped', (data: { id: string; eventId: string }) => {
     if (data.id !== playerId) {
       const player = playersClient[data.id];
       if (player && !player.eliminated) {
@@ -1263,7 +1277,7 @@ function initMultiplayer(): void {
     }
   });
 
-  socket.on('player-rotated', (data: { id: string; cameraAzimuth: number }) => {
+  socket!.on('player-rotated', (data: { id: string; cameraAzimuth: number }) => {
     if (data.id !== playerId) {
       const player = playersClient[data.id];
       if (player && !player.eliminated) {
@@ -1272,7 +1286,7 @@ function initMultiplayer(): void {
     }
   });
 
-  socket.on('player-disconnected', (data: { id: string }) => {
+  socket!.on('player-disconnected', (data: { id: string }) => {
     const player = playersClient[data.id];
     if (player && !player.eliminated) {
       player.eliminated = true;
@@ -1299,7 +1313,7 @@ function initMultiplayer(): void {
     }
   });
 
-  socket.on('player-eliminated', (data: { id: string; rank: number }) => {
+  socket!.on('player-eliminated', (data: { id: string; rank: number }) => {
     const player = playersClient[data.id];
     if (player && !player.eliminated) {
       player.eliminated = true;
@@ -1348,13 +1362,13 @@ function initMultiplayer(): void {
     }
   });
 
-  socket.on('hexagon-collided-ack', (data: { eventId: string }) => {
+  socket!.on('hexagon-collided-ack', (data: { eventId: string }) => {
     if (data.eventId && collisionAcknowledged[data.eventId] !== undefined) {
       collisionAcknowledged[data.eventId] = true;
     }
   });
 
-  socket.on('hexagon-broken', (data: { index: number; playerId: string }) => {
+  socket!.on('hexagon-broken', (data: { index: number; playerId: string }) => {
     const hexagon = hexagonsClient[data.index];
     if (hexagon && !hexagon.isBreaking) {
       console.log(`Breaking hexagon ${hexagon.id} by player ${data.playerId}`);
@@ -1362,7 +1376,7 @@ function initMultiplayer(): void {
     }
   });
 
-  socket.on('sync', (data: { players: { id: string; position: { x: number; y: number; z: number }; rotation: { x: number; y: number; z: number; w: number } }[] }) => {
+  socket!.on('sync', (data: { players: { id: string; position: { x: number; y: number; z: number }; rotation: { x: number; y: number; z: number; w: number } }[] }) => {
     data.players.forEach((playerData) => {
       if (playerData.id === playerId && ballRigidBody) {
         try {
@@ -1392,17 +1406,17 @@ function initMultiplayer(): void {
     });
   });
 
-  socket.on('game-ended', () => {
+  socket!.on('game-ended', () => {
     window.exitGame();
     alert('Game ended: Host disconnected');
   });
 
-  socket.on('error', (data: { message: string }) => {
+  socket!.on('error', (data: { message: string }) => {
     console.error('Server error:', data.message);
     alert(data.message);
   });
 
-  socket.on('connect_error', () => {
+  socket!.on('connect_error', () => {
     console.error('Connection error');
     alert('Failed to connect to server. Please try again.');
   });
