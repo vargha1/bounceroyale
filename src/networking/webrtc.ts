@@ -155,6 +155,8 @@ export class WebRTCNetHost implements NetClient {
     if (!peerId) throw new Error('Answer missing peerId');
     const pc = this.pendingOffers.get(peerId) || this.peerConns.get(peerId);
     if (!pc) throw new Error('No pending offer for peerId: ' + peerId);
+    console.log('Applying answer for peer:', peerId);
+    console.log('Current signaling state:', pc.signalingState);
     await pc.setRemoteDescription(parsed.sdp);
     this.pendingOffers.delete(peerId);
   }
@@ -164,17 +166,27 @@ export class WebRTCNetHost implements NetClient {
     this.peerConns.set(peerId, pc);
 
     pc.onconnectionstatechange = () => {
-      // Only treat 'failed' or 'closed' as fatal. 'disconnected' is a
-      // transient state we should ride through — Chrome frequently enters it
-      // for a second or two while ICE recovers, especially on Wi-Fi.
+      console.log(
+        '[HOST]',
+        peerId,
+        'Connection State:',
+        pc.connectionState
+      );
+
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         this.handlePeerDisconnect(peerId);
       }
     };
     pc.oniceconnectionstatechange = () => {
-      // Same logic for ICE — 'disconnected' is recoverable, 'failed' is fatal.
+      console.log(
+        '[HOST]',
+        peerId,
+        'ICE State:',
+        pc.iceConnectionState
+      );
+
       if (pc.iceConnectionState === 'failed') {
-        try { pc.restartIce(); } catch { /* ignore */ }
+        try { pc.restartIce(); } catch { }
       }
     };
     pc.ondatachannel = (e) => {
@@ -190,6 +202,7 @@ export class WebRTCNetHost implements NetClient {
     // Buffer small messages so a burst of position updates doesn't drop.
     try { dc.bufferedAmountLowThreshold = 65536; } catch { /* ignore */ }
     dc.onopen = () => {
+      console.log('[HOST]', peerId, 'DataChannel OPEN');
       this.emit({ type: 'new-player', data: { id: peerId, position: { x: (Math.random() - 0.5) * 6, y: 5, z: (Math.random() - 0.5) * 6 } } });
       this.emitPeerChange();
     };
@@ -200,6 +213,7 @@ export class WebRTCNetHost implements NetClient {
     // happens when Chrome briefly flaps the data channel during ICE consent
     // freshness checks.
     dc.onclose = () => {
+      console.log('[HOST]', peerId, 'DataChannel CLOSED');
       setTimeout(() => {
         if (dc.readyState === 'closed') this.handlePeerDisconnect(peerId);
       }, 1500);
@@ -246,15 +260,17 @@ export class WebRTCNetHost implements NetClient {
         }
         case 'init': {
           // Host forwarding init data to a guest (rarely needed in this direction)
-          this.emit({ type: 'init', data: {
-            gameId: msg.gameId,
-            creatorId: msg.creatorId,
-            players: msg.players,
-            islandSeed: msg.islandSeed,
-            islandSize: msg.islandSize,
-            startTimer: msg.startTimer,
-            serverStartTime: msg.serverStartTime,
-          } });
+          this.emit({
+            type: 'init', data: {
+              gameId: msg.gameId,
+              creatorId: msg.creatorId,
+              players: msg.players,
+              islandSeed: msg.islandSeed,
+              islandSize: msg.islandSize,
+              startTimer: msg.startTimer,
+              serverStartTime: msg.serverStartTime,
+            }
+          });
           break;
         }
         case 'game-started':
@@ -373,15 +389,32 @@ export class WebRTCNetGuest implements NetClient {
       this.bindDataChannel(this.dc);
     };
     this.pc.onconnectionstatechange = () => {
+      console.log(
+        '[GUEST]',
+        'Connection State:',
+        this.pc?.connectionState
+      );
+
       if (!this.pc) return;
-      if (this.pc.connectionState === 'failed' || this.pc.connectionState === 'closed') {
+
+      if (
+        this.pc.connectionState === 'failed' ||
+        this.pc.connectionState === 'closed'
+      ) {
         this.scheduleClose();
       }
     };
     this.pc.oniceconnectionstatechange = () => {
+      console.log(
+        '[GUEST]',
+        'ICE State:',
+        this.pc?.iceConnectionState
+      );
+
       if (!this.pc) return;
+
       if (this.pc.iceConnectionState === 'failed') {
-        try { this.pc.restartIce(); } catch { /* ignore */ }
+        try { this.pc.restartIce(); } catch { }
       }
     };
 
@@ -398,6 +431,7 @@ export class WebRTCNetGuest implements NetClient {
     dc.binaryType = 'arraybuffer';
     try { dc.bufferedAmountLowThreshold = 65536; } catch { /* ignore */ }
     dc.onopen = () => {
+      console.log('[GUEST] DataChannel OPEN');
       // Cancel any pending close — we reconnected.
       if (this.closeTimer !== null) {
         clearTimeout(this.closeTimer);
@@ -412,15 +446,17 @@ export class WebRTCNetGuest implements NetClient {
         const msg = JSON.parse(e.data as string) as NetMessage;
         switch (msg.kind) {
           case 'init':
-            this.emit({ type: 'init', data: {
-              gameId: msg.gameId,
-              creatorId: msg.creatorId,
-              players: msg.players,
-              islandSeed: msg.islandSeed,
-              islandSize: msg.islandSize,
-              startTimer: msg.startTimer,
-              serverStartTime: msg.serverStartTime,
-            } });
+            this.emit({
+              type: 'init', data: {
+                gameId: msg.gameId,
+                creatorId: msg.creatorId,
+                players: msg.players,
+                islandSeed: msg.islandSeed,
+                islandSize: msg.islandSize,
+                startTimer: msg.startTimer,
+                serverStartTime: msg.serverStartTime,
+              }
+            });
             break;
           case 'new-player':
             this.emit({ type: 'new-player', data: { id: msg.id, position: msg.position } });
@@ -467,6 +503,7 @@ export class WebRTCNetGuest implements NetClient {
       }
     };
     dc.onclose = () => {
+      console.log('[GUEST] DataChannel CLOSED');
       // Give ICE a moment to recover before declaring the connection lost.
       this.scheduleClose();
     };
