@@ -74,9 +74,21 @@ const LABEL = 'bounceroyale';
 // through a public server, defeating the purpose of "no server required" LAN
 // play. If both mDNS and STUN fail (e.g. mobile hotspot with no internet),
 // the host can manually enter its local IP — see createOffer(manualHostIp).
+// Multiple STUN servers for redundancy. Google's are usually reachable, but
+// some corporate/college networks block them. Adding OpenRelay and others
+// increases the chance that at least one works. We intentionally do NOT add
+// a TURN server (TURN would relay traffic through a public server, defeating
+// the purpose of "no server required" LAN play AND costing bandwidth). If
+// both mDNS and STUN fail on your network, use the manual LAN IP field.
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun3.l.google.com:19302' },
+  { urls: 'stun:stun.stunprotocol.org:3478' },
+  { urls: 'stun:stun.services.mozilla.com:3478' },
+  { urls: 'stun:stun.sipgate.net:3478' },
+  { urls: 'stun:stun.ekiga.net:3478' },
 ];
 
 // ============================================================================
@@ -511,28 +523,57 @@ export class WebRTCNetHost implements NetClient {
     const pc = new RTCPeerConnection(PC_CONFIG);
     this.peerConns.set(peerId, pc);
 
-    pc.onconnectionstatechange = () => {
-      console.log(
-        '[HOST]',
-        peerId,
-        'Connection State:',
-        pc.connectionState
-      );
-
-      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-        this.handlePeerDisconnect(peerId);
+    // Log every local ICE candidate as it's gathered. This is critical for
+    // debugging ICE failures on hotspots — without this log, you can't tell
+    // whether the host even gathered an mDNS candidate, a STUN candidate,
+    // or only an IP candidate. The candidate string includes the address
+    // type (`typ host` / `typ srflx` / etc.) so you can see what's available.
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        const cand = e.candidate.candidate || '';
+        // Truncate the long random mDNS hostnames for readability.
+        const pretty = cand.replace(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.local/g, '<mdns>.local');
+        console.log('[HOST]', peerId, 'local ICE candidate:', pretty);
+      } else {
+        console.log('[HOST]', peerId, 'ICE gathering complete');
       }
     };
+    // Also log the selected candidate pair once ICE succeeds — this tells
+    // us exactly which candidate the connection is using (e.g. mDNS vs the
+    // manual IP vs STUN), which is invaluable for diagnosing hotspot issues.
     pc.oniceconnectionstatechange = () => {
-      console.log(
-        '[HOST]',
-        peerId,
-        'ICE State:',
-        pc.iceConnectionState
-      );
-
+      console.log('[HOST]', peerId, 'ICE State:', pc.iceConnectionState);
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        // Read the selected local + remote candidate pair.
+        try {
+          const stats = pc.getStats();
+          stats.then((report) => {
+            report.forEach((s) => {
+              if (s.type === 'candidate-pair' && (s as any).selected) {
+                const local = (s as any).localCandidateId;
+                const remote = (s as any).remoteCandidateId;
+                let localCand: any = null;
+                let remoteCand: any = null;
+                report.forEach((r) => {
+                  if (r.id === local) localCand = r;
+                  if (r.id === remote) remoteCand = r;
+                });
+                console.log('[HOST]', peerId, 'selected ICE pair:',
+                  '\n  local :', localCand ? `${localCand.candidate}` : '?',
+                  '\n  remote:', remoteCand ? `${remoteCand.candidate}` : '?');
+              }
+            });
+          }).catch(() => { /* ignore */ });
+        } catch { /* ignore */ }
+      }
       if (pc.iceConnectionState === 'failed') {
         try { pc.restartIce(); } catch { }
+      }
+    };
+    pc.onconnectionstatechange = () => {
+      console.log('[HOST]', peerId, 'Connection State:', pc.connectionState);
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        this.handlePeerDisconnect(peerId);
       }
     };
     pc.ondatachannel = (e) => {
@@ -725,6 +766,7 @@ export class WebRTCNetHost implements NetClient {
     this.dataChannels.clear();
     this.peerConns.clear();
     this.pendingOffers.clear();
+    this.appliedAnswers.clear();
     this.emit({ type: 'close' });
   }
 }
@@ -1081,31 +1123,48 @@ export class WebRTCNetGuest implements NetClient {
  * Wait for ICE gathering to produce enough candidates for a reliable
  * cross-device connection.
  *
- * The problem we're solving: on a LAN, the browser gathers mDNS/host
- * candidates almost instantly (< 10 ms), but STUN (server-reflexive)
- * candidates take 200–800 ms because they require a round-trip to the STUN
- * server. If we resolve too early (as soon as the first candidate arrives),
- * the SDP only contains the mDNS candidate — which works between two tabs on
- * the same machine but does NOT resolve across devices on the same Wi-Fi
- * (each browser has its own mDNS responder).
+ * THE BUG THIS FIXES: the previous version had a 2.5-second early-resolve that
+ * fired as soon as ANY candidate was gathered (usually mDNS within ~10ms).
+ * STUN (server-reflexive) candidates take 200ms–5s because they require a
+ * round-trip to the STUN server. On many networks (especially slow Wi-Fi,
+ * corporate networks, or networks where Google's STUN is blocked and we fall
+ * back to other STUN servers), STUN takes longer than 2.5s. The old code would
+ * resolve with only mDNS candidates, the offer/answer would be sent, and ICE
+ * would fail because mDNS hostnames don't resolve across devices.
  *
- * Strategy: wait until we've seen at least one `srflx` (STUN) candidate, then
- * give a short grace period for any additional candidates. If no srflx
- * candidate arrives within the timeout, fall back to whatever we have (better
- * than blocking forever — the user might be on a network that blocks STUN).
+ * NEW STRATEGY (patient):
+ *   1. Wait for `iceGatheringState === 'complete'` — this is the most reliable
+ *      signal that ALL candidates (including STUN) have been gathered.
+ *   2. If we get a `srflx` (STUN) candidate, wait 500ms for any additional
+ *      candidates, then resolve (fast path — we have what we need).
+ *   3. If we ONLY have mDNS/host candidates after 6 seconds, assume STUN is
+ *      blocked and resolve with what we have (so the user isn't waiting
+ *      forever — the manual IP field is the workaround for this case).
+ *   4. Hard timeout at 12 seconds (fallback for very slow networks).
+ *
+ * The key change: we NO LONGER resolve early just because we got an mDNS
+ * candidate. We always give STUN at least 6 seconds to respond.
  */
-function waitForIceComplete(pc: RTCPeerConnection, timeoutMs = 6000): Promise<void> {
+function waitForIceComplete(pc: RTCPeerConnection, timeoutMs = 12000): Promise<void> {
   return new Promise((resolve) => {
-    if (pc.iceGatheringState === 'complete') return resolve();
+    if (pc.iceGatheringState === 'complete') {
+      console.log('[WebRTC] ICE gathering already complete');
+      return resolve();
+    }
     let done = false;
     let gotSrflx = false;
     let gotAnyCandidate = false;
+    let candidateTypes: string[] = [];
+    let mdnsOnlyTimer: number | null = null;
 
     const finish = () => {
       if (done) return;
       done = true;
       pc.removeEventListener('icegatheringstatechange', stateCheck);
       pc.removeEventListener('icecandidate', candidateCheck);
+      if (mdnsOnlyTimer !== null) clearTimeout(mdnsOnlyTimer);
+      console.log('[WebRTC] ICE gathering finished. Candidates:', candidateTypes.join(', ') || 'none',
+        gotSrflx ? '(has srflx ✓)' : '(NO srflx ✗ — cross-device may fail, use manual IP)');
       resolve();
     };
     const stateCheck = () => {
@@ -1114,16 +1173,21 @@ function waitForIceComplete(pc: RTCPeerConnection, timeoutMs = 6000): Promise<vo
     const candidateCheck = (e: RTCPeerConnectionIceEvent) => {
       if (e.candidate) {
         gotAnyCandidate = true;
-        // Check the candidate type. The candidate string contains a typ= field.
         const cand = e.candidate.candidate || '';
+        // Extract the candidate type for logging.
+        const typMatch = cand.match(/typ (\w+)/);
+        const typ = typMatch ? typMatch[1] : 'unknown';
+        candidateTypes.push(typ);
+
         if (cand.includes('typ srflx') || cand.includes('typ prflx') || cand.includes('typ relay')) {
           // Got a server-reflexive, peer-reflexive, or relay candidate —
           // these are the ones that work cross-device. Give a short grace
           // period for any more candidates, then resolve.
           gotSrflx = true;
-          setTimeout(finish, 300);
+          setTimeout(finish, 500);
         }
         // If we only have host/mDNS candidates so far, keep waiting for STUN.
+        // Don't resolve early — the old 2.5s early-resolve was the bug.
       } else {
         // null candidate = ICE gathering complete.
         finish();
@@ -1132,14 +1196,19 @@ function waitForIceComplete(pc: RTCPeerConnection, timeoutMs = 6000): Promise<vo
     pc.addEventListener('icegatheringstatechange', stateCheck);
     pc.addEventListener('icecandidate', candidateCheck);
 
-    // If we get at least one candidate but no srflx within 2.5s, resolve
-    // anyway — the network might block STUN, and host candidates are better
-    // than nothing (they'll work for same-machine testing at least).
-    setTimeout(() => {
-      if (gotAnyCandidate && !done) finish();
-    }, 2500);
+    // If we ONLY have mDNS/host candidates after 6 seconds, assume STUN is
+    // blocked on this network and resolve with what we have. The user can
+    // use the manual IP field as a workaround. (Previously this was 2.5s,
+    // which was too short — STUN often takes 3–5s on real networks.)
+    mdnsOnlyTimer = window.setTimeout(() => {
+      if (gotAnyCandidate && !gotSrflx && !done) {
+        console.warn('[WebRTC] Only mDNS/host candidates after 6s — STUN appears blocked.',
+          'Cross-device connection will likely fail. Use the manual LAN IP field as a workaround.');
+        finish();
+      }
+    }, 6000);
 
-    // Hard timeout.
+    // Hard timeout — 12s. If we still haven't finished, give up.
     setTimeout(finish, timeoutMs);
   });
 }

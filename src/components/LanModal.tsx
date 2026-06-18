@@ -43,6 +43,8 @@ export default function LanModal({ onCancel, onStart }: Props) {
   const [copiedKey, setCopiedKey] = useState<'host' | 'guest' | null>(null);
   const [status, setStatus] = useState<'idle' | 'connecting' | 'connected'>('idle');
   const [busy, setBusy] = useState(false);
+  /** Transient status text shown during long operations (e.g. ICE gathering). */
+  const [statusText, setStatusText] = useState<string | null>(null);
 
   // ---- Host state ----
   // Phase: 'idle' (before clicking Start) → 'waiting' (showing invite, awaiting answer) → 'connected'
@@ -111,6 +113,7 @@ export default function LanModal({ onCancel, onStart }: Props) {
   const startHost = async () => {
     setError(null);
     setBusy(true);
+    setStatusText('Gathering ICE candidates (up to 10s for STUN)...');
     try {
       const id = `host-${Math.random().toString(36).slice(2, 8)}`;
       const host = new WebRTCNetHost(id);
@@ -137,6 +140,7 @@ export default function LanModal({ onCancel, onStart }: Props) {
       webrtcHostRef.current = null;
     } finally {
       setBusy(false);
+      setStatusText(null);
     }
   };
 
@@ -176,6 +180,7 @@ export default function LanModal({ onCancel, onStart }: Props) {
     if (!webrtcHostRef.current) return;
     setError(null);
     setBusy(true);
+    setStatusText('Gathering ICE candidates (up to 10s for STUN)...');
     try {
       const code = await webrtcHostRef.current.regenerateOffer();
       setHostCode(code);
@@ -186,6 +191,7 @@ export default function LanModal({ onCancel, onStart }: Props) {
       setError(e?.message ?? 'Failed to regenerate invite code');
     } finally {
       setBusy(false);
+      setStatusText(null);
     }
   };
 
@@ -197,6 +203,7 @@ export default function LanModal({ onCancel, onStart }: Props) {
     if (!hostCodeInput.trim()) return;
     setError(null);
     setBusy(true);
+    setStatusText('Gathering ICE candidates (up to 10s for STUN)...');
     try {
       const id = `g-${Math.random().toString(36).slice(2, 9)}`;
       const guest = new WebRTCNetGuest(id);
@@ -223,6 +230,7 @@ export default function LanModal({ onCancel, onStart }: Props) {
       );
     } finally {
       setBusy(false);
+      setStatusText(null);
     }
   };
 
@@ -511,6 +519,22 @@ export default function LanModal({ onCancel, onStart }: Props) {
           </>
         )}
 
+        {statusText && (
+          <div style={{
+            marginTop: '0.5rem',
+            padding: '0.5rem 0.75rem',
+            background: 'rgba(100, 150, 255, 0.1)',
+            borderRadius: '6px',
+            fontSize: '0.85rem',
+            color: 'var(--text-dim)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+          }}>
+            <span className="dot" style={{ animation: 'pulse 1s infinite' }} />
+            {statusText}
+          </div>
+        )}
         {error && <p style={{ color: 'var(--danger)', fontSize: '0.85rem', marginTop: '0.5rem' }}>{error}</p>}
       </div>
     </div>
