@@ -87,7 +87,7 @@ export default function LanModal({ onCancel, onStart }: Props) {
       setGuestQrUrl('');
     }
   }, [guestCode]);
-    
+
   const copyToClipboard = (text: string, which: 'host' | 'guest') => {
     navigator.clipboard?.writeText(text).then(() => {
       setCopiedKey(which);
@@ -167,9 +167,12 @@ export default function LanModal({ onCancel, onStart }: Props) {
       setGuestPhase('answer');
       setStatus('connecting');
     } catch (e: any) {
-      setError(e?.message ?? 'Failed to read host code. Make sure you pasted the full code.');
-      webrtcGuestRef.current?.close();
-      webrtcGuestRef.current = null;
+      console.error("JOIN ERROR:", e);
+      setError(
+        e?.stack ||
+        e?.message ||
+        JSON.stringify(e)
+      );
     } finally {
       setBusy(false);
     }
