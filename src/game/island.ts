@@ -9,8 +9,11 @@
  *   - Lay out a hex grid (flat-top orientation) within a bounding circle.
  *   - For each grid cell, compute "island-ness" = noise(x,z) × radial_falloff.
  *   - If island-ness > threshold, the tile exists.
- *   - Height is derived from a second noise channel + radial lift so the
- *     centre is slightly higher than the edges (gentle hill).
+ *   - Height is derived from multiple noise channels:
+ *       • A low-frequency base shape (rolling hills).
+ *       • A ridge-noise layer for sharper peaks and valleys.
+ *       • A high-frequency detail layer for small bumps.
+ *       • A radial lift so the centre is slightly higher than the edges.
  *
  * Colouring is done in the engine (based on height) so this module only
  * deals with geometry.
@@ -35,6 +38,19 @@ const SIZE_PARAMS: Record<IslandSize, { gridRadius: number; tileRadius: number; 
   medium: { gridRadius: 10, tileRadius: 0.6, noiseScale: 0.30, threshold: 0.32 },
   large: { gridRadius: 13, tileRadius: 0.6, noiseScale: 0.25, threshold: 0.33 },
 };
+
+// Height tuning. The ridge layer is the main source of "up and down"
+// character — it's positive-only (peaks, no valleys), and the base fbm
+// (centered around 0) provides the gentle hills and dips. Detail adds
+// surface roughness. Constants are picked so heights can range from
+// ~0.3 (clamped sand beaches) up to ~7.0 (sharp rock peaks), giving
+// strong local variation while keeping the floor non-negative.
+const HEIGHT_BASE = 1.2;
+const HEIGHT_BASE_AMP = 1.5;    // hills & dips (centered, ±1.5)
+const HEIGHT_RIDGE_AMP = 3.0;   // sharp peaks (positive only, 0 → 3.0)
+const HEIGHT_DETAIL_AMP = 0.5;  // surface bumps (centered, ±0.5)
+const HEIGHT_RADIAL_AMP = 1.0;  // centre dome
+const HEIGHT_MIN = 0.3;         // floor — never let tiles sink below this
 
 // ---- Deterministic hash-based value noise ----
 
@@ -65,6 +81,28 @@ function fbm(x: number, z: number, seed: number, octaves = 4): number {
   let max = 0;
   for (let i = 0; i < octaves; i++) {
     total += smoothNoise(x * frequency, z * frequency, seed + i * 17) * amplitude;
+    max += amplitude;
+    amplitude *= 0.5;
+    frequency *= 2;
+  }
+  return total / max;
+}
+
+/**
+ * Ridge noise — produces sharp ridgelines instead of smooth hills.
+ * Output is in [0, 1]. The 1 - |2n - 1| trick creates a tent shape that
+ * folds smooth noise into ridges; raising it to a power sharpens them.
+ */
+function ridgeNoise(x: number, z: number, seed: number, octaves = 4, sharpness = 1.5): number {
+  let total = 0;
+  let amplitude = 1;
+  let frequency = 1;
+  let max = 0;
+  for (let i = 0; i < octaves; i++) {
+    const n = smoothNoise(x * frequency, z * frequency, seed + i * 31);
+    const ridge = 1 - Math.abs(2 * n - 1);
+    const shaped = Math.pow(ridge, sharpness);
+    total += shaped * amplitude;
     max += amplitude;
     amplitude *= 0.5;
     frequency *= 2;
@@ -118,11 +156,46 @@ export function generateIsland(size: IslandSize = 'medium', seed: number = Date.
 
       if (islandness < threshold) continue;
 
-      // ---- Height map ----
-      // Centre tiles are higher (gentle hill), edges are lower (beach level).
-      const heightNoise = fbm((x + noiseOffsetX) * 0.4, (z + noiseOffsetZ) * 0.4, seed + 999, 3);
-      const radialLift = (1 - smoothstep(0, worldRadius * 0.8, dist)) * 1.8;
-      const y = 0.2 + heightNoise * 0.8 + radialLift;
+      // ---- Height map (lots of variation) ----
+      // Three independent noise layers:
+      //   1. Low-frequency rolling hills (fbm), centered around 0 so we get
+      //      both gentle dips and gentle rises.
+      //   2. Ridge noise — produces sharp peaks (the main "up and down"
+      //      character). Used as a positive-only offset, so peaks push tiles
+      //      up but never dig below the base.
+      //   3. High-frequency detail for small bumps and surface roughness,
+      //      also centered around 0.
+      //
+      // We sample each at a different scale and seed so they don't correlate,
+      // then weight them together. Heights end up roughly in [0.4, 5.4]
+      // depending on the noise lottery, giving noticeable peaks and valleys
+      // across the island while keeping the floor non-negative.
+      const nx = x + noiseOffsetX;
+      const nz = z + noiseOffsetZ;
+
+      const baseRoll = fbm(nx * 0.35, nz * 0.35, seed + 999, 4);            // [0,1] smooth hills
+      const ridge = ridgeNoise(nx * 0.5, nz * 0.5, seed + 5555, 5, 1.2);   // [0,1] sharp ridges
+      const detail = fbm(nx * 1.7, nz * 1.7, seed + 7777, 3);               // [0,1] small bumps
+
+      // Center the base & detail around zero so they can produce dips too.
+      // Ridge stays positive — it adds peaks only.
+      const baseCentered = baseRoll * 2 - 1;   // [-1, 1]
+      const detailCentered = detail * 2 - 1;   // [-1, 1]
+
+      // Centre tiles get a slight dome so the middle isn't a flat plateau.
+      const radialLift = (1 - smoothstep(0, worldRadius * 0.85, dist)) * HEIGHT_RADIAL_AMP;
+
+      // Compose: base + ridge (dominant peaks) + detail + radial dome.
+      // Clamp to HEIGHT_MIN so deep valleys don't sink tiles below the
+      // water/floor — sand beaches sit at the clamp level.
+      const y = Math.max(
+        HEIGHT_MIN,
+        HEIGHT_BASE +
+          baseCentered * HEIGHT_BASE_AMP +
+          ridge * HEIGHT_RIDGE_AMP +
+          detailCentered * HEIGHT_DETAIL_AMP +
+          radialLift,
+      );
 
       // Stable ID based on grid coordinates — same across all peers.
       const id = `t-${col}-${row}`;

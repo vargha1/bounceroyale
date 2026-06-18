@@ -429,11 +429,14 @@ export function createGameEngine(opts: EngineOptions) {
     if (tilesById.has(id)) return; // dedupe — stable IDs mean this can be called twice in multiplayer
     const geo = createHexagonGeometry(TILE_RADIUS, TILE_HEIGHT);
     // Colour by height: low = sandy beach, mid = grass, high = rock.
+    // Island heights span ~[0.3, 3.5] (see island.ts) — pick thresholds so
+    // we get a visible mix of sand (valleys & edges), grass (mid), and rock
+    // (peaks) instead of everything ending up grass.
     const baseColor = new THREE.Color();
-    const heightFactor = Math.min(1, pos.y / 2.5);
-    if (heightFactor < 0.35) {
+    const heightFactor = Math.min(1, pos.y / 3.5);
+    if (heightFactor < 0.25) {
       baseColor.setHSL(0.12, 0.55, 0.62); // warm sand
-    } else if (heightFactor < 0.7) {
+    } else if (heightFactor < 0.55) {
       baseColor.setHSL(0.33, 0.65, 0.42); // grass green
     } else {
       baseColor.setHSL(0.08, 0.15, 0.45); // rock grey-brown

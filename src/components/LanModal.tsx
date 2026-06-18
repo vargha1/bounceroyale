@@ -5,7 +5,7 @@ import { t } from '../i18n/translations';
 import { WebRTCNetHost, WebRTCNetGuest } from '../networking/webrtc';
 import type { NetClient } from '../networking/types';
 
-type Tab = 'menu' | 'webrtc-host' | 'webrtc-join';
+type Tab = 'menu' | 'host' | 'join';
 
 interface Props {
   onCancel: () => void;
@@ -18,17 +18,21 @@ interface Props {
 }
 
 /**
- * LAN multiplayer modal — cross-device only, using WebRTC.
+ * LAN multiplayer modal — cross-device, pure WebRTC (no signaling server).
  *
- * Two options:
- *   1. Host Game — creates a host, waits for a guest's SDP offer, generates
- *      an answer, and starts the game when the guest connects.
- *   2. Join Game — creates an SDP offer, sends it to the host, pastes the
- *      host's answer, and connects.
+ * Simplified 2-step flow:
  *
- * No server required. Both peers exchange SDP codes via copy-paste or QR
- * scan, then all game traffic flows directly between the two browsers over
- * WebRTC data channels.
+ *   HOST
+ *   1. Click "Start Hosting" → host's invite code (QR + text) appears.
+ *   2. Guest scans/copies it → returns their answer code.
+ *   3. Host pastes the answer → connected.
+ *
+ *   GUEST
+ *   1. Paste the host's invite code → answer code (QR + text) appears.
+ *   2. Send the answer back to the host → connected once host applies it.
+ *
+ * Codes are deflate-compressed + base64url-encoded (see webrtc.ts) so they
+ * fit comfortably inside a small QR code.
  */
 export default function LanModal({ onCancel, onStart }: Props) {
   const { language } = useSettings();
@@ -36,115 +40,138 @@ export default function LanModal({ onCancel, onStart }: Props) {
   const [tab, setTab] = useState<Tab>('menu');
   const [timer, setTimer] = useState(30);
   const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copiedKey, setCopiedKey] = useState<'host' | 'guest' | null>(null);
   const [status, setStatus] = useState<'idle' | 'connecting' | 'connected'>('idle');
+  const [busy, setBusy] = useState(false);
 
-  // WebRTC host state
-  const [offerInput, setOfferInput] = useState(''); // guest's offer pasted by host
-  const [answerCode, setAnswerCode] = useState(''); // host's answer to copy back
-  const [answerQrUrl, setAnswerQrUrl] = useState('');
+  // ---- Host state ----
+  // Phase: 'idle' (before clicking Start) → 'waiting' (showing invite, awaiting answer) → 'connected'
+  const [hostPhase, setHostPhase] = useState<'idle' | 'waiting'>('idle');
+  const [hostCode, setHostCode] = useState('');
+  const [hostQrUrl, setHostQrUrl] = useState('');
+  const [guestAnswerInput, setGuestAnswerInput] = useState('');
   const webrtcHostRef = useRef<WebRTCNetHost | null>(null);
   const startedRef = useRef(false);
 
-  // WebRTC guest state
-  const [hostToken, setHostToken] = useState('');
-  const [offerCode, setOfferCode] = useState(''); // guest's offer to copy out
-  const [offerQrUrl, setOfferQrUrl] = useState('');
-  const [answerInput, setAnswerInput] = useState(''); // host's answer pasted by guest
+  // ---- Guest state ----
+  // Phase: 'idle' (paste host code) → 'answer' (showing answer, waiting for host to apply) → 'connected'
+  const [guestPhase, setGuestPhase] = useState<'idle' | 'answer'>('idle');
+  const [hostCodeInput, setHostCodeInput] = useState('');
+  const [guestCode, setGuestCode] = useState('');
+  const [guestQrUrl, setGuestQrUrl] = useState('');
   const webrtcGuestRef = useRef<WebRTCNetGuest | null>(null);
 
+  // Generate QR codes (small + low error-correction for higher density / easier scan).
   useEffect(() => {
-    if (answerCode) {
-      QRCode.toDataURL(answerCode, { width: 200, margin: 1 }).then(setAnswerQrUrl).catch(() => setAnswerQrUrl(''));
+    if (hostCode) {
+      QRCode.toDataURL(hostCode, {
+        margin: 4,
+        errorCorrectionLevel: 'L'
+      })
+        .then(setHostQrUrl)
+        .catch(() => setHostQrUrl(''));
     } else {
-      setAnswerQrUrl('');
+      setHostQrUrl('');
     }
-  }, [answerCode]);
+  }, [hostCode]);
 
   useEffect(() => {
-    if (offerCode) {
-      QRCode.toDataURL(offerCode, { width: 200, margin: 1 }).then(setOfferQrUrl).catch(() => setOfferQrUrl(''));
+    if (guestCode) {
+      QRCode.toDataURL(guestCode, {
+        margin: 4,
+        errorCorrectionLevel: 'L'
+      })
+        .then(setGuestQrUrl)
+        .catch(() => setGuestQrUrl(''));
     } else {
-      setOfferQrUrl('');
+      setGuestQrUrl('');
     }
-  }, [offerCode]);
-
-  const copyToClipboard = (text: string) => {
+  }, [guestCode]);
+    
+  const copyToClipboard = (text: string, which: 'host' | 'guest') => {
     navigator.clipboard?.writeText(text).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      setCopiedKey(which);
+      setTimeout(() => setCopiedKey(null), 1500);
     });
   };
 
-  // ---- WebRTC host: create PeerConnection, accept guest's offer, produce answer ----
-  const startWebrtcHost = async () => {
-    setError(null);
-    const id = `host-${Math.random().toString(36).slice(2, 8)}`;
-    const host = new WebRTCNetHost(id);
-    webrtcHostRef.current = host;
-    host.onPeerChange((peers) => {
-      if (peers.length > 0 && !startedRef.current) {
-        startedRef.current = true;
-        setStatus('connected');
-        (window as any).__bounceroyale_pendingNet = host;
-        onStart(host, timer);
-      }
-    });
-    await host.host();
-    setStatus('connecting');
-  };
+  // ===========================================================================
+  // Host actions
+  // ===========================================================================
 
-  const generateAnswer = async () => {
-    if (!offerInput.trim() || !webrtcHostRef.current) return;
+  const startHost = async () => {
     setError(null);
+    setBusy(true);
     try {
-      const { answerSdp } = await webrtcHostRef.current.acceptGuest(offerInput.trim());
-      setAnswerCode(answerSdp);
-    } catch (e: any) {
-      setError(e?.message ?? 'Failed to process guest offer');
-    }
-  };
-
-  // ---- WebRTC guest: create offer, accept host's answer ----
-  const startWebrtcGuest = async () => {
-    setError(null);
-    if (hostToken.trim()) {
-      try {
-        const parsed = JSON.parse(hostToken.trim());
-        if (parsed?.kind !== 'host-invite') throw new Error('bad token');
-      } catch {
-        setError('Invalid host token. Paste exactly what the host shared, or leave blank.');
-        return;
-      }
-    }
-    const id = `g-${Math.random().toString(36).slice(2, 9)}`;
-    const guest = new WebRTCNetGuest(id);
-    webrtcGuestRef.current = guest;
-    guest.onMessage((ev) => {
-      if (ev.type === 'open' && !startedRef.current) {
-        startedRef.current = true;
-        setStatus('connected');
-        (window as any).__bounceroyale_pendingNet = guest;
-        webrtcGuestRef.current = null;
-        onStart(guest, 30);
-      }
-    });
-    try {
-      const offer = await guest.createOffer();
-      setOfferCode(offer);
+      const id = `host-${Math.random().toString(36).slice(2, 8)}`;
+      const host = new WebRTCNetHost(id);
+      webrtcHostRef.current = host;
+      host.onPeerChange((peers) => {
+        if (peers.length > 0 && !startedRef.current) {
+          startedRef.current = true;
+          setStatus('connected');
+          (window as any).__bounceroyale_pendingNet = host;
+          onStart(host, timer);
+        }
+      });
+      const code = await host.createOffer();
+      setHostCode(code);
+      setHostPhase('waiting');
       setStatus('connecting');
     } catch (e: any) {
-      setError(e?.message ?? 'Failed to create offer');
+      setError(e?.message ?? 'Failed to start hosting');
+      webrtcHostRef.current?.close();
+      webrtcHostRef.current = null;
+    } finally {
+      setBusy(false);
     }
   };
 
-  const applyHostAnswer = async () => {
-    if (!webrtcGuestRef.current || !answerInput.trim()) return;
+  const applyGuestAnswer = async () => {
+    if (!webrtcHostRef.current || !guestAnswerInput.trim()) return;
     setError(null);
+    setBusy(true);
     try {
-      await webrtcGuestRef.current.acceptAnswer(answerInput.trim());
+      await webrtcHostRef.current.acceptAnswer(guestAnswerInput.trim());
+      // Status will switch to 'connected' via onPeerChange when the data channel opens.
     } catch (e: any) {
-      setError(e?.message ?? 'Failed to apply host answer');
+      setError(e?.message ?? 'Failed to apply guest answer. Make sure you pasted the full code.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // ===========================================================================
+  // Guest actions
+  // ===========================================================================
+
+  const generateAnswer = async () => {
+    if (!hostCodeInput.trim()) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const id = `g-${Math.random().toString(36).slice(2, 9)}`;
+      const guest = new WebRTCNetGuest(id);
+      webrtcGuestRef.current = guest;
+      guest.onMessage((ev) => {
+        if (ev.type === 'open' && !startedRef.current) {
+          startedRef.current = true;
+          setStatus('connected');
+          (window as any).__bounceroyale_pendingNet = guest;
+          webrtcGuestRef.current = null;
+          onStart(guest, 30);
+        }
+      });
+      const answer = await guest.acceptOffer(hostCodeInput.trim());
+      setGuestCode(answer);
+      setGuestPhase('answer');
+      setStatus('connecting');
+    } catch (e: any) {
+      setError(e?.message ?? 'Failed to read host code. Make sure you pasted the full code.');
+      webrtcGuestRef.current?.close();
+      webrtcGuestRef.current = null;
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -152,6 +179,16 @@ export default function LanModal({ onCancel, onStart }: Props) {
     if (webrtcHostRef.current) { webrtcHostRef.current.close(); webrtcHostRef.current = null; }
     if (webrtcGuestRef.current) { webrtcGuestRef.current.close(); webrtcGuestRef.current = null; }
     onCancel();
+  };
+
+  const backToMenu = () => {
+    // Soft reset: tear down any in-progress connection and return to the tab menu.
+    if (webrtcHostRef.current) { webrtcHostRef.current.close(); webrtcHostRef.current = null; }
+    if (webrtcGuestRef.current) { webrtcGuestRef.current.close(); webrtcGuestRef.current = null; }
+    setHostPhase('idle'); setHostCode(''); setGuestAnswerInput('');
+    setGuestPhase('idle'); setHostCodeInput(''); setGuestCode('');
+    setStatus('idle'); setError(null); startedRef.current = false;
+    setTab('menu');
   };
 
   const TimerSlider = () => (
@@ -166,20 +203,64 @@ export default function LanModal({ onCancel, onStart }: Props) {
     </div>
   );
 
+  // Shared code-display block: QR + copy button + collapsible text.
+  const CodeBlock = ({ code, which }: { code: string; which: 'host' | 'guest' }) => {
+    const qrUrl = which === 'host' ? hostQrUrl : guestQrUrl;
+    return (
+      <div
+        className="code-block-grid"
+        style={{ display: 'flex', width: '100%', height: '320px', gap: '0.75rem', alignItems: 'stretch' }}
+      >
+        {qrUrl && (
+          <div
+            className="qr-side"
+            style={{
+              flex: '0 0 50%',
+              // background: 'white',
+              borderRadius: '8px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: '0.35rem',
+              overflow: 'hidden',
+            }}
+          >
+            <img src={qrUrl} alt="QR code" style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }} />
+          </div>
+        )}
+        <div
+          className="code-side"
+          style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', height: '100%' }}
+        >
+          <div className="code-box" style={{ flex: 1, maxHeight: 'none', margin: 0 }}>
+            {code}
+          </div>
+          <button
+            className="ghost"
+            style={{ width: '100%', marginTop: '0.4rem', flexShrink: 0 }}
+            onClick={() => copyToClipboard(code, which)}
+          >
+            📋 {copiedKey === which ? t('copied', lang) : t('copyCode', lang)}
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="modal-overlay" onClick={handleCancel}>
       <div className="modal wide" onClick={(e) => e.stopPropagation()}>
         <h2>📡 {t('hostLan', lang)}</h2>
         <p className="text-dim" style={{ fontSize: '0.85rem', marginBottom: '0.75rem' }}>{t('lanNoSignaling', lang)}</p>
 
-        {/* Main menu — two options */}
+        {/* ============ Main menu ============ */}
         {tab === 'menu' && (
           <div className="flex-col" style={{ gap: '0.6rem' }}>
-            <button className="primary" onClick={() => setTab('webrtc-host')}>
+            <button className="primary" onClick={() => setTab('host')}>
               📡 {t('lanHostNetwork', lang)}
               <span className="text-dim" style={{ fontSize: '0.8rem', fontWeight: 400 }}>— {t('lanNetworkDesc', lang)}</span>
             </button>
-            <button className="primary" onClick={() => setTab('webrtc-join')}>
+            <button className="primary" onClick={() => setTab('join')}>
               🔗 {t('lanJoinNetwork', lang)}
               <span className="text-dim" style={{ fontSize: '0.8rem', fontWeight: 400 }}>— {t('lanNetworkDesc', lang)}</span>
             </button>
@@ -189,122 +270,105 @@ export default function LanModal({ onCancel, onStart }: Props) {
           </div>
         )}
 
-        {/* WebRTC host */}
-        {tab === 'webrtc-host' && (
+        {/* ============ Host tab ============ */}
+        {tab === 'host' && (
           <>
             <h3>📡 {t('lanHostNetwork', lang)}</h3>
-            <ol className="lan-step-list">
-              <li>{t('lanHostStep1', lang)}</li>
-              <li>{t('lanHostStep2', lang)}</li>
-              <li>{t('lanHostStep3', lang)}</li>
-            </ol>
-            {!webrtcHostRef.current ? (
+
+            {hostPhase === 'idle' && (
               <>
+                <ol className="lan-step-list">
+                  <li>{t('lanHostStep1', lang)}</li>
+                  <li>{t('lanHostStep2', lang)}</li>
+                  <li>{t('lanHostStep3', lang)}</li>
+                </ol>
                 <TimerSlider />
                 <div className="actions">
-                  <button className="ghost" onClick={() => setTab('menu')}>{t('back', lang)}</button>
-                  <button className="primary" onClick={startWebrtcHost}>📡 {t('startHost', lang)}</button>
+                  <button className="ghost" onClick={backToMenu}>{t('back', lang)}</button>
+                  <button className="primary" onClick={startHost} disabled={busy}>
+                    {busy ? '…' : `📡 ${t('startHost', lang)}`}
+                  </button>
                 </div>
               </>
-            ) : (
+            )}
+
+            {hostPhase === 'waiting' && (
               <>
-                <h3>2. {t('pasteOffer', lang)}</h3>
+                <h3>1. {t('lanShareInvite', lang)}</h3>
+                <CodeBlock code={hostCode} which="host" />
+
+                <h3>2. {t('lanPasteAnswer', lang)}</h3>
                 <textarea
-                  value={offerInput}
-                  onChange={(e) => setOfferInput(e.target.value)}
-                  placeholder='{ "sdp": {...}, "guestId": "g-..." }'
+                  value={guestAnswerInput}
+                  onChange={(e) => setGuestAnswerInput(e.target.value)}
+                  placeholder={t('lanAnswerPlaceholder', lang)}
                   style={{ minHeight: 60 }}
                 />
-                <button className="primary mt-1" style={{ width: '100%' }} onClick={generateAnswer} disabled={!offerInput.trim()}>
-                  ➜ {t('generateAnswer', lang)}
+                <button
+                  className="primary mt-1"
+                  style={{ width: '100%' }}
+                  onClick={applyGuestAnswer}
+                  disabled={!guestAnswerInput.trim() || busy}
+                >
+                  {busy ? '…' : `✓ ${t('connect', lang)}`}
                 </button>
-                {answerCode && (
-                  <>
-                    <h3>3. {t('pasteAnswer', lang)} →</h3>
-                    <div className="flex-row" style={{ alignItems: 'flex-start', gap: '1rem' }}>
-                      <div style={{ flex: 1 }}>
-                        <div className="code-box">{answerCode}</div>
-                        <button className="ghost" style={{ width: '100%' }} onClick={() => copyToClipboard(answerCode)}>
-                          📋 {copied ? t('copied', lang) : t('copyCode', lang)}
-                        </button>
-                      </div>
-                      {answerQrUrl && (
-                        <div className="qr-wrap">
-                          <img src={answerQrUrl} alt="QR" width={140} height={140} />
-                        </div>
-                      )}
-                    </div>
-                  </>
-                )}
+
                 <div className={`connection-status ${status === 'connected' ? 'connected' : 'connecting'} mt-2`}>
                   <span className="dot"></span>
                   {status === 'connected' ? t('connected', lang) : t('waitingForGuest', lang)}
                 </div>
                 <div className="actions mt-2">
-                  <button className="ghost" onClick={handleCancel}>{t('cancel', lang)}</button>
+                  <button className="ghost" onClick={backToMenu}>{t('cancel', lang)}</button>
                 </div>
               </>
             )}
           </>
         )}
 
-        {/* WebRTC guest */}
-        {tab === 'webrtc-join' && (
+        {/* ============ Join tab ============ */}
+        {tab === 'join' && (
           <>
             <h3>🔗 {t('lanJoinNetwork', lang)}</h3>
-            <ol className="lan-step-list">
-              <li>{t('lanJoinStep1', lang)}</li>
-              <li>{t('lanJoinStep2', lang)}</li>
-              <li>{t('lanJoinStep3', lang)}</li>
-            </ol>
-            {!offerCode ? (
+
+            {guestPhase === 'idle' && (
               <>
-                <h3>1. {t('hostInstructions', lang)}</h3>
+                <ol className="lan-step-list">
+                  <li>{t('lanJoinStep1', lang)}</li>
+                  <li>{t('lanJoinStep2', lang)}</li>
+                  <li>{t('lanJoinStep3', lang)}</li>
+                </ol>
+                <h3>1. {t('lanPasteInvite', lang)}</h3>
                 <textarea
-                  value={hostToken}
-                  onChange={(e) => setHostToken(e.target.value)}
-                  placeholder='{ "kind": "host-invite", "hostId": "host-...", "ts": ... }'
-                  style={{ minHeight: 50 }}
-                />
-                <button className="primary mt-1" style={{ width: '100%' }} onClick={startWebrtcGuest}>
-                  ➜ {t('generateAnswer', lang)}
-                </button>
-                <div className="actions mt-2">
-                  <button className="ghost" onClick={() => setTab('menu')}>{t('back', lang)}</button>
-                </div>
-              </>
-            ) : (
-              <>
-                <h3>2. {t('hostInstructions', lang)} →</h3>
-                <div className="flex-row" style={{ alignItems: 'flex-start', gap: '1rem' }}>
-                  <div style={{ flex: 1 }}>
-                    <div className="code-box">{offerCode}</div>
-                    <button className="ghost" style={{ width: '100%' }} onClick={() => copyToClipboard(offerCode)}>
-                      📋 {copied ? t('copied', lang) : t('copyCode', lang)}
-                    </button>
-                  </div>
-                  {offerQrUrl && (
-                    <div className="qr-wrap">
-                      <img src={offerQrUrl} alt="QR" width={140} height={140} />
-                    </div>
-                  )}
-                </div>
-                <h3>3. {t('pasteAnswer', lang)}</h3>
-                <textarea
-                  value={answerInput}
-                  onChange={(e) => setAnswerInput(e.target.value)}
-                  placeholder='{ "sdp": {...}, "guestId": "g-...", "hostId": "host-..." }'
+                  value={hostCodeInput}
+                  onChange={(e) => setHostCodeInput(e.target.value)}
+                  placeholder={t('lanInvitePlaceholder', lang)}
                   style={{ minHeight: 60 }}
                 />
-                <button className="primary mt-1" style={{ width: '100%' }} onClick={applyHostAnswer} disabled={!answerInput.trim()}>
-                  ✓ {t('connect', lang)}
+                <button
+                  className="primary mt-1"
+                  style={{ width: '100%' }}
+                  onClick={generateAnswer}
+                  disabled={!hostCodeInput.trim() || busy}
+                >
+                  {busy ? '…' : `➜ ${t('generateAnswer', lang)}`}
                 </button>
+                <div className="actions mt-2">
+                  <button className="ghost" onClick={backToMenu}>{t('back', lang)}</button>
+                </div>
+              </>
+            )}
+
+            {guestPhase === 'answer' && (
+              <>
+                <h3>2. {t('lanSendAnswer', lang)}</h3>
+                <CodeBlock code={guestCode} which="guest" />
+
                 <div className={`connection-status ${status === 'connected' ? 'connected' : 'connecting'} mt-2`}>
                   <span className="dot"></span>
-                  {status === 'connected' ? t('connected', lang) : t('connecting', lang)}
+                  {status === 'connected' ? t('connected', lang) : t('lanWaitingForHost', lang)}
                 </div>
                 <div className="actions mt-2">
-                  <button className="ghost" onClick={handleCancel}>{t('cancel', lang)}</button>
+                  <button className="ghost" onClick={backToMenu}>{t('cancel', lang)}</button>
                 </div>
               </>
             )}

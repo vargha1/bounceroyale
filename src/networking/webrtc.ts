@@ -7,9 +7,17 @@
  * Browsers automatically gather mDNS ICE candidates for hosts on the same LAN,
  * so once the offer/answer is exchanged, all traffic stays on the local network.
  *
+ * Flow (intuitive — host invites guest):
+ *   1. HOST: createOffer() → compressed invite code (QR + text)
+ *   2. GUEST: paste/scan host's code → acceptOffer() → compressed answer code
+ *   3. HOST: paste/scan guest's answer → acceptAnswer() → connected
+ *
  * Topology: star — the host is the authoritative peer. One host can have N
  * guests (we open one RTCPeerConnection per guest on the host side, and one on
  * each guest). Host relays guest↔guest traffic.
+ *
+ * Codes are compressed with the browser's built-in deflate stream (60–70%
+ * smaller) and base64url-encoded so they fit comfortably in a QR code.
  *
  * Robustness notes:
  *   - We DO NOT tear down the connection when the ICE/DTLS state briefly goes
@@ -38,7 +46,68 @@ const PC_CONFIG: RTCConfiguration = {
   bundlePolicy: 'max-bundle',
 };
 
-/** Create the host-side WebRTC client. Call .host() to get the invite code. */
+// ============================================================================
+// Compression helpers — deflate via CompressionStream + URL-safe base64.
+// Falls back to raw JSON if the browser lacks CompressionStream (very old).
+// ============================================================================
+
+function hasCompression(): boolean {
+  return typeof CompressionStream !== 'undefined' && typeof DecompressionStream !== 'undefined';
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  // URL-safe base64: '+' → '-', '/' → '_', strip '=' padding.
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)) as unknown as number[]);
+  }
+  let b64 = btoa(bin);
+  b64 = b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return b64;
+}
+
+function base64UrlToBytes(b64: string): Uint8Array {
+  let s = b64.replace(/-/g, '+').replace(/_/g, '/');
+  // Re-pad
+  while (s.length % 4) s += '=';
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/** Compress an SDP payload string into a short, QR-friendly text code. */
+export async function compressCode(plain: string): Promise<string> {
+  if (!hasCompression()) return 'u' + plain; // 'u' prefix = uncompressed marker
+  const stream = new Blob([plain]).stream().pipeThrough(new CompressionStream('deflate'));
+  const buf = await new Response(stream).arrayBuffer();
+  return 'c' + bytesToBase64Url(new Uint8Array(buf)); // 'c' prefix = compressed
+}
+
+/** Reverse of compressCode. */
+export async function decompressCode(code: string): Promise<string> {
+  if (!code) throw new Error('Empty code');
+  const prefix = code[0];
+  const rest = code.slice(1);
+
+  if (prefix === 'u') return rest; // uncompressed
+  if (prefix === 'c') {
+    if (!hasCompression()) throw new Error('Browser missing DecompressionStream');
+    const bytes = base64UrlToBytes(rest);
+    // FIX: Cast to ArrayBuffer to satisfy strict TypeScript Blob types
+    const stream = new Blob([bytes.buffer as ArrayBuffer]).stream().pipeThrough(new DecompressionStream('deflate'));
+    return await new Response(stream).text();
+  }
+  // Backwards compat: legacy payloads were raw JSON.
+  return code;
+}
+
+// ============================================================================
+// Host
+// ============================================================================
+
+/** Create the host-side WebRTC client. Call .createOffer() to get the invite code. */
 export class WebRTCNetHost implements NetClient {
   readonly isHost = true;
   readonly id: string;
@@ -46,34 +115,48 @@ export class WebRTCNetHost implements NetClient {
   private dataChannels = new Map<string, RTCDataChannel>();
   private listeners = new Set<(ev: NetEvent) => void>();
   private peerListeners = new Set<(peers: string[]) => void>();
+  /** peerId → pc awaiting a guest's answer. */
+  private pendingOffers = new Map<string, RTCPeerConnection>();
   private closed = false;
 
   constructor(id: string) {
     this.id = id;
   }
 
-  /** Generate the host invite code. Display this to the user. */
-  async host(): Promise<string> {
-    // The "invite code" is a small metadata blob — the real per-guest SDP
-    // exchange happens when a guest creates an offer and the host answers it.
-    return JSON.stringify({ kind: 'host-invite', hostId: this.id, ts: Date.now() });
+  /**
+   * Generate the host's invite code. Display this to the user (QR + text).
+   *
+   * The host creates a fresh RTCPeerConnection + data channel and produces an
+   * SDP offer. The guest will accept this offer and produce an answer, which
+   * the host then applies via acceptAnswer().
+   */
+  async createOffer(): Promise<string> {
+    const peerId = `g-${Math.random().toString(36).slice(2, 9)}`;
+    const pc = this.createPeerConnection(peerId);
+    // Host creates the data channel — the guest receives it via ondatachannel.
+    const dc = pc.createDataChannel(LABEL, { ordered: false, maxRetransmits: 0 });
+    this.bindDataChannel(peerId, dc);
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIceComplete(pc);
+
+    this.pendingOffers.set(peerId, pc);
+
+    const payload = JSON.stringify({ sdp: pc.localDescription, peerId, hostId: this.id });
+    return compressCode(payload);
   }
 
-  /**
-   * Host accepts a guest by ingesting the guest's SDP offer and returning an
-   * SDP answer the host can send back to the guest.
-   */
-  async acceptGuest(offerSdp: string): Promise<{ guestId: string; answerSdp: string }> {
-    const offer = JSON.parse(offerSdp) as { sdp: RTCSessionDescriptionInit; guestId?: string };
-    const realGuestId = offer.guestId || `g-${Math.random().toString(36).slice(2, 9)}`;
-    const pc = this.createPeerConnection(realGuestId);
-    await pc.setRemoteDescription(offer.sdp);
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    // Wait briefly for ICE gathering (mDNS / host candidates are quick on LAN).
-    await waitForIceComplete(pc);
-    const answerSdp = JSON.stringify({ sdp: pc.localDescription, guestId: realGuestId, hostId: this.id });
-    return { guestId: realGuestId, answerSdp };
+  /** Apply the guest's compressed answer to finalize a pending connection. */
+  async acceptAnswer(compressedAnswer: string): Promise<void> {
+    const decoded = await decompressCode(compressedAnswer);
+    const parsed = JSON.parse(decoded) as { sdp: RTCSessionDescriptionInit; peerId?: string };
+    const peerId = parsed.peerId;
+    if (!peerId) throw new Error('Answer missing peerId');
+    const pc = this.pendingOffers.get(peerId) || this.peerConns.get(peerId);
+    if (!pc) throw new Error('No pending offer for peerId: ' + peerId);
+    await pc.setRemoteDescription(parsed.sdp);
+    this.pendingOffers.delete(peerId);
   }
 
   private createPeerConnection(peerId: string): RTCPeerConnection {
@@ -95,6 +178,7 @@ export class WebRTCNetHost implements NetClient {
       }
     };
     pc.ondatachannel = (e) => {
+      // Fires if the guest created the channel (legacy flow) — bind it.
       this.bindDataChannel(peerId, e.channel);
     };
     return pc;
@@ -199,6 +283,7 @@ export class WebRTCNetHost implements NetClient {
       try { pc.close(); } catch { /* ignore */ }
       this.peerConns.delete(peerId);
     }
+    this.pendingOffers.delete(peerId);
     if (had) {
       this.emit({ type: 'player-disconnected', data: { id: peerId } });
     }
@@ -243,9 +328,14 @@ export class WebRTCNetHost implements NetClient {
     }
     this.dataChannels.clear();
     this.peerConns.clear();
+    this.pendingOffers.clear();
     this.emit({ type: 'close' });
   }
 }
+
+// ============================================================================
+// Guest
+// ============================================================================
 
 /** Create the guest-side WebRTC client. */
 export class WebRTCNetGuest implements NetClient {
@@ -264,12 +354,24 @@ export class WebRTCNetGuest implements NetClient {
     this.id = id;
   }
 
-  /** Generate the SDP offer the guest should send to the host. */
-  async createOffer(): Promise<string> {
-    this.pc = new RTCPeerConnection(PC_CONFIG);
-    this.dc = this.pc.createDataChannel(LABEL, { ordered: false, maxRetransmits: 0 });
-    this.bindDataChannel(this.dc);
+  /**
+   * Accept the host's compressed offer and produce a compressed answer.
+   *
+   * The guest receives the host's data channel via ondatachannel — it does
+   * NOT create its own. The returned string should be sent back to the host
+   * (via QR code or copy-paste), and the host applies it with acceptAnswer().
+   */
+  async acceptOffer(compressedOffer: string): Promise<string> {
+    if (this.pc) throw new Error('Guest already has an active offer');
+    const decoded = await decompressCode(compressedOffer);
+    const parsed = JSON.parse(decoded) as { sdp: RTCSessionDescriptionInit; peerId?: string; hostId?: string };
 
+    this.pc = new RTCPeerConnection(PC_CONFIG);
+    // Guest receives the host's data channel.
+    this.pc.ondatachannel = (e) => {
+      this.dc = e.channel;
+      this.bindDataChannel(this.dc);
+    };
     this.pc.onconnectionstatechange = () => {
       if (!this.pc) return;
       if (this.pc.connectionState === 'failed' || this.pc.connectionState === 'closed') {
@@ -283,17 +385,13 @@ export class WebRTCNetGuest implements NetClient {
       }
     };
 
-    const offer = await this.pc.createOffer();
-    await this.pc.setLocalDescription(offer);
+    await this.pc.setRemoteDescription(parsed.sdp);
+    const answer = await this.pc.createAnswer();
+    await this.pc.setLocalDescription(answer);
     await waitForIceComplete(this.pc);
-    return JSON.stringify({ sdp: this.pc.localDescription, guestId: this.id });
-  }
 
-  /** Apply the host's answer to finalize the connection. */
-  async acceptAnswer(answerSdp: string): Promise<void> {
-    if (!this.pc) throw new Error('Cannot accept answer before creating offer');
-    const answer = JSON.parse(answerSdp) as { sdp: RTCSessionDescriptionInit };
-    await this.pc.setRemoteDescription(answer.sdp);
+    const payload = JSON.stringify({ sdp: this.pc.localDescription, peerId: parsed.peerId });
+    return compressCode(payload);
   }
 
   private bindDataChannel(dc: RTCDataChannel) {
@@ -416,6 +514,10 @@ export class WebRTCNetGuest implements NetClient {
     this.emit({ type: 'close' });
   }
 }
+
+// ============================================================================
+// ICE gathering helper
+// ============================================================================
 
 /**
  * Wait for ICE gathering to produce enough candidates for a reliable

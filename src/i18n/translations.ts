@@ -89,6 +89,13 @@ export type TranslationKey =
   | 'lanJoinStep3'
   | 'lanConnectedAsHost'
   | 'lanConnectedAsGuest'
+  | 'lanShareInvite'
+  | 'lanPasteInvite'
+  | 'lanPasteAnswer'
+  | 'lanSendAnswer'
+  | 'lanInvitePlaceholder'
+  | 'lanAnswerPlaceholder'
+  | 'lanWaitingForHost'
   | 'startGameConfirm'
   | 'win'
   | 'lostConnection'
@@ -181,13 +188,20 @@ const en: Dict = {
   latency: 'Ping',
   players: 'Players',
   lanNoSignaling:
-    'Pure peer-to-peer — no server required. Browsers exchange connection codes directly over your local network.',
-  lanHostStep1: '1. Click "Start Hosting" to generate your invite code.',
-  lanHostStep2: '2. Send the invite code to your friend (e.g. via chat or QR scan).',
+    'Pure peer-to-peer — no server required. Codes are compressed so they fit easily in a QR code.',
+  lanHostStep1: '1. Click "Start Hosting" — your invite code & QR appear instantly.',
+  lanHostStep2: '2. Share it with a friend (QR scan or copy the text).',
   lanHostStep3: '3. Paste the answer code they send back, then click "Connect".',
-  lanJoinStep1: '1. Paste the invite code from the host below.',
-  lanJoinStep2: '2. Click "Generate Answer" — an answer code will appear.',
-  lanJoinStep3: '3. Send the answer code back to the host. Once they paste it, you will connect.',
+  lanJoinStep1: '1. Get the invite code from the host (scan their QR or copy).',
+  lanJoinStep2: '2. Paste it below and click "Generate Answer".',
+  lanJoinStep3: '3. Send your answer code back to the host. You connect once they paste it.',
+  lanShareInvite: 'Share this invite code (QR or text)',
+  lanPasteInvite: 'Paste host invite code',
+  lanPasteAnswer: 'Paste guest answer code',
+  lanSendAnswer: 'Send this answer code to the host',
+  lanInvitePlaceholder: 'Paste the host code here…',
+  lanAnswerPlaceholder: 'Paste the answer code from your friend here…',
+  lanWaitingForHost: 'Waiting for host to apply your answer…',
   lanConnectedAsHost: 'Connected as host. Waiting for game to start…',
   lanConnectedAsGuest: 'Connected to host. Waiting for game to start…',
   startGameConfirm: 'Start Game',
@@ -281,13 +295,20 @@ const fa: Dict = {
   latency: 'پینگ',
   players: 'بازیکنان',
   lanNoSignaling:
-    'کاملاً نقطه‌به‌نقطه — بدون نیاز به سرور. مرورگرها کدهای اتصال را مستقیماً روی شبکه محلی شما مبادله می‌کنند.',
-  lanHostStep1: '۱. روی «شروع میزبانی» بزنید تا کد دعوت ساخته شود.',
-  lanHostStep2: '۲. کد دعوت را برای دوستتان بفرستید (مثلاً با چت یا QR).',
+    'کاملاً نقطه‌به‌نقطه — بدون نیاز به سرور. کدها فشرده می‌شوند تا به‌راحتی در QR جا بگیرند.',
+  lanHostStep1: '۱. روی «شروع میزبانی» بزنید تا کد دعوت و QR فوراً ساخته شود.',
+  lanHostStep2: '۲. آن را برای دوستتان بفرستید (اسکن QR یا کپی متن).',
   lanHostStep3: '۳. کد پاسخ او را جای‌گذاری کرده و «اتصال» را بزنید.',
-  lanJoinStep1: '۱. کد دعوت میزبان را در پایین جای‌گذاری کنید.',
-  lanJoinStep2: '۲. روی «تولید پاسخ» بزنید تا کد پاسخ ساخته شود.',
-  lanJoinStep3: '۳. کد پاسخ را برای میزبان بفرستید. پس از جای‌گذاری توسط میزبان، متصل می‌شوید.',
+  lanJoinStep1: '۱. کد دعوت را از میزبان بگیرید (QR او را اسکن کنید یا کپی کنید).',
+  lanJoinStep2: '۲. آن را در پایین جای‌گذاری کنید و روی «تولید پاسخ» بزنید.',
+  lanJoinStep3: '۳. کد پاسخ خود را برای میزبان بفرستید. پس از جای‌گذاری توسط میزبان متصل می‌شوید.',
+  lanShareInvite: 'این کد دعوت را به اشتراک بگذارید (QR یا متن)',
+  lanPasteInvite: 'کد دعوت میزبان را جای‌گذاری کنید',
+  lanPasteAnswer: 'کد پاسخ مهمان را جای‌گذاری کنید',
+  lanSendAnswer: 'این کد پاسخ را برای میزبان بفرستید',
+  lanInvitePlaceholder: 'کد میزبان را اینجا جای‌گذاری کنید…',
+  lanAnswerPlaceholder: 'کد پاسخ دوستتان را اینجا جای‌گذاری کنید…',
+  lanWaitingForHost: 'در انتظار اعمال پاسخ توسط میزبان…',
   lanConnectedAsHost: 'به‌عنوان میزبان متصل شدید. در انتظار شروع بازی…',
   lanConnectedAsGuest: 'به میزبان متصل شدید. در انتظار شروع بازی…',
   startGameConfirm: 'شروع بازی',
