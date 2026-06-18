@@ -178,6 +178,10 @@ io.on('connection', (socket) => {
             startTimer = 30;
         }
 
+        // The host client generates the island seed + size; the server just
+        // stores and relays them to joining guests.
+        const islandSeed = (data && typeof data.islandSeed === 'number') ? data.islandSeed : Math.floor(Math.random() * 1e9);
+        const islandSize = (data && typeof data.islandSize === 'string') ? data.islandSize : 'medium';
 
         const serverStartTime = Date.now() + startTimer * 1000;
 
@@ -186,7 +190,8 @@ io.on('connection', (socket) => {
             players: {
                 [socket.id]: { position: { x: 0, y: 5, z: 0 } }
             },
-            hexagons: [...defaultHexagons],
+            islandSeed,
+            islandSize,
             startTimer,
             serverStartTime
         };
@@ -199,12 +204,13 @@ io.on('connection', (socket) => {
                 id,
                 position: games[gameId].players[id].position
             })),
-            hexagons: games[gameId].hexagons,
+            islandSeed,
+            islandSize,
             startTimer,
             serverStartTime: games[gameId].serverStartTime,
             remainingTime: Math.max(0, Math.ceil((games[gameId].serverStartTime - Date.now()) / 1000))
         });
-        console.log('Game created:', { gameId, creatorId: socket.id, startTimer });
+        console.log('Game created:', { gameId, creatorId: socket.id, startTimer, islandSeed, islandSize });
 
         // Advertise new game
         advertiseGame(gameId);
@@ -233,8 +239,10 @@ io.on('connection', (socket) => {
                 id,
                 position: games[gameId].players[id].position
             })),
-            hexagons: games[gameId].hexagons,
+            islandSeed: games[gameId].islandSeed,
+            islandSize: games[gameId].islandSize,
             startTimer: games[gameId].startTimer,
+            serverStartTime: games[gameId].serverStartTime,
             remainingTime: Math.max(0, Math.ceil((games[gameId].serverStartTime - Date.now()) / 1000))
         });
         socket.to(gameId).emit('new-player', {
@@ -290,6 +298,15 @@ io.on('connection', (socket) => {
         if (games[gameId]) {
             // Forward hit to the target player
             io.to(data.targetId).emit('player-hit', data);
+        }
+    });
+
+    // Relay island tile damage to all other players in the same game so
+    // everyone's island stays in sync.
+    socket.on('damage-tile', (data) => {
+        const gameId = data.gameId;
+        if (games[gameId]) {
+            socket.to(gameId).emit('damage-tile', data);
         }
     });
 
