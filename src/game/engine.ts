@@ -42,6 +42,20 @@ const TILE_RADIUS = 0.6;
 const TILE_HEIGHT = 0.5;
 const TILE_MAX_HEALTH = 100;
 
+// Powerup pickup tuning.
+const POWERUP_PICKUP_COUNT = 6;        // how many pickups spawn on the map
+const POWERUP_PICKUP_RADIUS = 0.45;    // visual size of the pickup
+const POWERUP_COLLECT_DISTANCE = 1.1;  // player-to-pickup distance to collect
+const POWERUP_RESPAWN_MS = 12000;      // a collected pickup reappears after this long
+const POWERUP_DURATION_MS = 12000;     // how long the collected effect lasts on the player
+const POWERUP_TYPES = ['speed_boost', 'high_jump', 'invincibility', 'health_regen'] as const;
+const POWERUP_COLORS: Record<string, number> = {
+  speed_boost: 0xffd700,    // gold
+  high_jump: 0x00e676,      // green
+  invincibility: 0x40c4ff,  // blue
+  health_regen: 0xff5252,   // red
+};
+
 // Impact damage tuning. The "base" damage is applied at a reference fall speed
 // of 10 m/s with a 1× multiplier. Harder landings scale linearly up to 3×.
 const BASE_TILE_DAMAGE = 22;
@@ -209,10 +223,36 @@ export function createGameEngine(opts: EngineOptions) {
     targetPosition: { x: number; y: number; z: number };
     targetRotation: { x: number; y: number; z: number; w: number };
   };
+  /**
+   * A powerup pickup scattered on the map. Players collect these by moving
+   * close to them; the effect then activates on the collector for a fixed
+   * duration. Pickups respawn after POWERUP_RESPAWN_MS.
+   *
+   * Pickup IDs and positions are DETERMINISTIC across peers — they are
+   * derived from the island seed (which the host generates and sends to
+   * guests in the init message). So everyone sees the same set of pickups
+   * in the same places. Collection events are broadcast so peers hide the
+   * pickup on their side; respawn is similarly broadcast (host-driven).
+   */
+  type PowerupPickup = {
+    id: string;
+    type: string;
+    tileId: string;          // which tile this pickup currently sits above
+    basePosition: THREE.Vector3; // current anchor position (used for hover offset)
+    mesh: THREE.Mesh;
+    haloMesh: THREE.Mesh;
+    collected: boolean;
+    respawnAt: number;       // timestamp (ms) when the pickup reappears; 0 = available
+    /** How many times this pickup has respawned. Used to seed the
+     *  respawn-position PRNG so each respawn lands on a different tile. */
+    respawnCount: number;
+  };
 
   const tiles: TileClient[] = [];
   const tilesById = new Map<string, TileClient>();
   const players: Record<string, PlayerClient> = {};
+  const powerupPickups: PowerupPickup[] = [];
+  const powerupPickupsById = new Map<string, PowerupPickup>();
   const colliderHandleToPlayerId: Record<number, string> = {};
   const particles: { mesh: THREE.Mesh; vel: THREE.Vector3; life: number; maxLife: number }[] = [];
   const tweenGroup = new Group();
@@ -331,7 +371,18 @@ export function createGameEngine(opts: EngineOptions) {
     }
   }
 
-  function addPowerUp(type: string, duration = 10000) {
+  function addPowerUp(type: string, duration = POWERUP_DURATION_MS) {
+    // Replace any existing powerup of the same type (refresh duration) so a
+    // player can't stack 5 speed_boosts by collecting 5 gold pickups.
+    for (const [id, p] of Object.entries(powerUps)) {
+      if (p.type === type) {
+        p.startTime = performance.now();
+        p.duration = duration;
+        p.active = true;
+        pushHud();
+        return;
+      }
+    }
     powerUps[`${type}_${Date.now()}`] = { type, duration, startTime: performance.now(), active: true };
     pushHud();
   }
@@ -340,11 +391,349 @@ export function createGameEngine(opts: EngineOptions) {
     return Object.values(powerUps).some((p) => p.type === type && p.active);
   }
 
-  function spawnRandomPowerUp() {
-    if (Math.random() < 0.1) {
-      const types = ['speed_boost', 'high_jump', 'invincibility', 'health_regen'];
-      addPowerUp(types[Math.floor(Math.random() * types.length)], 15000);
+  // -----------------------------------------------------------------------
+  // Scattered powerup pickups
+  // -----------------------------------------------------------------------
+  //
+  // Pickups are placed DETERMINISTICALLY across all peers using a seeded PRNG
+  // derived from the island seed. So host and guests see the same pickups in
+  // the same positions. The collection / respawn events are broadcast so
+  // everyone hides / shows the pickup at the same moment.
+  //
+  // We deliberately AVOID giving players powerups directly (the old code did
+  // `spawnRandomPowerUp()` which directly granted a random effect every
+  // second). Players now have to move their ball to a pickup to collect it.
+
+  /** Mulberry32 — tiny, fast, deterministic PRNG for pickup placement. */
+  function mulberry32(seed: number) {
+    let a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /**
+   * Pick N widely-spaced tiles for powerup pickup placement. Uses a seeded
+   * PRNG so host and guests pick the same tiles. Returns the chosen tiles.
+   */
+  function pickPowerupTiles(count: number, seed: number): TileClient[] {
+    const available = tiles.filter((t) => !t.isBreaking);
+    if (available.length === 0) return [];
+    const rand = mulberry32(seed ^ 0x5eed);
+    const chosen: TileClient[] = [];
+    const minDist = 4.0; // pickups should be at least this far apart
+    let attempts = 0;
+    while (chosen.length < count && attempts < count * 30) {
+      attempts++;
+      const candidate = available[Math.floor(rand() * available.length)];
+      if (!candidate) continue;
+      const tooClose = chosen.some((c) => {
+        const dx = c.mesh.position.x - candidate.mesh.position.x;
+        const dz = c.mesh.position.z - candidate.mesh.position.z;
+        return Math.sqrt(dx * dx + dz * dz) < minDist;
+      });
+      if (!tooClose) chosen.push(candidate);
     }
+    // If we couldn't get enough spaced-out tiles, fill the rest randomly.
+    while (chosen.length < count && available.length > chosen.length) {
+      const candidate = available[Math.floor(rand() * available.length)];
+      if (candidate && !chosen.includes(candidate)) chosen.push(candidate);
+    }
+    return chosen;
+  }
+
+  /**
+   * Spawn the initial set of powerup pickups. Call AFTER the island is
+   * generated. Idempotent — if a pickup with the same id already exists,
+   * skip it (so re-running on a guest receiving init twice is safe).
+   */
+  function spawnPowerupPickups() {
+    if (powerupPickups.length > 0) return; // already spawned
+    const seedForPickups = (islandSeed ^ 0x7077) >>> 0;
+    const chosenTiles = pickPowerupTiles(POWERUP_PICKUP_COUNT, seedForPickups);
+    const rand = mulberry32(seedForPickups + 1);
+    chosenTiles.forEach((tile, i) => {
+      const type = POWERUP_TYPES[Math.floor(rand() * POWERUP_TYPES.length)];
+      const id = `pu-${i}-${tile.id}`;
+      createPowerupPickup(id, type, tile);
+    });
+    console.log('[ENGINE] Spawned', powerupPickups.length, 'powerup pickups');
+  }
+
+  function createPowerupPickup(id: string, type: string, tile: TileClient) {
+    if (powerupPickupsById.has(id)) return;
+    const color = POWERUP_COLORS[type] ?? 0xffffff;
+    const pos = tile.mesh.position;
+    const hover = pos.y + 1.2; // float above the tile
+
+    // Inner icon — a spinning octahedron. Cheap and clearly visible.
+    const geo = new THREE.OctahedronGeometry(POWERUP_PICKUP_RADIUS, 0);
+    const mat = new THREE.MeshStandardMaterial({
+      color,
+      emissive: new THREE.Color(color),
+      emissiveIntensity: 1.0,
+      roughness: 0.3,
+      metalness: 0.4,
+      transparent: true,
+      opacity: 0.95,
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(pos.x, hover, pos.z);
+    mesh.castShadow = settings.graphicsQuality === 'high';
+    scene.add(mesh);
+
+    // Halo — a flat translucent ring on the tile surface so the pickup is
+    // visible from above even when the player is right on top of it.
+    const haloGeo = new THREE.RingGeometry(POWERUP_PICKUP_RADIUS * 0.9, POWERUP_PICKUP_RADIUS * 1.6, 24);
+    const haloMat = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.45,
+      side: THREE.DoubleSide,
+    });
+    const haloMesh = new THREE.Mesh(haloGeo, haloMat);
+    haloMesh.rotation.x = -Math.PI / 2;
+    haloMesh.position.set(pos.x, pos.y + TILE_HEIGHT / 2 + 0.05, pos.z);
+    scene.add(haloMesh);
+
+    const pickup: PowerupPickup = {
+      id,
+      type,
+      tileId: tile.id,
+      basePosition: new THREE.Vector3(pos.x, hover, pos.z),
+      mesh,
+      haloMesh,
+      collected: false,
+      respawnAt: 0,
+      respawnCount: 0,
+    };
+    powerupPickups.push(pickup);
+    powerupPickupsById.set(id, pickup);
+  }
+
+  /**
+   * Per-frame update for pickups: spin, hover, check local-player collection,
+   * and check timer-based respawns.
+   *
+   * Collection is detected ONLY for the local player on each peer — that peer
+   * then broadcasts `powerup-collected` so everyone else hides the pickup.
+   * Respawn is host-driven: when the host's respawn timer fires, the host
+   * picks a NEW random tile for the pickup (not the original tile — so
+   * players have to keep moving to collect), moves the pickup there, and
+   * broadcasts `powerup-respawned` with the new tileId + position. Guests
+   * just apply the host's choice. (Single-player mode acts as host.)
+   */
+  function updatePowerupPickups(dt: number, now: number) {
+    // First: handle respawns (host drives the timer + new-tile selection for everyone).
+    if (isHost || mode === 'single') {
+      for (const p of powerupPickups) {
+        if (p.collected && p.respawnAt > 0 && now >= p.respawnAt) {
+          // Pick a NEW random available tile. We exclude the pickup's
+          // current tileId so the pickup never respawns on the same spot —
+          // players have to keep moving to collect, which keeps the game
+          // dynamic. We also exclude tiles that are currently breaking or
+          // already occupied by another visible pickup.
+          const newTile = pickRandomAvailableTile(p.tileId, p.id, p.respawnCount + 1);
+          if (!newTile) {
+            // No available tile (island mostly destroyed) — try again later.
+            p.respawnAt = now + 2000;
+            continue;
+          }
+          movePickupToTile(p, newTile);
+          p.collected = false;
+          p.respawnAt = 0;
+          p.respawnCount++;
+          p.mesh.visible = true;
+          p.haloMesh.visible = true;
+          // Broadcast respawn (with the new tileId + position) to peers.
+          if (netClient && mode !== 'single') {
+            netClient.send({
+              kind: 'powerup-respawned',
+              powerupId: p.id,
+              newTileId: newTile.id,
+              position: { x: newTile.mesh.position.x, y: newTile.mesh.position.y + 1.2, z: newTile.mesh.position.z },
+            });
+          }
+        }
+      }
+    }
+
+    // Spin + hover all visible pickups, and check local-player collection.
+    const localPlayer = players[localPlayerId];
+    const localPos = ballRigidBody && !isSpectating
+      ? ballRigidBody.translation()
+      : null;
+    for (const p of powerupPickups) {
+      if (p.collected) continue;
+      // Spin
+      p.mesh.rotation.y += dt * 2.0;
+      p.mesh.rotation.x += dt * 0.7;
+      // Hover bob
+      const bob = Math.sin(now * 0.003 + p.basePosition.x) * 0.15;
+      p.mesh.position.y = p.basePosition.y + bob;
+      // Pulse halo
+      const pulse = 0.4 + 0.2 * (0.5 + 0.5 * Math.sin(now * 0.005));
+      (p.haloMesh.material as THREE.MeshBasicMaterial).opacity = pulse;
+
+      // Collision check with local player
+      if (localPos && localPlayer && !localPlayer.eliminated && physicsEnabled) {
+        const dx = localPos.x - p.basePosition.x;
+        const dy = localPos.y - p.mesh.position.y;
+        const dz = localPos.z - p.basePosition.z;
+        const distSq = dx * dx + dy * dy + dz * dz;
+        if (distSq < POWERUP_COLLECT_DISTANCE * POWERUP_COLLECT_DISTANCE) {
+          collectPowerup(p);
+        }
+      }
+    }
+  }
+
+  /**
+   * Pick a random available tile for a respawn. Excludes the given tileId
+   * (so the pickup doesn't respawn on its previous spot), tiles that are
+   * currently breaking, and tiles already occupied by other VISIBLE pickups.
+   *
+   * The seed combines the island seed + the pickup's id hash + the respawn
+   * count, so each respawn lands on a different tile (different seed each
+   * time) and different pickups land on different tiles (different id hash).
+   */
+  function pickRandomAvailableTile(excludeTileId: string, pickupId: string, respawnCount: number): TileClient | null {
+    const available = tiles.filter((t) => {
+      if (t.isBreaking) return false;
+      if (t.id === excludeTileId) return false;
+      // Exclude tiles that currently host a visible (non-collected) pickup.
+      for (const other of powerupPickups) {
+        if (other.id === pickupId) continue;
+        if (!other.collected && other.tileId === t.id) return false;
+      }
+      return true;
+    });
+    if (available.length === 0) return null;
+    // Hash the pickup id into a number for the seed.
+    let idHash = 0;
+    for (let i = 0; i < pickupId.length; i++) {
+      idHash = ((idHash << 5) - idHash + pickupId.charCodeAt(i)) | 0;
+    }
+    const seed = ((islandSeed ^ 0xfeedface) ^ (idHash >>> 0) ^ (respawnCount * 2654435761)) >>> 0;
+    const rand = mulberry32(seed);
+    // Try a few times to find a tile that's at least minDist away from other
+    // visible pickups (so respawns spread out instead of clustering).
+    const minDist = 3.0;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const candidate = available[Math.floor(rand() * available.length)];
+      if (!candidate) continue;
+      const tooClose = powerupPickups.some((other) => {
+        if (other.id === pickupId) return false;
+        if (other.collected) return false;
+        const dx = other.basePosition.x - candidate.mesh.position.x;
+        const dz = other.basePosition.z - candidate.mesh.position.z;
+        return Math.sqrt(dx * dx + dz * dz) < minDist;
+      });
+      if (!tooClose) return candidate;
+    }
+    // Fallback: just take the first available.
+    return available[0] ?? null;
+  }
+
+  /**
+   * Move a pickup's meshes + state to a new tile. Called by the host on
+   * respawn, and by guests in response to a `powerup-respawned` message.
+   */
+  function movePickupToTile(p: PowerupPickup, tile: TileClient) {
+    const pos = tile.mesh.position;
+    const hover = pos.y + 1.2;
+    p.tileId = tile.id;
+    p.basePosition.set(pos.x, hover, pos.z);
+    p.mesh.position.set(pos.x, hover, pos.z);
+    p.haloMesh.position.set(pos.x, pos.y + TILE_HEIGHT / 2 + 0.05, pos.z);
+  }
+
+  /**
+   * Collect a pickup: hide its meshes, activate the effect on the local
+   * player, set the respawn timer, and broadcast the collection so peers
+   * hide the pickup on their side too.
+   */
+  function collectPowerup(p: PowerupPickup) {
+    if (p.collected) return;
+    p.collected = true;
+    p.respawnAt = performance.now() + POWERUP_RESPAWN_MS;
+    p.mesh.visible = false;
+    p.haloMesh.visible = false;
+    // Apply the effect to the local collector.
+    addPowerUp(p.type, POWERUP_DURATION_MS);
+    createParticleEffect(p.basePosition, POWERUP_COLORS[p.type] ?? 0xffffff, 14);
+    addScore(10);
+    // Broadcast collection.
+    if (netClient && mode !== 'single') {
+      netClient.send({
+        kind: 'powerup-collected',
+        powerupId: p.id,
+        playerId: localPlayerId,
+        powerupType: p.type,
+      });
+    }
+  }
+
+  /** Remote peer collected a pickup — hide it on our side. */
+  function handleRemotePowerupCollected(powerupId: string, playerId: string, powerupType: string) {
+    const p = powerupPickupsById.get(powerupId);
+    if (!p) return;
+    // Only apply the effect locally if WE are the collector — otherwise just
+    // hide the pickup. (The collector's own client already applied the effect
+    // in collectPowerup above.)
+    if (playerId !== localPlayerId) {
+      // The remote player gets the effect on their own screen; we just hide
+      // the pickup. (Remote players don't have visible powerup UI on our
+      // screen anyway — the HUD only shows the local player's powerups.)
+      p.collected = true;
+      p.respawnAt = performance.now() + POWERUP_RESPAWN_MS;
+      p.mesh.visible = false;
+      p.haloMesh.visible = false;
+    }
+    void powerupType;
+  }
+
+  /**
+   * Host broadcast a respawn — move the pickup to the new tile and show it.
+   * The host already picked the new tile and sent us its id + position; we
+   * just apply the move. (We don't re-pick — that would desync from the
+   * host.)
+   */
+  function handleRemotePowerupRespawned(powerupId: string, newTileId: string, position: { x: number; y: number; z: number }) {
+    const p = powerupPickupsById.get(powerupId);
+    if (!p) return;
+    // Look up the tile locally — if it's missing (guest hasn't generated it
+    // yet, or it was destroyed), use the position the host sent us directly.
+    const tile = tilesById.get(newTileId);
+    if (tile && !tile.isBreaking) {
+      movePickupToTile(p, tile);
+    } else {
+      // Tile not found locally — just move the meshes to the host-provided
+      // position. We won't have a tileId we can use for the respawn-after-
+      // tile-break check, but that's a corner case (the host already
+      // validated the tile exists).
+      p.tileId = newTileId;
+      p.basePosition.set(position.x, position.y, position.z);
+      p.mesh.position.set(position.x, position.y, position.z);
+      // Best-effort halo position (we don't know the tile's surface Y, so
+      // estimate from the pickup's hover offset).
+      p.haloMesh.position.set(position.x, position.y - 1.2 + TILE_HEIGHT / 2 + 0.05, position.z);
+    }
+    p.collected = false;
+    p.respawnAt = 0;
+    p.mesh.visible = true;
+    p.haloMesh.visible = true;
+  }
+
+  function spawnRandomPowerUp() {
+    // Deprecated — kept as a no-op so the per-second survival tick (which
+    // used to call this) still compiles. Powerups are now scattered on the
+    // map as pickups — see spawnPowerupPickups / updatePowerupPickups.
+    void 0;
   }
 
   function updatePowerUps(dt: number) {
@@ -790,19 +1179,24 @@ export function createGameEngine(opts: EngineOptions) {
         case 'new-player': {
           if (ev.data.id !== localPlayerId && !players[ev.data.id]) {
             createSphere(ev.data.id, ev.data.position, false);
-            // If we are the host, also respond with init info
-            if (isHost) {
-              netClient.send({
-                kind: 'init',
-                gameId: 'lan',
-                creatorId: localPlayerId,
-                players: Object.values(players).map((pp) => ({ id: pp.id, position: pp.targetPosition })),
-                islandSeed,
-                islandSize,
-                startTimer: startTimerValue,
-                serverStartTime: serverStartTime ?? Date.now() + startTimerValue * 1000,
-              });
-            }
+          }
+          // If we are the host, ALWAYS (re)send init in response to a
+          // new-player announcement. The guest may have missed an earlier
+          // init (e.g. its engine listener wasn't registered yet when the
+          // first init arrived — see the WebRTCNetGuest event-buffer comments).
+          // The guest's init handler is idempotent (createTile / createSphere
+          // both early-return on duplicate ids), so re-sending is safe.
+          if (isHost) {
+            netClient.send({
+              kind: 'init',
+              gameId: 'lan',
+              creatorId: localPlayerId,
+              players: Object.values(players).map((pp) => ({ id: pp.id, position: pp.targetPosition })),
+              islandSeed,
+              islandSize,
+              startTimer: startTimerValue,
+              serverStartTime: serverStartTime ?? Date.now() + startTimerValue * 1000,
+            });
           }
           break;
         }
@@ -817,6 +1211,9 @@ export function createGameEngine(opts: EngineOptions) {
             islandSize = (ev.data.islandSize as IslandSize) || 'medium';
             const islandTiles = generateIsland(islandSize, islandSeed);
             for (const t of islandTiles) createTile({ x: t.x, y: t.y, z: t.z }, t.id);
+            // Spawn the deterministic powerup pickups — same positions on
+            // every peer because they're derived from the island seed.
+            spawnPowerupPickups();
             // Create remote players (and ourselves)
             for (const p of ev.data.players) {
               if (p.id === localPlayerId) {
@@ -863,7 +1260,8 @@ export function createGameEngine(opts: EngineOptions) {
           break;
         }
         case 'player-hit': {
-          if (ev.data.targetId === localPlayerId && ballRigidBody) {
+          // Invincibility powerup: ignore knockback impulses from other players.
+          if (ev.data.targetId === localPlayerId && ballRigidBody && !hasPowerUp('invincibility')) {
             try { ballRigidBody.applyImpulse(ev.data.impulse, true); } catch { /* ignore */ }
           }
           break;
@@ -910,6 +1308,17 @@ export function createGameEngine(opts: EngineOptions) {
           enablePhysics();
           break;
         }
+        case 'powerup-collected': {
+          // A peer collected a pickup — hide it on our side. The collector's
+          // own client already applied the effect locally (in collectPowerup).
+          handleRemotePowerupCollected(ev.data.powerupId, ev.data.playerId, ev.data.powerupType);
+          break;
+        }
+        case 'powerup-respawned': {
+          // Host broadcast a respawn at a NEW tile — move the pickup and show it.
+          handleRemotePowerupRespawned(ev.data.powerupId, ev.data.newTileId, ev.data.position);
+          break;
+        }
         case 'error':
           callbacks.onError(ev.message);
           break;
@@ -929,6 +1338,9 @@ export function createGameEngine(opts: EngineOptions) {
       // Generate the island for single-player mode.
       const islandTiles = generateIsland(islandSize, islandSeed);
       for (const t of islandTiles) createTile({ x: t.x, y: t.y, z: t.z }, t.id);
+      // Scatter powerup pickups across the island — they're collected by
+      // moving the ball over them, not granted randomly.
+      spawnPowerupPickups();
       const spawn = getIslandSpawn(islandTiles);
       createSphere('local', spawn, true);
       serverStartTime = Date.now() + 5 * 1000;
@@ -940,6 +1352,9 @@ export function createGameEngine(opts: EngineOptions) {
       // regenerate the exact same island.
       const islandTiles = generateIsland(islandSize, islandSeed);
       for (const t of islandTiles) createTile({ x: t.x, y: t.y, z: t.z }, t.id);
+      // Scatter powerup pickups — same positions on every peer because they
+      // are derived from the island seed (which is sent in the init msg).
+      spawnPowerupPickups();
       const spawn = getIslandSpawn(islandTiles);
       createSphere(localPlayerId, spawn, true);
       serverStartTime = Date.now() + startTimerValue * 1000;
@@ -947,6 +1362,27 @@ export function createGameEngine(opts: EngineOptions) {
     }
     // LAN guest: waits for 'init' message from host (handled in setupNetworking).
     setupNetworking();
+    // Safety net for guests: the WebRTC data channel may have opened BEFORE
+    // the engine was created (the LanModal's `open` listener fires onStart →
+    // App screen switch → Game mount → engine created). In that case, the
+    // engine's `case 'open'` handler never runs and the guest never sends its
+    // own `new-player` request from the engine side. The WebRTCNetGuest itself
+    // sends `new-player` in its dc.onopen, but the host's `init` response can
+    // arrive at any time relative to this point. The event buffer in
+    // WebRTCNetGuest catches the race, but we ALSO re-send `new-player` here
+    // to be defensive — the host's new-player handler always responds with a
+    // fresh `init`, so the guest will get one. (The host side is idempotent.)
+    if (mode !== 'single' && !isHost && netClient) {
+      try {
+        netClient.send({
+          kind: 'new-player',
+          id: localPlayerId,
+          position: { x: (Math.random() - 0.5) * 6, y: 5, z: (Math.random() - 0.5) * 6 },
+        });
+      } catch {
+        /* ignore — the data channel might not be open yet */
+      }
+    }
     lastFrameTime = performance.now() / 1000;
     animationFrameId = requestAnimationFrame(loop);
   }
@@ -995,6 +1431,8 @@ export function createGameEngine(opts: EngineOptions) {
     // ----- Per-frame simulation that needs real (scaled) dt -----
     updateParticles(scaledDt);
     updatePowerUps(scaledDt);
+    // Spin / hover / collect / respawn the scattered powerup pickups.
+    updatePowerupPickups(scaledDt, performance.now());
     tweenGroup.update(now * 1000);
 
     // Per-second survival score
@@ -1004,7 +1442,9 @@ export function createGameEngine(opts: EngineOptions) {
       lastSecondMarker = nowSec;
       if (physicsEnabled && !isSpectating) {
         addScore(1);
-        spawnRandomPowerUp();
+        // Powerups are no longer randomly granted to the player — they are
+        // scattered on the map as pickups. See spawnPowerupPickups +
+        // updatePowerupPickups. The old spawnRandomPowerUp() is now a no-op.
       }
     }
 
@@ -1101,8 +1541,9 @@ export function createGameEngine(opts: EngineOptions) {
         }
         // Death check
         if (p.y < DEATH_Y_LEVEL && !lp?.eliminated) eliminatePlayer(localPlayerId);
-        // Falling damage
-        if (p.y < -5) {
+        // Falling damage (skipped while invincibility is active — the player
+        // still falls but takes no HP loss from hard landings.)
+        if (p.y < -5 && !hasPowerUp('invincibility')) {
           const v = ballRigidBody.linvel();
           if (v.y < -10) updateHealth(-5);
         }

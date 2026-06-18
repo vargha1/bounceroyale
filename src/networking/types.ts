@@ -95,6 +95,30 @@ export type NewPlayerMessage = {
   position: { x: number; y: number; z: number };
 };
 
+/** Powerup pickup collected by a player. Broadcast so all peers hide the pickup. */
+export type PowerupCollectedMessage = {
+  kind: 'powerup-collected';
+  /** ID of the powerup pickup (deterministic across peers). */
+  powerupId: string;
+  /** ID of the player who collected it. */
+  playerId: string;
+  /** Powerup type, so receivers know what effect to apply if needed. */
+  powerupType: string;
+};
+
+/** A previously-collected powerup has respawned. Broadcast so all peers show it again.
+ *  The host picks a NEW random tile for the respawn (not the original tile) and
+ *  sends the new position + tileId so all peers move the pickup to the same spot. */
+export type PowerupRespawnedMessage = {
+  kind: 'powerup-respawned';
+  powerupId: string;
+  /** New tile ID the pickup now sits above. */
+  newTileId: string;
+  /** New world position (above the new tile) — saves peers from having to look
+   *  up the tile by id (which might not exist yet on a freshly-joined guest). */
+  position: { x: number; y: number; z: number };
+};
+
 export type NetMessage =
   | MoveMessage
   | JumpMessage
@@ -109,7 +133,9 @@ export type NetMessage =
   | GameEndedMessage
   | GameStartedMessage
   | InitMessage
-  | NewPlayerMessage;
+  | NewPlayerMessage
+  | PowerupCollectedMessage
+  | PowerupRespawnedMessage;
 
 export type NetEvent =
   | { type: 'open'; id: string }
@@ -126,6 +152,8 @@ export type NetEvent =
   | { type: 'player-disconnected'; data: Omit<PlayerDisconnectedMessage, 'kind'> }
   | { type: 'game-ended'; data: Omit<GameEndedMessage, 'kind'> }
   | { type: 'game-started'; data: Omit<GameStartedMessage, 'kind'> }
+  | { type: 'powerup-collected'; data: Omit<PowerupCollectedMessage, 'kind'> }
+  | { type: 'powerup-respawned'; data: Omit<PowerupRespawnedMessage, 'kind'> }
   | { type: 'error'; message: string }
   | { type: 'close' };
 

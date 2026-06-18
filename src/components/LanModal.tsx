@@ -50,6 +50,10 @@ export default function LanModal({ onCancel, onStart }: Props) {
   const [hostCode, setHostCode] = useState('');
   const [hostQrUrl, setHostQrUrl] = useState('');
   const [guestAnswerInput, setGuestAnswerInput] = useState('');
+  // Manual LAN IP override. When set, the host injects IP-based ICE candidates
+  // into its SDP so the guest can reach it on networks where mDNS is blocked
+  // (mobile hotspots, restrictive routers). Empty = rely on mDNS + STUN only.
+  const [manualHostIp, setManualHostIp] = useState('');
   const webrtcHostRef = useRef<WebRTCNetHost | null>(null);
   const startedRef = useRef(false);
 
@@ -59,6 +63,11 @@ export default function LanModal({ onCancel, onStart }: Props) {
   const [hostCodeInput, setHostCodeInput] = useState('');
   const [guestCode, setGuestCode] = useState('');
   const [guestQrUrl, setGuestQrUrl] = useState('');
+  // Manual guest LAN IP — symmetric to the host's manualHostIp. When set, we
+  // inject IP-based ICE candidates into the answer SDP so the host can reach
+  // us on networks where mDNS is blocked (mobile hotspots, restrictive
+  // routers). Empty = rely on mDNS + STUN only.
+  const [manualGuestIp, setManualGuestIp] = useState('');
   const webrtcGuestRef = useRef<WebRTCNetGuest | null>(null);
 
   // Generate QR codes (small + low error-correction for higher density / easier scan).
@@ -114,7 +123,11 @@ export default function LanModal({ onCancel, onStart }: Props) {
           onStart(host, timer);
         }
       });
-      const code = await host.createOffer();
+      // Pass the manual IP (if any) so the host injects IP-based ICE candidates
+      // into the offer SDP. This is what makes the connection work on mobile
+      // hotspots where mDNS is blocked. Empty string = mDNS + STUN only.
+      const ip = manualHostIp.trim();
+      const code = await host.createOffer(ip || undefined);
       setHostCode(code);
       setHostPhase('waiting');
       setStatus('connecting');
@@ -134,8 +147,43 @@ export default function LanModal({ onCancel, onStart }: Props) {
     try {
       await webrtcHostRef.current.acceptAnswer(guestAnswerInput.trim());
       // Status will switch to 'connected' via onPeerChange when the data channel opens.
+      // If ICE fails (e.g. on a hotspot with the wrong manual IP), the host's
+      // PC will eventually hit `failed` and the data channel won't open. The
+      // user will see "waiting for guest..." forever. We surface a hint after
+      // a few seconds so they know to regenerate.
+      window.setTimeout(() => {
+        if (status !== 'connected' && !startedRef.current) {
+          setError(prev => prev ?? 'Connection is taking longer than expected. If it doesn\'t connect within a few more seconds, click "Regenerate invite code" and have the guest re-join with the new code.');
+        }
+      }, 8000);
     } catch (e: any) {
-      setError(e?.message ?? 'Failed to apply guest answer. Make sure you pasted the full code.');
+      const msg = e?.message ?? 'Failed to apply guest answer. Make sure you pasted the full code.';
+      setError(msg);
+      // If the error indicates the PC is in a wrong state or was already torn
+      // down, surface a "regenerate" hint — the user needs a fresh invite code.
+      if (msg.includes('wrong state') || msg.includes('No pending') || msg.includes('Cannot apply')) {
+        setError(prev => prev + ' Click "Regenerate invite code" below to start fresh.');
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Regenerate the host's invite code after a failed attempt. Tears down any
+   *  stale PC and creates a fresh one with a new peerId. The user must give
+   *  the new code to the guest and have them re-join. */
+  const regenerateInvite = async () => {
+    if (!webrtcHostRef.current) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const code = await webrtcHostRef.current.regenerateOffer();
+      setHostCode(code);
+      setGuestAnswerInput('');
+      setStatus('connecting');
+      console.log('[HOST] Regenerated invite code');
+    } catch (e: any) {
+      setError(e?.message ?? 'Failed to regenerate invite code');
     } finally {
       setBusy(false);
     }
@@ -162,7 +210,7 @@ export default function LanModal({ onCancel, onStart }: Props) {
           onStart(guest, 30);
         }
       });
-      const answer = await guest.acceptOffer(hostCodeInput.trim());
+      const answer = await guest.acceptOffer(hostCodeInput.trim(), manualGuestIp.trim() || undefined);
       setGuestCode(answer);
       setGuestPhase('answer');
       setStatus('connecting');
@@ -286,6 +334,42 @@ export default function LanModal({ onCancel, onStart }: Props) {
                   <li>{t('lanHostStep3', lang)}</li>
                 </ol>
                 <TimerSlider />
+                {/* Manual host IP — needed when playing over a mobile hotspot
+                    or any network where Chrome's mDNS anti-fingerprinting
+                    blocks local-IP candidates. The host enters its OWN LAN IP
+                    (NOT the gateway/router IP — those are different numbers).
+                    On Windows, run `ipconfig` and look for the adapter you're
+                    using (e.g. Wi-Fi); the line "IPv4 Address" is your IP.
+                    On Android hotspot host: 192.168.43.1.
+                    On iOS hotspot host: 172.20.10.1.
+                    We inject that IP into the offer SDP as extra ICE
+                    candidates so the guest can reach it directly. Leave
+                    blank to rely on mDNS + STUN (works on normal Wi-Fi). */}
+                <div className="setting-row">
+                  <label>🌐 Host LAN IP (optional — for hotspot)</label>
+                  <input
+                    type="text"
+                    value={manualHostIp}
+                    onChange={(e) => setManualHostIp(e.target.value)}
+                    placeholder="e.g. 192.168.43.1 (Android) or 172.20.10.1 (iOS)"
+                    inputMode="decimal"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <div className="text-dim" style={{ fontSize: '0.75rem', marginTop: '0.25rem' }}>
+                    <strong>Enter your OWN device's IP — NOT the gateway/router IP.</strong>
+                    <br />
+                    On Windows: run <code>ipconfig</code> and look at the
+                    "IPv4 Address" line of the adapter you're using (e.g.
+                    Wi-Fi). If you see a "Default Gateway" line below it,
+                    that's a DIFFERENT IP — don't enter it here.
+                    <br />
+                    On the host of an Android hotspot: <code>192.168.43.1</code>.
+                    On the host of an iOS hotspot: <code>172.20.10.1</code>.
+                    <br />
+                    Leave blank on normal Wi-Fi.
+                  </div>
+                </div>
                 <div className="actions">
                   <button className="ghost" onClick={backToMenu}>{t('back', lang)}</button>
                   <button className="primary" onClick={startHost} disabled={busy}>
@@ -320,6 +404,28 @@ export default function LanModal({ onCancel, onStart }: Props) {
                   <span className="dot"></span>
                   {status === 'connected' ? t('connected', lang) : t('waitingForGuest', lang)}
                 </div>
+
+                {/* Regenerate button — shown whenever we're waiting for a
+                    connection. Clicking it tears down the current PC (which
+                    may have failed ICE, may be in a wrong state, or may just
+                    be stuck) and creates a fresh offer with a new peerId.
+                    The user must then re-share the new invite code with the
+                    guest and have them re-join. */}
+                <button
+                  className="ghost mt-1"
+                  style={{ width: '100%' }}
+                  onClick={regenerateInvite}
+                  disabled={busy}
+                  title="Tear down the current connection attempt and create a fresh invite code. Use this if Connect isn't doing anything, if you got a 'wrong state' error, or if ICE failed."
+                >
+                  {busy ? '…' : '🔄 Regenerate invite code'}
+                </button>
+                <div className="text-dim" style={{ fontSize: '0.75rem', marginTop: '0.4rem', textAlign: 'center' }}>
+                  If Connect isn't working (e.g. wrong-state error, no pending offer,
+                  or it just hangs), click this to start fresh. You'll get a new
+                  invite code — give it to the guest and have them re-join.
+                </div>
+
                 <div className="actions mt-2">
                   <button className="ghost" onClick={backToMenu}>{t('cancel', lang)}</button>
                 </div>
@@ -347,6 +453,33 @@ export default function LanModal({ onCancel, onStart }: Props) {
                   placeholder={t('lanInvitePlaceholder', lang)}
                   style={{ minHeight: 60 }}
                 />
+                {/* Manual guest LAN IP — symmetric to the host's field. On a
+                    mobile hotspot, the guest (often a phone) also needs to
+                    provide a working IP candidate because Chrome's mDNS
+                    anti-fingerprinting blocks local-IP candidates and STUN
+                    can't reach the internet through the hotspot. Find this
+                    device's IP in its Wi-Fi settings (e.g. on Android:
+                    Settings → Wi-Fi → tap the network → Advanced → IP
+                    address; on iOS: Settings → Wi-Fi → tap (i) next to the
+                    network → IP Address). */}
+                <div className="setting-row" style={{ marginTop: '0.75rem' }}>
+                  <label>🌐 Your LAN IP (optional — for hotspot)</label>
+                  <input
+                    type="text"
+                    value={manualGuestIp}
+                    onChange={(e) => setManualGuestIp(e.target.value)}
+                    placeholder="e.g. 10.181.207.148 (find in this device's Wi-Fi settings)"
+                    inputMode="decimal"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <div className="text-dim" style={{ fontSize: '0.75rem', marginTop: '0.25rem' }}>
+                    Leave blank on normal Wi-Fi. Set this when you're on a
+                    mobile hotspot — find this device's IP in its Wi-Fi
+                    settings (NOT the gateway/router IP — your own IP on the
+                    hotspot network, which is usually a different number).
+                  </div>
+                </div>
                 <button
                   className="primary mt-1"
                   style={{ width: '100%' }}

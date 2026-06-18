@@ -54,6 +54,8 @@ export class SocketNetClient implements NetClient {
     this.socket.on('player-disconnected', (data: any) => this.emit({ type: 'player-disconnected', data: { id: data.id } }));
     this.socket.on('game-ended', (data: any) => this.emit({ type: 'game-ended', data: { winner: data?.winner ?? null } }));
     this.socket.on('game-started', () => this.emit({ type: 'game-started', data: {} }));
+    this.socket.on('powerup-collected', (data: any) => this.emit({ type: 'powerup-collected', data: { powerupId: data.powerupId, playerId: data.playerId, powerupType: data.powerupType } }));
+    this.socket.on('powerup-respawned', (data: any) => this.emit({ type: 'powerup-respawned', data: { powerupId: data.powerupId, newTileId: data.newTileId, position: data.position } }));
 
     this.socket.on('error', (data: any) => this.emit({ type: 'error', message: data?.message ?? 'Server error' }));
     this.socket.on('connect_error', () => this.emit({ type: 'error', message: 'Failed to connect to server.' }));
@@ -96,6 +98,12 @@ export class SocketNetClient implements NetClient {
       case 'hexagon-broken':
       case 'hexagon-collided':
         // Server-controlled or handled above; we don't send these from client.
+        break;
+      case 'powerup-collected':
+        this.socket.emit('powerup-collected', { gameId: gameIdStore, powerupId: msg.powerupId, playerId: msg.playerId, powerupType: msg.powerupType });
+        break;
+      case 'powerup-respawned':
+        this.socket.emit('powerup-respawned', { gameId: gameIdStore, powerupId: msg.powerupId, newTileId: msg.newTileId, position: msg.position });
         break;
     }
   }
