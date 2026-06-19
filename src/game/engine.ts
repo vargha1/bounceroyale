@@ -275,6 +275,10 @@ export function createGameEngine(opts: EngineOptions) {
   let canJumpUntil = 0;
   let jumpBufferedUntil = 0;
   let lastSendTime = 0;
+  /** Fallback timer for guests: if `game-started` isn't received within 3s of
+   *  the guest's own countdown reaching 0, enable physics anyway (the message
+   *  may have been lost on the unreliable WebRTC data channel). */
+  let gameStartedFallbackTimer: number | null = null;
   const SEND_INTERVAL = 33; // ~30 updates/s
 
   // Fall-speed tracking for impact damage. While the ball is airborne we
@@ -331,16 +335,58 @@ export function createGameEngine(opts: EngineOptions) {
     }
     const remaining = Math.max(0, Math.ceil((serverStartTime - Date.now()) / 1000));
     if (remaining <= 0) {
-      // Timer has expired — enable physics, clear the countdown UI, and
-      // null out serverStartTime so we don't keep re-entering this branch.
-      // (Previously the "0" stayed on screen forever because the second
-      // call to pushCountdown saw physicsEnabled=true and skipped the
-      // onCountdown(null) call.)
-      if (!physicsEnabled) {
-        enablePhysics();
+      // Timer has expired. BEHAVIOR DIFFERS BY ROLE:
+      //
+      // HOST (and single-player): the host is the authority for when the
+      // match begins. When the host's own countdown hits 0, it enables
+      // physics locally AND broadcasts `game-started` to all guests (via
+      // enablePhysics() → netClient.send). Guests then enable physics in
+      // response to that broadcast.
+      //
+      // GUEST: guests must NOT enable physics based on their own countdown
+      // expiring. The guest's `serverStartTime` is copied from the host's
+      // `init` message, and due to network latency + clock skew the guest's
+      // countdown can expire BEFORE the host's. If the guest enabled physics
+      // on its own countdown, it could move/jump before the host's timer hit
+      // 0 — the "one player can move before the timer finishes" bug.
+      //
+      // Instead, the guest shows "0" and WAITS for the host's `game-started`
+      // broadcast (handled in the `case 'game-started'` branch of
+      // setupNetworking, which calls enablePhysics()).
+      //
+      // FALLBACK: the WebRTC data channel is unreliable (maxRetransmits: 0),
+      // so `game-started` could be lost. To prevent the guest from being
+      // stuck forever, we enable physics after a 3-second grace period past
+      // the guest's own countdown reaching 0. This is safe because:
+      //   - The host's `serverStartTime` was set to `Date.now() + timer*1000`
+      //     when the host's engine started.
+      //   - The guest's `serverStartTime` is the SAME value (copied from init).
+      //   - By the time the guest's countdown hits 0, the host's countdown
+      //     has ALSO hit 0 (or is about to, within clock skew).
+      //   - The 3-second grace accounts for clock skew + the network round
+      //     trip of the `game-started` message. If it still hasn't arrived
+      //     after 3 seconds, it was almost certainly lost.
+      if (isHost || mode === 'single') {
+        if (!physicsEnabled) {
+          enablePhysics();
+        }
+        callbacks.onCountdown(null);
+        serverStartTime = null;
+      } else {
+        // Guest: show "0" and wait for game-started (with 3s fallback).
+        callbacks.onCountdown(0);
+        if (!physicsEnabled && !gameStartedFallbackTimer) {
+          gameStartedFallbackTimer = window.setTimeout(() => {
+            if (!physicsEnabled && serverStartTime) {
+              console.warn('[ENGINE] game-started not received within 3s of countdown expiry — enabling physics as fallback (message may have been lost on the unreliable data channel).');
+              enablePhysics();
+              serverStartTime = null;
+              callbacks.onCountdown(null);
+            }
+            gameStartedFallbackTimer = null;
+          }, 3000);
+        }
       }
-      callbacks.onCountdown(null);
-      serverStartTime = null;
       return;
     }
     callbacks.onCountdown(remaining);
@@ -1344,6 +1390,13 @@ export function createGameEngine(opts: EngineOptions) {
           // host's (due to the network round-trip of the start-countdown
           // message). This way, the physics-enable moment is synchronized
           // across all peers via the host's `game-started` broadcast.
+          //
+          // Also cancel the fallback timer (if set) since we got the real
+          // message — no need for the fallback anymore.
+          if (gameStartedFallbackTimer !== null) {
+            clearTimeout(gameStartedFallbackTimer);
+            gameStartedFallbackTimer = null;
+          }
           enablePhysics();
           serverStartTime = null;
           callbacks.onCountdown(null);
@@ -1822,6 +1875,11 @@ export function createGameEngine(opts: EngineOptions) {
   function dispose() {
     if (animationFrameId) cancelAnimationFrame(animationFrameId);
     animationFrameId = null;
+    // Clear the game-started fallback timer if it's still pending.
+    if (gameStartedFallbackTimer !== null) {
+      clearTimeout(gameStartedFallbackTimer);
+      gameStartedFallbackTimer = null;
+    }
     try { renderer.dispose(); } catch { /* ignore */ }
     // NOTE: We deliberately do NOT close the net client here. The Game
     // component owns the net client and may reuse it across StrictMode

@@ -19,6 +19,13 @@ export default function CreateGameModal({ onCancel, onStart }: Props) {
     setServerUrl(host);
   };
 
+  // Detect mixed-content scenario: page is HTTPS but URL is HTTP. The browser
+  // will block the WebSocket connection. We show a warning so the user knows
+  // to use an HTTPS server URL instead.
+  const pageIsHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
+  const urlIsHttp = serverUrl.trim().startsWith('http://') || serverUrl.trim().startsWith('ws://');
+  const showMixedContentWarning = pageIsHttps && urlIsHttp;
+
   return (
     <div className="modal-overlay" onClick={onCancel}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -33,7 +40,7 @@ export default function CreateGameModal({ onCancel, onStart }: Props) {
           <input
             type="text"
             value={serverUrl}
-            placeholder="e.g. http://localhost:8443 or https://game.safahanbattery.ir:8443"
+            placeholder="e.g. https://game.safahanbattery.ir:8443"
             onChange={(e) => setServerUrl(e.target.value)}
           />
           <div className="flex-row mt-1" style={{ gap: '0.4rem', flexWrap: 'wrap' }}>
@@ -45,6 +52,31 @@ export default function CreateGameModal({ onCancel, onStart }: Props) {
             </button>
           </div>
         </div>
+
+        {showMixedContentWarning && (
+          <div style={{
+            marginTop: '0.6rem',
+            padding: '0.6rem 0.75rem',
+            borderRadius: '8px',
+            background: 'rgba(245, 158, 11, 0.1)',
+            border: '1px solid rgba(245, 158, 11, 0.4)',
+            fontSize: '0.82rem',
+            lineHeight: 1.5,
+          }}>
+            <strong style={{ color: '#fbbf24', display: 'block', marginBottom: '0.3rem' }}>
+              ⚠️ Mixed content detected
+            </strong>
+            This page is served over <strong>HTTPS</strong>, but you entered an <code>http://</code> URL.
+            Browsers block insecure WebSocket connections from HTTPS pages — the connection will fail.
+            <div style={{ marginTop: '0.4rem' }}>
+              <strong>Use an HTTPS server URL instead.</strong> The game server must accept HTTPS/WSS
+              connections (e.g. with SSL certificates, or behind Cloudflare/nginx/ngrok).
+              The URL will be auto-upgraded to <code>https://</code> when you connect, but the server
+              must actually support it.
+            </div>
+          </div>
+        )}
+
         <div className="setting-row" style={{ marginTop: '0.6rem' }}>
           <label>{t('startTimer', lang)}</label>
           <input

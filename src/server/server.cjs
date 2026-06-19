@@ -24,10 +24,22 @@ if (fs.existsSync(SSL_KEY_PATH) && fs.existsSync(SSL_CERT_PATH)) {
     };
     server = https.createServer(options, app);
     protocol = 'https';
-    console.log('Starting HTTPS server...');
+    console.log('Starting HTTPS/WSS server...');
 } else {
     server = http.createServer(app);
-    console.log('SSL certificates not found. Starting HTTP server...');
+    console.log('SSL certificates not found. Starting HTTP/WS server...');
+    console.log('');
+    console.log('⚠️  IMPORTANT: If your game client is deployed on HTTPS (e.g. Vercel, Netlify,');
+    console.log('    GitHub Pages), browsers will BLOCK connections to this HTTP/WS server');
+    console.log('    (mixed content blocking). HTTPS clients can ONLY connect to HTTPS/WSS servers.');
+    console.log('');
+    console.log('    To enable HTTPS/WSS on this server, either:');
+    console.log('      1. Provide SSL certificates via env vars:');
+    console.log('         SSL_KEY_PATH=/path/to/privkey.pem SSL_CERT_PATH=/path/to/fullchain.pem npm run server');
+    console.log('      2. Use Let\'s Encrypt (certbot) — the default paths point to /etc/letsencrypt/live/...');
+    console.log('      3. Put this server behind a reverse proxy that provides SSL (Cloudflare, nginx, Caddy, Traefik).');
+    console.log('      4. Use a tunneling service for quick testing: ngrok http 8443, or cloudflared tunnel.');
+    console.log('');
 }
 
 const io = new Server(server, {

@@ -130,18 +130,17 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         const serverIsHost = !!isHostProp;
         if (!netClientRef.current) {
           const id = `pending-${Math.random().toString(36).slice(2, 8)}`;
-          // Normalize the URL: if the user entered just "host:port" without a
-          // protocol, prepend ws:// or wss:// based on the current page's
-          // protocol. Socket.io accepts both http(s):// and ws(s):// URLs.
-          const url = serverUrl?.startsWith('http') || serverUrl?.startsWith('ws')
-            ? serverUrl
-            : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${serverUrl}`;
-          if (!url) {
+          if (!serverUrl) {
             onError('Server URL is missing. Please go back and enter the server URL.');
             onExit();
             return;
           }
-          const client = new SocketNetClient(url, {
+          // The SocketNetClient constructor normalizes the URL internally:
+          //   - prepends http(s):// if the user entered a bare host:port
+          //   - auto-upgrades http→https on HTTPS pages (mixed-content protection)
+          //   - converts ws://→http:// and wss://→https://
+          // So we just pass the raw user-entered URL here.
+          const client = new SocketNetClient(serverUrl, {
             isHost: serverIsHost,
             gameId: gameId ?? null,
             startTimer,
