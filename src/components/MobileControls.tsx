@@ -64,7 +64,6 @@ export default function MobileControls({ onJoystick, onJump, onLook, disabled }:
   }, [disabled]);
 
   const handleTouchMove = useCallback((e: TouchEvent) => {
-    console.log('touchmove', 'disabled=', disabled, 'joyId=', joyTouchId.current);
     if (disabled) return;
     // Prevent scroll rubber-banding and zoom during any active touch
     e.preventDefault();

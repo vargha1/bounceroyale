@@ -105,7 +105,28 @@ export type TranslationKey =
   | 'applySettings'
   | 'speedSlow'
   | 'speedNormal'
-  | 'speedFast';
+  | 'speedFast'
+  | 'scanQr'
+  | 'lobby'
+  | 'lobbyTitle'
+  | 'lobbyWaitingHost'
+  | 'lobbyPlayers'
+  | 'lobbyInviteMore'
+  | 'lobbyInviteMoreShort'
+  | 'lobbyStartGame'
+  | 'lobbyStartHint'
+  | 'lobbyNeedPlayers'
+  | 'lobbyConnecting'
+  | 'lobbyYou'
+  | 'lobbyHost'
+  | 'lobbyGuest'
+  | 'lobbyWaitingGuests'
+  | 'scanInvite'
+  | 'scanAnswer'
+  | 'scanClose'
+  | 'scanHint'
+  | 'regenerateInvite'
+  | 'addPlayer';
 
 type Dict = Record<TranslationKey, string>;
 
@@ -214,6 +235,27 @@ const en: Dict = {
   speedSlow: 'Slow',
   speedNormal: 'Normal',
   speedFast: 'Fast',
+  scanQr: 'Scan QR',
+  lobby: 'Lobby',
+  lobbyTitle: '🎮 Game Lobby',
+  lobbyWaitingHost: 'Waiting for the host to start the game…',
+  lobbyPlayers: 'Players in lobby',
+  lobbyInviteMore: 'Invite another player',
+  lobbyInviteMoreShort: 'Invite more',
+  lobbyStartGame: 'Start Game',
+  lobbyStartHint: 'Click to begin the countdown and start the match.',
+  lobbyNeedPlayers: 'At least 2 players are needed (you + 1 guest).',
+  lobbyConnecting: 'Connecting…',
+  lobbyYou: 'You',
+  lobbyHost: 'Host',
+  lobbyGuest: 'Guest',
+  lobbyWaitingGuests: 'Share your code and wait for guests to join.',
+  scanInvite: 'Scan invite code',
+  scanAnswer: 'Scan answer code',
+  scanClose: 'Close scanner',
+  scanHint: 'Point the camera at the QR code',
+  regenerateInvite: 'Regenerate invite code',
+  addPlayer: 'Add another player',
 };
 
 const fa: Dict = {
@@ -321,6 +363,27 @@ const fa: Dict = {
   speedSlow: 'آهسته',
   speedNormal: 'عادی',
   speedFast: 'سریع',
+  scanQr: 'اسکن QR',
+  lobby: 'لابی',
+  lobbyTitle: '🎮 لابی بازی',
+  lobbyWaitingHost: 'در انتظار شروع بازی توسط میزبان…',
+  lobbyPlayers: 'بازیکنان حاضر در لابی',
+  lobbyInviteMore: 'دعوت از بازیکن دیگر',
+  lobbyInviteMoreShort: 'دعوت بیشتر',
+  lobbyStartGame: 'شروع بازی',
+  lobbyStartHint: 'برای شروع تایمر و آغاز مسابقه کلیک کنید.',
+  lobbyNeedPlayers: 'حداقل ۲ بازیکن لازم است (شما + ۱ مهمان).',
+  lobbyConnecting: 'در حال اتصال…',
+  lobbyYou: 'شما',
+  lobbyHost: 'میزبان',
+  lobbyGuest: 'مهمان',
+  lobbyWaitingGuests: 'کد خود را به اشتراک بگذارید و منتظر joining مهمان‌ها بمانید.',
+  scanInvite: 'اسکن کد دعوت',
+  scanAnswer: 'اسکن کد پاسخ',
+  scanClose: 'بستن اسکنر',
+  scanHint: 'دوربین را روی QR کد بگیرید',
+  regenerateInvite: 'تولید مجدد کد دعوت',
+  addPlayer: 'افزودن بازیکن دیگر',
 };
 
 const dicts: Record<Language, Dict> = { en, fa };

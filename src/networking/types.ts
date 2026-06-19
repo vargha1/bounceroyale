@@ -119,6 +119,30 @@ export type PowerupRespawnedMessage = {
   position: { x: number; y: number; z: number };
 };
 
+/**
+ * Lobby / waiting-room messages.
+ *
+ * The host broadcasts `peer-list` whenever a guest joins or disconnects, so
+ * every peer's lobby UI shows an up-to-date roster. The host sends
+ * `start-countdown` when the host clicks "Start Game" in the lobby — this
+ * tells guests to transition from the lobby into the actual game (mount the
+ * engine, generate the island, start the countdown).
+ *
+ * Both messages are LAN-only (WebRTC). Server-mode uses Socket.io's built-in
+ * room events and the server's own init flow.
+ */
+export type PeerListMessage = {
+  kind: 'peer-list';
+  /** Stable roster of player IDs currently in the lobby (host + all guests). */
+  players: { id: string; isHost: boolean }[];
+};
+
+export type StartCountdownMessage = {
+  kind: 'start-countdown';
+  /** Seconds the host wants everyone to count down before physics enables. */
+  startTimer: number;
+};
+
 export type NetMessage =
   | MoveMessage
   | JumpMessage
@@ -135,7 +159,9 @@ export type NetMessage =
   | InitMessage
   | NewPlayerMessage
   | PowerupCollectedMessage
-  | PowerupRespawnedMessage;
+  | PowerupRespawnedMessage
+  | PeerListMessage
+  | StartCountdownMessage;
 
 export type NetEvent =
   | { type: 'open'; id: string }
@@ -154,6 +180,8 @@ export type NetEvent =
   | { type: 'game-started'; data: Omit<GameStartedMessage, 'kind'> }
   | { type: 'powerup-collected'; data: Omit<PowerupCollectedMessage, 'kind'> }
   | { type: 'powerup-respawned'; data: Omit<PowerupRespawnedMessage, 'kind'> }
+  | { type: 'peer-list'; data: Omit<PeerListMessage, 'kind'> }
+  | { type: 'start-countdown'; data: Omit<StartCountdownMessage, 'kind'> }
   | { type: 'error'; message: string }
   | { type: 'close' };
 

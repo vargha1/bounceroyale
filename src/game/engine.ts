@@ -1336,7 +1336,17 @@ export function createGameEngine(opts: EngineOptions) {
           break;
         }
         case 'game-started': {
+          // Host's countdown expired and physics enabled. Enable physics on
+          // our side too AND clear our countdown UI immediately. Without
+          // clearing serverStartTime, our own pushCountdown() would keep
+          // showing a countdown (e.g. "2", "1") for a couple more seconds
+          // because our serverStartTime was set slightly later than the
+          // host's (due to the network round-trip of the start-countdown
+          // message). This way, the physics-enable moment is synchronized
+          // across all peers via the host's `game-started` broadcast.
           enablePhysics();
+          serverStartTime = null;
+          callbacks.onCountdown(null);
           break;
         }
         case 'powerup-collected': {
@@ -1348,6 +1358,25 @@ export function createGameEngine(opts: EngineOptions) {
         case 'powerup-respawned': {
           // Host broadcast a respawn at a NEW tile — move the pickup and show it.
           handleRemotePowerupRespawned(ev.data.powerupId, ev.data.newTileId, ev.data.position);
+          break;
+        }
+        case 'peer-list': {
+          // Lobby roster update. The engine doesn't need to act on this — the
+          // LanModal handles the lobby UI. We just log it for debugging.
+          console.log('[ENGINE] peer-list update:', ev.data.players.map((p) => p.id).join(', '));
+          break;
+        }
+        case 'start-countdown': {
+          // Host triggered the countdown. The engine's own start() should have
+          // already set serverStartTime, but if for some reason it didn't
+          // (e.g. this is a late-arriving start-countdown), set it now. This
+          // is mostly a safety net.
+          if (!serverStartTime) {
+            serverStartTime = Date.now() + (ev.data.startTimer ?? 5) * 1000;
+            startTimerValue = ev.data.startTimer ?? 5;
+            pushCountdown();
+            console.log('[ENGINE] start-countdown received; serverStartTime set to', serverStartTime);
+          }
           break;
         }
         case 'error':
@@ -1520,6 +1549,15 @@ export function createGameEngine(opts: EngineOptions) {
     if (!physicsEnabled) {
       // Still step remote kinematic bodies so they appear in the right place even pre-game
       updateRemoteKinematics();
+      // IMPORTANT: Interpolate remote players toward their targetPosition EVEN
+      // WHEN PHYSICS IS DISABLED (during the countdown). Without this, the
+      // host receives `move` messages from the guest (which can move on the
+      // guest's side once the guest's own countdown expires), updates
+      // `p.targetPosition`, but the guest's mesh on the host's screen stays
+      // frozen at the spawn position because the interpolation loop below was
+      // gated by `physicsEnabled`. This was the "movement not visible to host
+      // until timer runs out" bug.
+      interpolateRemotePlayers();
       return;
     }
 
@@ -1591,18 +1629,9 @@ export function createGameEngine(opts: EngineOptions) {
       }
     }
 
-    // Interpolate remote players
-    for (const [id, p] of Object.entries(players)) {
-      if (id === localPlayerId || p.eliminated) continue;
-      const tp = new THREE.Vector3(p.targetPosition.x, p.targetPosition.y, p.targetPosition.z);
-      p.mesh.position.lerp(tp, 0.2);
-      const tq = new THREE.Quaternion(p.targetRotation.x, p.targetRotation.y, p.targetRotation.z, p.targetRotation.w);
-      p.mesh.quaternion.slerp(tq, 0.2);
-      if (tp.y < DEATH_Y_LEVEL && !p.eliminated) {
-        // Remote player fell — host will broadcast, but as a fallback we eliminate locally too.
-        if (isHost || mode === 'single') eliminatePlayer(id);
-      }
-    }
+    // Interpolate remote players (also runs when physicsEnabled=false, via
+    // the early-return branch above — see comment there for why).
+    interpolateRemotePlayers();
 
     // ---- Island tile contact + impact damage ----
     const contacted = getContactedTile();
@@ -1676,6 +1705,38 @@ export function createGameEngine(opts: EngineOptions) {
     }
   }
 
+  /**
+   * Lerp each remote player's mesh toward its targetPosition (received via
+   * `move` messages) and slerp its quaternion toward targetRotation. This
+   * smooths out network jitter and makes remote players appear to move
+   * continuously rather than teleporting between snapshots.
+   *
+   * CRITICAL: This MUST run regardless of `physicsEnabled`. The host receives
+   * `move` messages from guests even during the pre-game countdown (when
+   * physicsEnabled=false). If we only interpolate inside the
+   * physicsEnabled-gated block, the host's screen shows remote players frozen
+   * at spawn until the host's own countdown expires — which can be much later
+   * than the guest's countdown if there's clock skew between devices. The
+   * classic "movement not visible to host until timer runs out" bug.
+   *
+   * Death check: if a remote player's targetPosition falls below the death
+   * level, we eliminate them locally as a fallback (the host will broadcast
+   * the elimination if it's authoritative).
+   */
+  function interpolateRemotePlayers() {
+    for (const [id, p] of Object.entries(players)) {
+      if (id === localPlayerId || p.eliminated) continue;
+      const tp = new THREE.Vector3(p.targetPosition.x, p.targetPosition.y, p.targetPosition.z);
+      p.mesh.position.lerp(tp, 0.2);
+      const tq = new THREE.Quaternion(p.targetRotation.x, p.targetRotation.y, p.targetRotation.z, p.targetRotation.w);
+      p.mesh.quaternion.slerp(tq, 0.2);
+      if (tp.y < DEATH_Y_LEVEL && !p.eliminated) {
+        // Remote player fell — host will broadcast, but as a fallback we eliminate locally too.
+        if (isHost || mode === 'single') eliminatePlayer(id);
+      }
+    }
+  }
+
   function updateCamera(dt: number) {
     // Determine follow target
     let targetId: string | null = localPlayerId;
@@ -1710,7 +1771,6 @@ export function createGameEngine(opts: EngineOptions) {
     keys[k] = v;
   }
   function setJoystick(x: number, y: number) {
-    console.log('joystick', x, y, 'physicsEnabled=', physicsEnabled, 'ballRigidBody=', !!ballRigidBody);
     joystickX = x;
     joystickY = y;
   }

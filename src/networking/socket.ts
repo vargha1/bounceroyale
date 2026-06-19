@@ -64,6 +64,8 @@ export class SocketNetClient implements NetClient {
     this.socket.on('game-started', () => this.emit({ type: 'game-started', data: {} }));
     this.socket.on('powerup-collected', (data: any) => this.emit({ type: 'powerup-collected', data: { powerupId: data.powerupId, playerId: data.playerId, powerupType: data.powerupType } }));
     this.socket.on('powerup-respawned', (data: any) => this.emit({ type: 'powerup-respawned', data: { powerupId: data.powerupId, newTileId: data.newTileId, position: data.position } }));
+    this.socket.on('peer-list', (data: any) => this.emit({ type: 'peer-list', data: { players: data.players ?? [] } }));
+    this.socket.on('start-countdown', (data: any) => this.emit({ type: 'start-countdown', data: { startTimer: data.startTimer ?? 5 } }));
 
     this.socket.on('error', (data: any) => this.emit({ type: 'error', message: data?.message ?? 'Server error' }));
     this.socket.on('connect_error', () => this.emit({ type: 'error', message: 'Failed to connect to server.' }));
@@ -117,6 +119,14 @@ export class SocketNetClient implements NetClient {
         break;
       case 'powerup-respawned':
         this.socket.emit('powerup-respawned', { gameId: gameIdStore, powerupId: msg.powerupId, newTileId: msg.newTileId, position: msg.position });
+        break;
+      case 'peer-list':
+        // Server-mode: server is the authority for the roster; clients don't
+        // send peer-list. Ignore.
+        break;
+      case 'start-countdown':
+        // Server-mode: server manages the countdown via the init event's
+        // serverStartTime. Ignore.
         break;
     }
   }

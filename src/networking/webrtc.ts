@@ -562,6 +562,23 @@ export class WebRTCNetHost implements NetClient {
    *  the same offline-aware configuration. */
   private forceOffline: boolean;
   private closed = false;
+  /**
+   * Events that arrived before any listener was registered. In the new lobby
+   * flow, the host's WebRTCNetHost is created in LanModal BEFORE the engine
+   * exists (the engine is only created when the host clicks "Start Game").
+   * Guests can send `new-player` and other messages during the lobby phase —
+   * without buffering, those events would be lost forever (the host's
+   * LanModal only listens for `peer-list` events, not full NetEvents).
+   *
+   * We replay the buffer (deduped by event type where appropriate) as soon as
+   * the first listener attaches. The buffer is capped to prevent OOM from a
+   * runaway peer.
+   *
+   * The LanModal's listener (registered during lobby setup) typically
+   * drains this buffer when it attaches. Subsequent listeners (e.g. the
+   * engine's) receive events live from then on.
+   */
+  private pendingEvents: NetEvent[] = [];
 
   constructor(id: string, opts?: { forceOffline?: boolean }) {
     this.id = id;
@@ -811,6 +828,46 @@ export class WebRTCNetHost implements NetClient {
     return this.createOffer(ip);
   }
 
+  /**
+   * Create a fresh invite code for an ADDITIONAL guest — WITHOUT tearing down
+   * any existing connections. This is the key method for 3+ device play: the
+   * host already has guest 1 connected, and now wants to invite guest 2.
+   *
+   * Each call generates a brand-new peerId + RTCPeerConnection + data channel
+   * + SDP offer. Existing connected guests are untouched. The host can call
+   * this multiple times to invite as many guests as desired.
+   *
+   * Reuses the last manualHostIp (if any) so the user doesn't have to re-enter
+   * their LAN IP for every additional guest.
+   */
+  async createAnotherOffer(manualHostIp?: string): Promise<string> {
+    const ip = manualHostIp ?? this.lastManualHostIp;
+    console.log('[HOST] Creating invite code for an additional guest. Existing connections:',
+      Array.from(this.dataChannels.entries()).filter(([_, dc]) => dc.readyState === 'open').length);
+    return this.createOffer(ip);
+  }
+
+  /**
+   * Broadcast a `start-countdown` message to ALL connected guests. Called by
+   * the host's lobby UI when the host clicks "Start Game". Guests receive
+   * this and transition from the lobby into the actual game (mount engine,
+   * generate island, start countdown).
+   *
+   * The host itself does NOT need this message — its own LanModal calls
+   * `onStart` directly when the host clicks "Start Game".
+   */
+  broadcastStartCountdown(startTimer: number) {
+    const msg: NetMessage = { kind: 'start-countdown', startTimer };
+    const raw = JSON.stringify(msg);
+    let sent = 0;
+    for (const dc of this.dataChannels.values()) {
+      if (dc.readyState === 'open') {
+        try { dc.send(raw); sent++; } catch { /* ignore */ }
+      }
+    }
+    console.log('[HOST] Broadcast start-countdown to', sent, 'guest(s). startTimer=', startTimer);
+  }
+
   /** Returns true if there's a pending PC awaiting an answer for this peerId. */
   hasPendingOffer(peerId: string): boolean {
     const pc = this.pendingOffers.get(peerId) || this.peerConns.get(peerId);
@@ -920,6 +977,12 @@ export class WebRTCNetHost implements NetClient {
       console.log('[HOST]', peerId, 'DataChannel OPEN');
       this.emit({ type: 'new-player', data: { id: peerId, position: { x: (Math.random() - 0.5) * 6, y: 5, z: (Math.random() - 0.5) * 6 } } });
       this.emitPeerChange();
+      // Broadcast the updated lobby roster to ALL connected guests (including
+      // the just-connected one) so everyone's lobby UI shows the new player.
+      // Slight delay (50ms) to let the guest's dc.onopen finish and its
+      // message listener attach — without this, the new guest could miss the
+      // peer-list broadcast entirely.
+      setTimeout(() => this.broadcastPeerList(), 50);
     };
     dc.onmessage = (e) => this.handleRawMessage(peerId, e.data as string);
     // Treat data channel close as a recoverable signal — wait a moment, then
@@ -1001,6 +1064,9 @@ export class WebRTCNetHost implements NetClient {
           // is the host-assigned peerId, after the acceptOffer fix). This makes
           // the host's `players` map key match the guest's localPlayerId.
           this.emit({ type: 'new-player', data: { id: playerId, position: msg.position } });
+          // BROADCAST the new roster to ALL guests so everyone's lobby UI
+          // updates. The host is the source of truth for the lobby roster.
+          this.broadcastPeerList();
           break;
         }
         case 'init': {
@@ -1047,6 +1113,14 @@ export class WebRTCNetHost implements NetClient {
         case 'player-disconnected':
           this.emit({ type: 'player-disconnected', data: { id: fromPeer } });
           break;
+        case 'peer-list':
+          // Guests don't normally send peer-list to the host (host is the
+          // authority), but ignore gracefully if one arrives.
+          break;
+        case 'start-countdown':
+          // Guests don't send this to the host (host triggers countdown), but
+          // ignore gracefully if one arrives.
+          break;
         default:
           // ignore unknown
           break;
@@ -1068,8 +1142,39 @@ export class WebRTCNetHost implements NetClient {
     this.appliedAnswers.delete(peerId);
     if (had) {
       this.emit({ type: 'player-disconnected', data: { id: peerId } });
+      // Refresh the lobby roster on remaining peers so the disconnected
+      // player is removed from everyone's UI.
+      this.broadcastPeerList();
     }
     this.emitPeerChange();
+  }
+
+  /**
+   * Broadcast the current lobby roster (host + all connected guests) to every
+   * connected guest. Called whenever a guest joins or disconnects so every
+   * peer's lobby UI shows the same up-to-date player list.
+   *
+   * The host's own id is always first in the list with isHost=true. Each
+   * connected guest's peerId follows with isHost=false.
+   */
+  broadcastPeerList() {
+    const players = [
+      { id: this.id, isHost: true },
+      ...Array.from(this.dataChannels.keys())
+        .filter((id) => this.dataChannels.get(id)!.readyState === 'open')
+        .map((id) => ({ id, isHost: false })),
+    ];
+    const msg: NetMessage = { kind: 'peer-list', players };
+    const raw = JSON.stringify(msg);
+    let sent = 0;
+    for (const dc of this.dataChannels.values()) {
+      if (dc.readyState === 'open') {
+        try { dc.send(raw); sent++; } catch { /* ignore */ }
+      }
+    }
+    console.log('[HOST] Broadcast peer-list to', sent, 'guest(s):', players.map((p) => p.id).join(', '));
+    // Also emit locally so the host's own lobby UI updates.
+    this.emit({ type: 'peer-list', data: { players } });
   }
 
   private emitPeerChange() {
@@ -1089,6 +1194,23 @@ export class WebRTCNetHost implements NetClient {
 
   onMessage(cb: (ev: NetEvent) => void) {
     this.listeners.add(cb);
+    // If events arrived before any listener was registered, replay them now.
+    // The most important cases are `new-player` (so the engine creates a
+    // sphere for an already-connected guest when the engine finally mounts)
+    // and `peer-list` (so the lobby UI shows the current roster). We replay
+    // ALL event types except `close` (which is terminal and should only fire
+    // once — see the close() method).
+    if (this.pendingEvents.length > 0) {
+      const pending = this.pendingEvents.slice();
+      this.pendingEvents = [];
+      console.log('[HOST] Replaying', pending.length, 'buffered events to new listener');
+      // Defer to a microtask so the caller's setup completes first.
+      queueMicrotask(() => {
+        for (const ev of pending) {
+          try { cb(ev); } catch (e) { console.warn('[HOST] replay threw', e); }
+        }
+      });
+    }
   }
   onPeerChange(cb: (peers: string[]) => void) {
     this.peerListeners.add(cb);
@@ -1096,6 +1218,16 @@ export class WebRTCNetHost implements NetClient {
   }
 
   private emit(ev: NetEvent) {
+    if (this.listeners.size === 0) {
+      // No listener yet — buffer. We cap the buffer so a runaway peer can't
+      // OOM us. We DO buffer `close` too (the close() method sets closed=true
+      // first, so any subsequent emit calls are no-ops anyway).
+      this.pendingEvents.push(ev);
+      if (this.pendingEvents.length > 200) {
+        this.pendingEvents.splice(0, this.pendingEvents.length - 200);
+      }
+      return;
+    }
     this.listeners.forEach((cb) => cb(ev));
   }
 
@@ -1423,6 +1555,12 @@ export class WebRTCNetGuest implements NetClient {
                 position: msg.position,
               },
             });
+            break;
+          case 'peer-list':
+            this.emit({ type: 'peer-list', data: { players: msg.players } });
+            break;
+          case 'start-countdown':
+            this.emit({ type: 'start-countdown', data: { startTimer: msg.startTimer } });
             break;
           default:
             // ignore

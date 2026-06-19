@@ -9,7 +9,8 @@ import {
   getNetworkStatus,
   COMMON_HOTSPOT_HOST_IPS,
 } from '../networking/webrtc';
-import type { NetClient } from '../networking/types';
+import type { NetClient, NetEvent } from '../networking/types';
+import QrScanner from './QrScanner';
 
 type Tab = 'menu' | 'host' | 'join';
 
@@ -19,6 +20,11 @@ interface Props {
    * Called when the player is ready to enter the game with a connected net
    * client. The Game component takes ownership of the client and will close
    * it on exit.
+   *
+   * For the host: called when the host clicks "Start Game" in the lobby (so
+   * the lobby can collect as many guests as desired before the match begins).
+   * For the guest: called when the guest receives a `start-countdown` message
+   * from the host (i.e. the host clicked "Start Game").
    */
   onStart: (client: NetClient, startTimer: number) => void;
 }
@@ -26,16 +32,22 @@ interface Props {
 /**
  * LAN multiplayer modal — cross-device, pure WebRTC (no signaling server).
  *
- * Simplified 2-step flow:
+ * Flow:
  *
  *   HOST
  *   1. Click "Start Hosting" → host's invite code (QR + text) appears.
  *   2. Guest scans/copies it → returns their answer code.
- *   3. Host pastes the answer → connected.
+ *   3. Host pastes the answer → guest joins the LOBBY.
+ *   4. (Optional) Host clicks "Invite another player" to generate a fresh
+ *      invite code for guest 2, 3, … All connected guests stay connected.
+ *   5. Host clicks "Start Game" → countdown begins for everyone.
  *
  *   GUEST
- *   1. Paste the host's invite code → answer code (QR + text) appears.
- *   2. Send the answer back to the host → connected once host applies it.
+ *   1. Paste/scan the host's invite code → answer code (QR + text) appears.
+ *   2. Send the answer back to the host → connected → enter LOBBY.
+ *   3. Lobby shows the roster (host + all guests) and "waiting for host".
+ *   4. When the host clicks "Start Game", the guest receives a
+ *      `start-countdown` message → guest calls onStart → countdown begins.
  *
  * Codes are deflate-compressed + base64url-encoded (see webrtc.ts) so they
  * fit comfortably inside a small QR code.
@@ -53,8 +65,27 @@ export default function LanModal({ onCancel, onStart }: Props) {
   const [statusText, setStatusText] = useState<string | null>(null);
 
   // ---- Host state ----
-  // Phase: 'idle' (before clicking Start) → 'waiting' (showing invite, awaiting answer) → 'connected'
-  const [hostPhase, setHostPhase] = useState<'idle' | 'waiting'>('idle');
+  // Phase machine:
+  //   'idle'     — before clicking Start Hosting
+  //   'hosting'  — showing invite code, awaiting guest's answer
+  //   'lobby'    — at least one guest connected; waiting for host to click "Start Game"
+  const [hostPhase, setHostPhaseState] = useState<'idle' | 'hosting' | 'lobby'>('idle');
+  // Ref mirror of hostPhase so async callbacks (the 8s timeout in
+  // applyGuestAnswer, the onPeerChange callback) can read the CURRENT phase
+  // instead of the stale closure value captured when they were created.
+  const hostPhaseRef = useRef<'idle' | 'hosting' | 'lobby'>('idle');
+  const setHostPhase = (p: 'idle' | 'hosting' | 'lobby' | ((prev: 'idle' | 'hosting' | 'lobby') => 'idle' | 'hosting' | 'lobby')) => {
+    if (typeof p === 'function') {
+      setHostPhaseState((prev) => {
+        const next = p(prev);
+        hostPhaseRef.current = next;
+        return next;
+      });
+    } else {
+      hostPhaseRef.current = p;
+      setHostPhaseState(p);
+    }
+  };
   const [hostCode, setHostCode] = useState('');
   const [hostQrUrl, setHostQrUrl] = useState('');
   const [guestAnswerInput, setGuestAnswerInput] = useState('');
@@ -64,10 +95,17 @@ export default function LanModal({ onCancel, onStart }: Props) {
   const [manualHostIp, setManualHostIp] = useState('');
   const webrtcHostRef = useRef<WebRTCNetHost | null>(null);
   const startedRef = useRef(false);
+  /** Tracks the most recent pending peerId the host invited, so we know which
+   *  peer just connected when onPeerChange fires. Used for the "just joined"
+   *  toast in the lobby UI. */
+  const lastInvitePeerIdRef = useRef<string | null>(null);
 
   // ---- Guest state ----
-  // Phase: 'idle' (paste host code) → 'answer' (showing answer, waiting for host to apply) → 'connected'
-  const [guestPhase, setGuestPhase] = useState<'idle' | 'answer'>('idle');
+  // Phase machine:
+  //   'idle'   — paste host code
+  //   'answer' — showing answer, waiting for host to apply it
+  //   'lobby'  — connected; waiting for host to click "Start Game"
+  const [guestPhase, setGuestPhase] = useState<'idle' | 'answer' | 'lobby'>('idle');
   const [hostCodeInput, setHostCodeInput] = useState('');
   const [guestCode, setGuestCode] = useState('');
   const [guestQrUrl, setGuestQrUrl] = useState('');
@@ -77,6 +115,18 @@ export default function LanModal({ onCancel, onStart }: Props) {
   // routers). Empty = rely on mDNS + STUN only.
   const [manualGuestIp, setManualGuestIp] = useState('');
   const webrtcGuestRef = useRef<WebRTCNetGuest | null>(null);
+
+  // ---- Lobby roster (shared) ----
+  // Host: built locally from dataChannels. Guest: received from host via
+  // `peer-list` messages. Both render the same UI.
+  const [peerList, setPeerList] = useState<{ id: string; isHost: boolean }[]>([]);
+
+  // ---- QR scanner ----
+  // When non-null, the QrScanner overlay is shown. The value indicates which
+  // input field the decoded text should fill:
+  //   'host-offer'  → guest scanning host's invite code → fills hostCodeInput
+  //   'guest-answer' → host scanning guest's answer code → fills guestAnswerInput
+  const [qrScannerTarget, setQrScannerTarget] = useState<'host-offer' | 'guest-answer' | null>(null);
 
   // ---- Network status & IP detection (shared) ----
   // "Force offline" lets the user tell us "I'm on a hotspot without internet,
@@ -191,18 +241,45 @@ export default function LanModal({ onCancel, onStart }: Props) {
       const id = `host-${Math.random().toString(36).slice(2, 8)}`;
       const host = new WebRTCNetHost(id, { forceOffline });
       webrtcHostRef.current = host;
+
+      // Register a message listener early so the host receives `peer-list`
+      // broadcasts from itself (broadcastPeerList emits locally too) and
+      // updates the lobby roster. This listener runs alongside the engine's
+      // listener once the engine mounts.
+      host.onMessage((ev: NetEvent) => {
+        if (ev.type === 'peer-list') {
+          setPeerList(ev.data.players);
+        }
+      });
+
       host.onPeerChange((peers) => {
-        // Only trigger onStart when a data channel is actually OPEN, not just
-        // present in the map. During regeneration, the old PC's dc.onclose
-        // can fire emitPeerChange while the new PC's data channel is still
-        // in "connecting" state — without this guard, that would spuriously
-        // trigger onStart and transition to the game screen.
-        const hasOpen = host.hasOpenDataChannel();
-        if (peers.length > 0 && hasOpen && !startedRef.current) {
-          startedRef.current = true;
+        // Only count guests whose data channel is actually OPEN. During
+        // regeneration or inviting another player, the new PC's data channel
+        // is in "connecting" state — without this guard, the lobby would
+        // spuriously add a "connecting" player to the roster.
+        const openPeers = peers.filter((pid) => {
+          const dc = (host as any).dataChannels?.get(pid);
+          return dc && dc.readyState === 'open';
+        });
+        console.log('[HOST Lobby] onPeerChange:', peers.length, 'peers,', openPeers.length, 'open');
+        // Update the local roster view. The host's own id is always first.
+        setPeerList([
+          { id: host.id, isHost: true },
+          ...openPeers.map((pid) => ({ id: pid, isHost: false })),
+        ]);
+        // When at least one guest has an OPEN data channel, transition to the
+        // LOBBY phase. We DO NOT call onStart here anymore — the host must
+        // click "Start Game" in the lobby to begin the actual match. This
+        // gives other guests time to join.
+        //
+        // Use a FUNCTIONAL state update so we don't capture a stale
+        // `hostPhase` from this closure (which was created when startHost ran
+        // and would always see `hostPhase = 'idle'`). The functional update
+        // sees the latest state value at the time the callback fires, and
+        // also keeps hostPhaseRef in sync.
+        if (openPeers.length > 0) {
           setStatus('connected');
-          (window as any).__bounceroyale_pendingNet = host;
-          onStart(host, timer);
+          setHostPhase((prev) => prev !== 'lobby' ? 'lobby' : prev);
         }
       });
       // Pass the manual IP (if any) so the host injects IP-based ICE candidates
@@ -211,8 +288,10 @@ export default function LanModal({ onCancel, onStart }: Props) {
       const ip = manualHostIp.trim();
       const code = await host.createOffer(ip || undefined);
       setHostCode(code);
-      setHostPhase('waiting');
+      setHostPhase('hosting');
       setStatus('connecting');
+      // Initialize the roster with just the host.
+      setPeerList([{ id: host.id, isHost: true }]);
     } catch (e: any) {
       setError(e?.message ?? 'Failed to start hosting');
       webrtcHostRef.current?.close();
@@ -230,12 +309,17 @@ export default function LanModal({ onCancel, onStart }: Props) {
     try {
       await webrtcHostRef.current.acceptAnswer(guestAnswerInput.trim());
       // Status will switch to 'connected' via onPeerChange when the data channel opens.
+      // Once connected, the host transitions to the LOBBY phase (via onPeerChange),
+      // where they can invite more players or click "Start Game".
       // If ICE fails (e.g. on a hotspot with the wrong manual IP), the host's
-      // PC will eventually hit `failed` and the data channel won't open. The
-      // user will see "waiting for guest..." forever. We surface a hint after
-      // a few seconds so they know to regenerate.
+      // PC will eventually hit `failed` and the data channel won't open. We
+      // surface a hint after a few seconds so they know to regenerate.
       window.setTimeout(() => {
-        if (status !== 'connected' && !startedRef.current) {
+        // Only show the error if we're still in 'hosting' phase (haven't
+        // transitioned to lobby yet). If we're in lobby, the connection
+        // succeeded. Use the ref so we see the CURRENT phase, not the stale
+        // closure value.
+        if (hostPhaseRef.current !== 'lobby' && !startedRef.current) {
           // Generate a targeted error message based on the user's setup.
           // The #1 cause is the host's firewall blocking inbound UDP.
           let msg = 'Connection failed — packets are not getting through.\n\n';
@@ -264,6 +348,71 @@ export default function LanModal({ onCancel, onStart }: Props) {
     } finally {
       setBusy(false);
     }
+  };
+
+  /**
+   * Generate a fresh invite code for an ADDITIONAL guest — without tearing
+   * down any existing connections. This is the key action for 3+ device play:
+   * the host already has guest 1 connected (and in the lobby), and now wants
+   * to invite guest 2.
+   *
+   * After clicking, the host's UI switches back to the 'hosting' phase (showing
+   * the new invite code + awaiting the new guest's answer). When guest 2
+   * connects, the UI returns to the lobby, now showing both guests in the
+   * roster.
+   */
+  const inviteAnotherPlayer = async () => {
+    if (!webrtcHostRef.current) return;
+    setError(null);
+    setBusy(true);
+    setStatusText(forceOffline
+      ? 'Gathering ICE candidates (offline mode — should be fast)...'
+      : 'Gathering ICE candidates (up to 10s for STUN)...');
+    try {
+      const code = await webrtcHostRef.current.createAnotherOffer();
+      setHostCode(code);
+      setGuestAnswerInput('');
+      // Transition back to 'hosting' so the host sees the new invite code
+      // and can paste the new guest's answer. The existing guests stay
+      // connected and remain in the roster.
+      setHostPhase('hosting');
+      setStatus('connecting');
+      console.log('[HOST] Generated invite code for an additional player.');
+    } catch (e: any) {
+      setError(e?.message ?? 'Failed to generate a new invite code');
+    } finally {
+      setBusy(false);
+      setStatusText(null);
+    }
+  };
+
+  /**
+   * Host clicked "Start Game" in the lobby. Broadcasts a `start-countdown`
+   * message to all connected guests (so they transition from their lobby
+   * view into the actual game), then calls onStart locally.
+   *
+   * The host's own engine is created when onStart is called — at that point
+   * the engine's start() generates the island, sends `init` to all guests
+   * (with serverStartTime), and the countdown begins on every peer.
+   */
+  const startGameFromLobby = () => {
+    if (!webrtcHostRef.current || startedRef.current) return;
+    // Need at least 2 players (host + 1 guest) to start a meaningful game.
+    const connectedGuests = peerList.filter((p) => !p.isHost).length;
+    if (connectedGuests < 1) {
+      setError(t('lobbyNeedPlayers', lang));
+      return;
+    }
+    startedRef.current = true;
+    const host = webrtcHostRef.current;
+    // Tell all guests to start their countdown. Guests' LanModal receives
+    // this and calls their own onStart → engine mounts → guest receives init
+    // from host's engine → countdown begins.
+    host.broadcastStartCountdown(timer);
+    // Stash the host on the global slot so the Game component can pick it up.
+    (window as any).__bounceroyale_pendingNet = host;
+    setStatus('connected');
+    onStart(host, timer);
   };
 
   /** Regenerate the host's invite code after a failed attempt. Tears down any
@@ -312,13 +461,37 @@ export default function LanModal({ onCancel, onStart }: Props) {
       const id = `g-${Math.random().toString(36).slice(2, 9)}`;
       const guest = new WebRTCNetGuest(id, { forceOffline });
       webrtcGuestRef.current = guest;
-      guest.onMessage((ev) => {
-        if (ev.type === 'open' && !startedRef.current) {
-          startedRef.current = true;
+      guest.onMessage((ev: NetEvent) => {
+        if (ev.type === 'open') {
+          // Data channel opened — we're connected to the host. Transition to
+          // the LOBBY phase. We DO NOT call onStart yet — the host hasn't
+          // clicked "Start Game" so there's no engine to mount. Wait for the
+          // host's `start-countdown` message.
+          console.log('[GUEST Lobby] Data channel OPEN — entering lobby phase.');
           setStatus('connected');
+          setGuestPhase('lobby');
+          // Stash the guest on the global slot so the Game component can pick
+          // it up when onStart is called later.
           (window as any).__bounceroyale_pendingNet = guest;
           webrtcGuestRef.current = null;
-          onStart(guest, 30);
+        } else if (ev.type === 'peer-list') {
+          // Host broadcast the lobby roster — update the local view.
+          setPeerList(ev.data.players);
+        } else if (ev.type === 'start-countdown' && !startedRef.current) {
+          // Host clicked "Start Game" — transition into the actual game.
+          // The host's engine will send us an `init` message shortly (with
+          // the island seed + serverStartTime) which the engine processes to
+          // generate the island and start the countdown.
+          console.log('[GUEST Lobby] Received start-countdown from host. startTimer=', ev.data.startTimer);
+          startedRef.current = true;
+          onStart(guest, ev.data.startTimer);
+        } else if (ev.type === 'close' && !startedRef.current) {
+          // Host disconnected during the lobby (e.g. host closed their tab or
+          // went back to menu). Surface a clear error and let the guest go
+          // back to the menu to try again.
+          console.log('[GUEST Lobby] Connection to host lost.');
+          setError('Lost connection to the host. They may have left the lobby. Click Back to return to the menu.');
+          setStatus('idle');
         }
       });
       const answer = await guest.acceptOffer(hostCodeInput.trim(), manualGuestIp.trim() || undefined);
@@ -351,6 +524,7 @@ export default function LanModal({ onCancel, onStart }: Props) {
     setHostPhase('idle'); setHostCode(''); setGuestAnswerInput('');
     setGuestPhase('idle'); setHostCodeInput(''); setGuestCode('');
     setStatus('idle'); setError(null); startedRef.current = false;
+    setPeerList([]);
     setTab('menu');
   };
 
@@ -685,7 +859,7 @@ export default function LanModal({ onCancel, onStart }: Props) {
               </>
             )}
 
-            {hostPhase === 'waiting' && (
+            {hostPhase === 'hosting' && (
               <>
                 <h3>1. {t('lanShareInvite', lang)}</h3>
                 <CodeBlock code={hostCode} which="host" />
@@ -697,14 +871,25 @@ export default function LanModal({ onCancel, onStart }: Props) {
                   placeholder={t('lanAnswerPlaceholder', lang)}
                   style={{ minHeight: 60 }}
                 />
-                <button
-                  className="primary mt-1"
-                  style={{ width: '100%' }}
-                  onClick={applyGuestAnswer}
-                  disabled={!guestAnswerInput.trim() || busy}
-                >
-                  {busy ? '…' : `✓ ${t('connect', lang)}`}
-                </button>
+                <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.4rem' }}>
+                  <button
+                    className="primary"
+                    style={{ flex: 1 }}
+                    onClick={applyGuestAnswer}
+                    disabled={!guestAnswerInput.trim() || busy}
+                  >
+                    {busy ? '…' : `✓ ${t('connect', lang)}`}
+                  </button>
+                  <button
+                    className="ghost"
+                    style={{ flex: '0 0 auto' }}
+                    onClick={() => setQrScannerTarget('guest-answer')}
+                    disabled={busy}
+                    title={t('scanAnswer', lang)}
+                  >
+                    📷 {t('scanQr', lang)}
+                  </button>
+                </div>
 
                 <div className={`connection-status ${status === 'connected' ? 'connected' : 'connecting'} mt-2`}>
                   <span className="dot"></span>
@@ -724,13 +909,105 @@ export default function LanModal({ onCancel, onStart }: Props) {
                   disabled={busy}
                   title="Tear down the current connection attempt and create a fresh invite code. Use this if Connect isn't doing anything, if you got a 'wrong state' error, or if ICE failed."
                 >
-                  {busy ? '…' : '🔄 Regenerate invite code'}
+                  {busy ? '…' : `🔄 ${t('regenerateInvite', lang)}`}
                 </button>
                 <div className="text-dim" style={{ fontSize: '0.75rem', marginTop: '0.4rem', textAlign: 'center' }}>
                   If Connect isn't working (e.g. wrong-state error, no pending offer,
                   or it just hangs), click this to start fresh. You'll get a new
                   invite code — give it to the guest and have them re-join.
                 </div>
+
+                <div className="actions mt-2">
+                  <button className="ghost" onClick={backToMenu}>{t('cancel', lang)}</button>
+                </div>
+              </>
+            )}
+
+            {hostPhase === 'lobby' && (
+              <>
+                <h3>🎮 {t('lobbyTitle', lang)}</h3>
+                <p className="text-dim" style={{ fontSize: '0.85rem', marginBottom: '0.6rem' }}>
+                  {t('lobbyWaitingGuests', lang)}
+                </p>
+
+                {/* Player roster */}
+                <div style={{
+                  padding: '0.75rem',
+                  marginBottom: '0.75rem',
+                  borderRadius: '8px',
+                  background: 'rgba(34, 197, 94, 0.08)',
+                  border: '1px solid rgba(34, 197, 94, 0.3)',
+                }}>
+                  <div style={{ fontSize: '0.85rem', marginBottom: '0.5rem', fontWeight: 600 }}>
+                    👥 {t('lobbyPlayers', lang)} ({peerList.length})
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+                    {peerList.map((p) => (
+                      <div
+                        key={p.id}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '0.5rem',
+                          padding: '0.4rem 0.6rem',
+                          background: 'rgba(255,255,255,0.04)',
+                          borderRadius: '6px',
+                          fontSize: '0.85rem',
+                        }}
+                      >
+                        <span style={{
+                          width: 8, height: 8, borderRadius: '50%',
+                          background: p.isHost ? '#ffd700' : '#4ade80',
+                          display: 'inline-block',
+                          flexShrink: 0,
+                        }} />
+                        <span style={{ fontFamily: 'monospace', fontSize: '0.8rem', flex: 1 }}>
+                          {p.id.slice(0, 12)}
+                        </span>
+                        <span style={{
+                          fontSize: '0.7rem',
+                          padding: '0.1rem 0.4rem',
+                          borderRadius: '4px',
+                          background: p.isHost ? 'rgba(255, 215, 0, 0.15)' : 'rgba(74, 222, 128, 0.15)',
+                          color: p.isHost ? '#ffd700' : '#4ade80',
+                        }}>
+                          {p.isHost ? t('lobbyHost', lang) : t('lobbyGuest', lang)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Timer slider — host can still adjust the countdown length
+                    before starting the game. */}
+                <TimerSlider />
+
+                {/* Action buttons: Invite more players + Start Game */}
+                <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.75rem' }}>
+                  <button
+                    className="ghost"
+                    style={{ flex: 1 }}
+                    onClick={inviteAnotherPlayer}
+                    disabled={busy}
+                    title={t('lobbyInviteMore', lang)}
+                  >
+                    {busy ? '…' : `➕ ${t('lobbyInviteMoreShort', lang)}`}
+                  </button>
+                  <button
+                    className="primary"
+                    style={{ flex: 1.4, fontSize: '1rem', fontWeight: 700 }}
+                    onClick={startGameFromLobby}
+                    disabled={busy || peerList.filter((p) => !p.isHost).length < 1}
+                    title={t('lobbyStartHint', lang)}
+                  >
+                    ▶ {t('lobbyStartGame', lang)}
+                  </button>
+                </div>
+                {peerList.filter((p) => !p.isHost).length < 1 && (
+                  <div className="text-dim" style={{ fontSize: '0.75rem', marginTop: '0.4rem', textAlign: 'center' }}>
+                    {t('lobbyNeedPlayers', lang)}
+                  </div>
+                )}
 
                 <div className="actions mt-2">
                   <button className="ghost" onClick={backToMenu}>{t('cancel', lang)}</button>
@@ -759,6 +1036,19 @@ export default function LanModal({ onCancel, onStart }: Props) {
                   placeholder={t('lanInvitePlaceholder', lang)}
                   style={{ minHeight: 60 }}
                 />
+                {/* QR scanner button — opens the camera so the guest can scan
+                    the host's invite QR code directly, without needing an
+                    external scanner app. The decoded text fills the textarea
+                    above. */}
+                <button
+                  className="ghost mt-1"
+                  style={{ width: '100%' }}
+                  onClick={() => setQrScannerTarget('host-offer')}
+                  disabled={busy}
+                  title={t('scanInvite', lang)}
+                >
+                  📷 {t('scanQr', lang)}
+                </button>
                 {/* Manual guest LAN IP — symmetric to the host's field. On a
                     mobile hotspot, the guest (often a phone) also needs to
                     provide a working IP candidate because Chrome's mDNS
@@ -825,6 +1115,78 @@ export default function LanModal({ onCancel, onStart }: Props) {
                   <span className="dot"></span>
                   {status === 'connected' ? t('connected', lang) : t('lanWaitingForHost', lang)}
                 </div>
+                <div className="actions mt-2">
+                  <button className="ghost" onClick={backToMenu}>{t('cancel', lang)}</button>
+                </div>
+              </>
+            )}
+
+            {guestPhase === 'lobby' && (
+              <>
+                <h3>🎮 {t('lobbyTitle', lang)}</h3>
+                <p className="text-dim" style={{ fontSize: '0.85rem', marginBottom: '0.6rem' }}>
+                  {t('lobbyWaitingHost', lang)}
+                </p>
+
+                {/* Player roster — same UI as the host's lobby, populated from
+                    peer-list messages received from the host. */}
+                <div style={{
+                  padding: '0.75rem',
+                  marginBottom: '0.75rem',
+                  borderRadius: '8px',
+                  background: 'rgba(56, 189, 248, 0.08)',
+                  border: '1px solid rgba(56, 189, 248, 0.3)',
+                }}>
+                  <div style={{ fontSize: '0.85rem', marginBottom: '0.5rem', fontWeight: 600 }}>
+                    👥 {t('lobbyPlayers', lang)} ({peerList.length})
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+                    {peerList.length === 0 && (
+                      <div className="text-dim" style={{ fontSize: '0.8rem', padding: '0.3rem 0' }}>
+                        {t('lobbyConnecting', lang)}
+                      </div>
+                    )}
+                    {peerList.map((p) => (
+                      <div
+                        key={p.id}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '0.5rem',
+                          padding: '0.4rem 0.6rem',
+                          background: 'rgba(255,255,255,0.04)',
+                          borderRadius: '6px',
+                          fontSize: '0.85rem',
+                        }}
+                      >
+                        <span style={{
+                          width: 8, height: 8, borderRadius: '50%',
+                          background: p.isHost ? '#ffd700' : '#4ade80',
+                          display: 'inline-block',
+                          flexShrink: 0,
+                        }} />
+                        <span style={{ fontFamily: 'monospace', fontSize: '0.8rem', flex: 1 }}>
+                          {p.id.slice(0, 12)}
+                        </span>
+                        <span style={{
+                          fontSize: '0.7rem',
+                          padding: '0.1rem 0.4rem',
+                          borderRadius: '4px',
+                          background: p.isHost ? 'rgba(255, 215, 0, 0.15)' : 'rgba(74, 222, 128, 0.15)',
+                          color: p.isHost ? '#ffd700' : '#4ade80',
+                        }}>
+                          {p.isHost ? t('lobbyHost', lang) : t('lobbyGuest', lang)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className={`connection-status connected mt-2`}>
+                  <span className="dot"></span>
+                  {t('lobbyWaitingHost', lang)}
+                </div>
+
                 <div className="actions mt-2">
                   <button className="ghost" onClick={backToMenu}>{t('cancel', lang)}</button>
                 </div>
@@ -966,6 +1328,27 @@ export default function LanModal({ onCancel, onStart }: Props) {
           )}
         </div>
       </div>
+
+      {/* ============ QR Scanner overlay ============ */}
+      {/* Rendered on top of the modal when the user clicks "📷 Scan QR". The
+          scanner decodes a QR code from the device's camera and fills the
+          relevant input field, then closes. */}
+      {qrScannerTarget && (
+        <QrScanner
+          title={qrScannerTarget === 'host-offer' ? t('scanInvite', lang) : t('scanAnswer', lang)}
+          onDecode={(text) => {
+            // Fill the appropriate input field based on which scan button
+            // was clicked.
+            if (qrScannerTarget === 'host-offer') {
+              setHostCodeInput(text);
+            } else {
+              setGuestAnswerInput(text);
+            }
+            setQrScannerTarget(null);
+          }}
+          onClose={() => setQrScannerTarget(null)}
+        />
+      )}
     </div>
   );
 }
