@@ -1,4 +1,17 @@
 /* ===== Global styles ===== */
+
+/* Local IRSANS font for Persian text. Bundled at /public/IRSANS.ttf so it
+   works fully offline (no Google Fonts CDN dependency). Loaded with a swap
+   strategy so the page renders immediately with system fonts while IRSANS
+   downloads (only matters on first visit before SW caches it). */
+@font-face {
+  font-family: 'IRSANS';
+  src: url('/IRSANS.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --bg: #0a0a14;
   --bg-grad-1: #1a0b2e;

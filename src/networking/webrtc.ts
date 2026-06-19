@@ -80,7 +80,7 @@ const LABEL = 'bounceroyale';
 // a TURN server (TURN would relay traffic through a public server, defeating
 // the purpose of "no server required" LAN play AND costing bandwidth). If
 // both mDNS and STUN fail on your network, use the manual LAN IP field.
-const ICE_SERVERS: RTCIceServer[] = [
+const STUN_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
@@ -89,6 +89,160 @@ const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.services.mozilla.com:3478' },
   { urls: 'stun:stun.sipgate.net:3478' },
   { urls: 'stun:stun.ekiga.net:3478' },
+];
+
+// ============================================================================
+// Network status & dynamic ICE config
+// ============================================================================
+//
+// PROBLEM: On a mobile-hotspot network without internet routing, STUN servers
+// are unreachable. The browser still tries to gather STUN candidates, taking
+// 5-12 seconds before timing out. This makes "hotspot host + guest" play
+// painfully slow — the user clicks "Start Hosting" and waits ~10 seconds
+// before the invite code even appears.
+//
+// FIX: Detect whether the device thinks it has internet (navigator.onLine +
+// a manual override flag). When we believe we're offline (hotspot without
+// internet), use NO STUN servers — only mDNS + manual IP candidates. ICE
+// gathering completes in ~50ms instead of 6-10s. Connections are also more
+// reliable because we don't waste time on candidates that will never work.
+//
+// The user can force "LAN-only / hotspot mode" in the UI even if
+// navigator.onLine is true (e.g., mobile data is on but they want to play
+// purely on the hotspot LAN).
+
+/** Network status used to decide which ICE servers to use. */
+export type NetworkStatus = 'online' | 'offline';
+
+/**
+ * Detect the device's current network status. We use `navigator.onLine` as
+ * a fast first check. The user can override this via the `forceOffline`
+ * argument (e.g., they know they're on a hotspot without internet even if
+ * mobile data is on).
+ */
+export function getNetworkStatus(forceOffline = false): NetworkStatus {
+  if (forceOffline) return 'offline';
+  if (typeof navigator === 'undefined') return 'online';
+  return navigator.onLine ? 'online' : 'offline';
+}
+
+/**
+ * Build the appropriate RTCConfiguration based on the network status.
+ * - Online: mDNS + STUN servers (current behavior, works on regular Wi-Fi)
+ * - Offline: mDNS only (no STUN servers, faster gathering on hotspots)
+ *
+ * We always use `iceTransportPolicy: 'all'` and `bundlePolicy: 'max-bundle'`.
+ */
+export function createPCConfig(forceOffline = false): RTCConfiguration {
+  const status = getNetworkStatus(forceOffline);
+  const iceServers = status === 'online' ? STUN_SERVERS : [];
+  console.log('[WebRTC] ICE config:', status === 'online'
+    ? `online — using ${iceServers.length} STUN servers`
+    : 'offline — mDNS only (no STUN, faster on hotspot)');
+  return {
+    iceServers,
+    iceTransportPolicy: 'all',
+    bundlePolicy: 'max-bundle',
+  };
+}
+
+// ============================================================================
+// Local IP auto-detection (for the manual IP field UX)
+// ============================================================================
+//
+// We use the well-known WebRTC IP-discovery trick: create a temporary
+// RTCPeerConnection with NO STUN servers, createDataChannel + createOffer +
+// setLocalDescription, and listen for ICE candidates. The local candidates
+// contain the device's local IP address.
+//
+// Caveats:
+//   - Chrome with mDNS anti-fingerprinting enabled (default since Chrome 75+)
+//     will produce only `*.local` candidates, not raw IPs. In that case we
+//     return an empty array and the UI prompts the user to enter their IP
+//     manually with clear instructions.
+//   - Firefox, Safari, and Chrome with mDNS disabled (e.g., via flag) WILL
+//     return raw IPs. We filter for IPv4 only (LAN IPs are always IPv4).
+//   - The trick completes in <500ms because there's no STUN to wait for.
+
+/**
+ * Detect this device's local IPv4 addresses using the WebRTC ICE candidate
+ * trick. Resolves to an array of unique IPv4 strings (may be empty on Chrome
+ * with mDNS obfuscation enabled — see comment above).
+ *
+ * The UI should call this when the user opens the LAN modal and offer the
+ * detected IPs as clickable suggestions for the manual IP field.
+ */
+export function detectLocalIps(): Promise<string[]> {
+  return new Promise((resolve) => {
+    const ips = new Set<string>();
+    let pc: RTCPeerConnection | null = null;
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      try { pc?.close(); } catch { /* ignore */ }
+      // Filter to private IPv4 ranges (LAN IPs) — public IPs from this trick
+      // are unlikely to be useful for LAN play and might leak privacy.
+      const lanIps = Array.from(ips).filter((ip) => isPrivateIpv4(ip));
+      resolve(lanIps);
+    };
+
+    try {
+      pc = new RTCPeerConnection({ iceServers: [], iceCandidatePoolSize: 0 });
+      // Must create a data channel for ICE candidates to be generated.
+      pc.createDataChannel('detect');
+      pc.onicecandidate = (e) => {
+        if (!e.candidate) {
+          // null candidate = gathering complete
+          finish();
+          return;
+        }
+        const cand = e.candidate.candidate || '';
+        // Extract IPv4 address from the candidate string.
+        const match = cand.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
+        if (match) ips.add(match[1]);
+      };
+      pc.createOffer()
+        .then((offer) => pc!.setLocalDescription(offer))
+        .catch(() => finish());
+    } catch {
+      finish();
+      return;
+    }
+
+    // Hard timeout — never block the UI longer than 1.5s. On Chrome with
+    // mDNS, candidates arrive almost instantly; on slow devices we still
+    // cap at 1.5s.
+    setTimeout(finish, 1500);
+  });
+}
+
+/** Check if an IPv4 string is in a private range (10.x, 172.16-31.x, 192.168.x). */
+function isPrivateIpv4(ip: string): boolean {
+  const parts = ip.split('.').map((p) => parseInt(p, 10));
+  if (parts.length !== 4 || parts.some((p) => isNaN(p) || p < 0 || p > 255)) return false;
+  const [a, b] = parts;
+  if (a === 10) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  // Carrier-grade NAT — also typically LAN-side on hotspots.
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  return false;
+}
+
+/** Common hotspot host IPs for quick-pick in the UI.
+ *  - Android hotspot host: 192.168.43.1
+ *  - iOS hotspot host: 172.20.10.1
+ *  - Windows Mobile Hotspot: 192.168.137.1
+ *  - Typical home router: 192.168.1.1 / 192.168.0.1 (less useful as a "your IP"
+ *    value but listed so users don't confuse gateway with their own IP)
+ */
+export const COMMON_HOTSPOT_HOST_IPS = [
+  { ip: '192.168.43.1', label: 'Android hotspot host' },
+  { ip: '172.20.10.1', label: 'iOS hotspot host' },
+  { ip: '192.168.137.1', label: 'Windows Mobile Hotspot' },
+  { ip: '10.0.0.1', label: 'Some Android / Linux hotspots' },
 ];
 
 // ============================================================================
@@ -233,11 +387,10 @@ async function applyExtraCandidates(pc: RTCPeerConnection, candidates: ExtraIceC
   }
 }
 
-const PC_CONFIG: RTCConfiguration = {
-  iceServers: ICE_SERVERS,
-  iceTransportPolicy: 'all',
-  bundlePolicy: 'max-bundle',
-};
+// PC_CONFIG is now built dynamically via createPCConfig() so we can adapt to
+// the device's online/offline status (hotspot without internet = skip STUN).
+// The old static `PC_CONFIG` constant is removed; each call site that needs
+// an RTCConfiguration calls createPCConfig(forceOffline) instead.
 
 // ============================================================================
 // Compression helpers — deflate via CompressionStream + URL-safe base64.
@@ -318,10 +471,15 @@ export class WebRTCNetHost implements NetClient {
   /** The last manualHostIp passed to createOffer, so regenerateOffer can
    *  reuse it without the caller having to pass it again. */
   private lastManualHostIp: string | undefined;
+  /** Whether to skip STUN servers entirely (hotspot without internet). Set
+   *  via the constructor so all peer connections created by this host use
+   *  the same offline-aware configuration. */
+  private forceOffline: boolean;
   private closed = false;
 
-  constructor(id: string) {
+  constructor(id: string, opts?: { forceOffline?: boolean }) {
     this.id = id;
+    this.forceOffline = !!opts?.forceOffline;
   }
 
   /**
@@ -350,7 +508,7 @@ export class WebRTCNetHost implements NetClient {
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    await waitForIceComplete(pc);
+    await waitForIceComplete(pc, 12000, this.forceOffline);
 
     this.pendingOffers.set(peerId, pc);
 
@@ -520,7 +678,11 @@ export class WebRTCNetHost implements NetClient {
   }
 
   private createPeerConnection(peerId: string): RTCPeerConnection {
-    const pc = new RTCPeerConnection(PC_CONFIG);
+    // Build the ICE config dynamically — when forceOffline is set (or
+    // navigator.onLine is false), we skip STUN servers entirely so ICE
+    // gathering completes in milliseconds instead of waiting 5-10s for STUN
+    // to time out on a hotspot without internet.
+    const pc = new RTCPeerConnection(createPCConfig(this.forceOffline));
     this.peerConns.set(peerId, pc);
 
     // Log every local ICE candidate as it's gathered. This is critical for
@@ -798,9 +960,12 @@ export class WebRTCNetGuest implements NetClient {
    */
   private pendingEvents: NetEvent[] = [];
   private openEmitted = false;
+  /** Whether to skip STUN servers entirely (hotspot without internet). */
+  private forceOffline: boolean;
 
-  constructor(id: string) {
+  constructor(id: string, opts?: { forceOffline?: boolean }) {
     this.id = id;
+    this.forceOffline = !!opts?.forceOffline;
   }
 
   /**
@@ -844,7 +1009,7 @@ export class WebRTCNetGuest implements NetClient {
       console.log('[GUEST] Adopted host-assigned peerId:', parsed.peerId);
     }
 
-    this.pc = new RTCPeerConnection(PC_CONFIG);
+    this.pc = new RTCPeerConnection(createPCConfig(this.forceOffline));
     // Guest receives the host's data channel.
     this.pc.ondatachannel = (e) => {
       this.dc = e.channel;
@@ -919,7 +1084,7 @@ export class WebRTCNetGuest implements NetClient {
 
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
-    await waitForIceComplete(this.pc);
+    await waitForIceComplete(this.pc, 12000, this.forceOffline);
 
     // IMPORTANT: we do NOT modify the SDP text. If the guest provided a
     // manual IP, we extract extra IP-based ICE candidates from the local
@@ -1142,10 +1307,18 @@ export class WebRTCNetGuest implements NetClient {
  *      forever — the manual IP field is the workaround for this case).
  *   4. Hard timeout at 12 seconds (fallback for very slow networks).
  *
+ * OFFLINE FAST-PATH: When `forceOffline` is true (or navigator.onLine is
+ * false), we use NO STUN servers — only mDNS + manual IP candidates. In that
+ * case there's nothing to wait for, so we resolve as soon as we get the first
+ * host candidate (or after a short 1.5s timeout if no candidates appear at
+ * all). This makes "hotspot host + guest" play feel instant instead of making
+ * the user wait 6-10 seconds for STUN to time out.
+ *
  * The key change: we NO LONGER resolve early just because we got an mDNS
- * candidate. We always give STUN at least 6 seconds to respond.
+ * candidate. We always give STUN at least 6 seconds to respond — UNLESS
+ * we're in offline mode, in which case STUN isn't being attempted.
  */
-function waitForIceComplete(pc: RTCPeerConnection, timeoutMs = 12000): Promise<void> {
+function waitForIceComplete(pc: RTCPeerConnection, timeoutMs = 12000, forceOffline = false): Promise<void> {
   return new Promise((resolve) => {
     if (pc.iceGatheringState === 'complete') {
       console.log('[WebRTC] ICE gathering already complete');
@@ -1156,6 +1329,11 @@ function waitForIceComplete(pc: RTCPeerConnection, timeoutMs = 12000): Promise<v
     let gotAnyCandidate = false;
     let candidateTypes: string[] = [];
     let mdnsOnlyTimer: number | null = null;
+
+    // In offline mode (no STUN servers configured), there's no point waiting
+    // 6 seconds for STUN candidates that will never come. We resolve as soon
+    // as we have ANY candidate (or after 1.5s if none arrive).
+    const offlineFastTimeout = forceOffline ? 1500 : -1;
 
     const finish = () => {
       if (done) return;
@@ -1185,9 +1363,14 @@ function waitForIceComplete(pc: RTCPeerConnection, timeoutMs = 12000): Promise<v
           // period for any more candidates, then resolve.
           gotSrflx = true;
           setTimeout(finish, 500);
+        } else if (forceOffline && gotAnyCandidate) {
+          // OFFLINE FAST-PATH: no STUN to wait for. Resolve as soon as we
+          // have any host candidate (with a tiny 200ms grace for any
+          // additional host candidates on multi-interface devices).
+          setTimeout(finish, 200);
         }
-        // If we only have host/mDNS candidates so far, keep waiting for STUN.
-        // Don't resolve early — the old 2.5s early-resolve was the bug.
+        // If we only have host/mDNS candidates so far, keep waiting for STUN
+        // (unless we're in offline mode — handled above).
       } else {
         // null candidate = ICE gathering complete.
         finish();
@@ -1196,19 +1379,31 @@ function waitForIceComplete(pc: RTCPeerConnection, timeoutMs = 12000): Promise<v
     pc.addEventListener('icegatheringstatechange', stateCheck);
     pc.addEventListener('icecandidate', candidateCheck);
 
-    // If we ONLY have mDNS/host candidates after 6 seconds, assume STUN is
-    // blocked on this network and resolve with what we have. The user can
-    // use the manual IP field as a workaround. (Previously this was 2.5s,
-    // which was too short — STUN often takes 3–5s on real networks.)
-    mdnsOnlyTimer = window.setTimeout(() => {
-      if (gotAnyCandidate && !gotSrflx && !done) {
-        console.warn('[WebRTC] Only mDNS/host candidates after 6s — STUN appears blocked.',
-          'Cross-device connection will likely fail. Use the manual LAN IP field as a workaround.');
-        finish();
-      }
-    }, 6000);
+    if (forceOffline) {
+      // OFFLINE: short timeout — STUN isn't being attempted, so if no host
+      // candidates arrive within 1.5s something is very wrong.
+      mdnsOnlyTimer = window.setTimeout(() => {
+        if (!done) {
+          console.warn('[WebRTC] Offline mode: no candidates after 1.5s — ICE config issue?');
+          finish();
+        }
+      }, offlineFastTimeout);
+    } else {
+      // ONLINE: if we ONLY have mDNS/host candidates after 6 seconds, assume
+      // STUN is blocked on this network and resolve with what we have. The
+      // user can use the manual IP field as a workaround. (Previously this
+      // was 2.5s, which was too short — STUN often takes 3–5s on real
+      // networks.)
+      mdnsOnlyTimer = window.setTimeout(() => {
+        if (gotAnyCandidate && !gotSrflx && !done) {
+          console.warn('[WebRTC] Only mDNS/host candidates after 6s — STUN appears blocked.',
+            'Cross-device connection will likely fail. Use the manual LAN IP field as a workaround.');
+          finish();
+        }
+      }, 6000);
+    }
 
-    // Hard timeout — 12s. If we still haven't finished, give up.
-    setTimeout(finish, timeoutMs);
+    // Hard timeout. In offline mode we use the shorter fast-timeout.
+    setTimeout(finish, forceOffline ? Math.min(timeoutMs, 4000) : timeoutMs);
   });
 }

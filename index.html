@@ -3,14 +3,33 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="description" content="3D physics battle royale — bounce, survive, and become the last one standing on a crumbling island. Works offline — single player & LAN P2P multiplayer." />
+    <meta name="theme-color" content="#0a0a14" />
+
+    <!-- PWA: make it installable + work offline -->
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Bounce Royale" />
+    <link rel="apple-touch-icon" href="/images/logo.png" />
+
     <link rel="icon" type="image/png" href="/images/logo.png" />
     <title>Bounce Royale</title>
-    <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700&family=Outfit:wght@400;500;600;700;900&display=swap" rel="stylesheet" />
+    <!--
+      Fonts: previously we loaded Outfit + Vazirmatn from Google Fonts CDN.
+      That required internet on every load and broke offline play. We now
+      use only local fonts:
+        - English: system-ui stack (looks great on all platforms, instant load)
+        - Persian: IRSANS.ttf bundled in /public (loaded via @font-face in
+          global.css)
+      This is a critical change for offline / PWA support — no external
+      requests are made on app startup.
+    -->
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
       html, body, #root { height: 100%; width: 100%; overflow: hidden; background: #0a0a14; }
-      body { font-family: 'Outfit', 'Vazirmatn', system-ui, sans-serif; color: #fff; -webkit-tap-highlight-color: transparent; }
-      body.rtl { font-family: 'Vazirmatn', 'Outfit', system-ui, sans-serif; }
+      body { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; color: #fff; -webkit-tap-highlight-color: transparent; }
+      body.rtl { font-family: 'IRSANS', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
       canvas { display: block; }
       ::-webkit-scrollbar { width: 8px; height: 8px; }
       ::-webkit-scrollbar-track { background: rgba(255,255,255,0.05); }
