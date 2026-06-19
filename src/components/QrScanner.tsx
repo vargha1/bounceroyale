@@ -72,7 +72,13 @@ export default function QrScanner({ onDecode, onClose, title = 'Scan QR Code' }:
    *  - iOS Safari: ✗ (Apple doesn't expose torch to web pages as of iOS 17)
    *  - Desktop: ✗ (no LED flash hardware)
    */
-  const toggleTorch = useCallback(async () => {
+  const toggleTorch = useCallback(async (e?: React.SyntheticEvent) => {
+    // Stop propagation in case the root overlay's stopPropagation ever gets
+    // removed — we never want this click to bubble up to a parent overlay.
+    if (e) {
+      e.stopPropagation();
+      e.preventDefault();
+    }
     const stream = streamRef.current;
     if (!stream) return;
     const track = stream.getVideoTracks()[0];
@@ -87,8 +93,8 @@ export default function QrScanner({ onDecode, onClose, title = 'Scan QR Code' }:
       await track.applyConstraints({ advanced: [{ torch: next } as any] });
       setTorchOn(next);
       console.log('[QR Scanner] Torch:', next ? 'ON' : 'OFF');
-    } catch (e) {
-      console.warn('[QR Scanner] Failed to toggle torch:', e);
+    } catch (err) {
+      console.warn('[QR Scanner] Failed to toggle torch:', err);
     }
   }, [torchOn]);
 
@@ -254,6 +260,16 @@ export default function QrScanner({ onDecode, onClose, title = 'Scan QR Code' }:
   return (
     <div
       className="qr-scanner-overlay"
+      // CRITICAL: stop click propagation so clicks inside the scanner (e.g. the
+      // flashlight button, the close button, taps on the video) do NOT bubble
+      // up to the parent LanModal's `modal-overlay` onClick={handleCancel}
+      // handler — which would close the entire LAN modal unexpectedly.
+      onClick={(e) => e.stopPropagation()}
+      // Also stop mousedown/touchstart so any parent listening for those
+      // (e.g. to dismiss on outside-click) doesn't fire while interacting
+      // with the scanner UI.
+      onMouseDown={(e) => e.stopPropagation()}
+      onTouchStart={(e) => e.stopPropagation()}
       style={{
         position: 'fixed',
         inset: 0,

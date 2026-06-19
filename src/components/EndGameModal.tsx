@@ -6,9 +6,23 @@ interface Props {
   winner: string | null;
   localPlayerId: string;
   onExit: () => void;
+  /** Called when the user clicks "Play Again". The parent decides whether
+   *  restart is actually possible (single player & LAN host only) — if not,
+   *  pass `canRestart={false}` and the button is hidden. */
+  onRestart?: () => void;
+  /** Whether to show the "Play Again" button. False for LAN guests and server
+   *  mode (where restart isn't supported). */
+  canRestart?: boolean;
 }
 
-export default function EndGameModal({ rankings, winner, localPlayerId, onExit }: Props) {
+export default function EndGameModal({
+  rankings,
+  winner,
+  localPlayerId,
+  onExit,
+  onRestart,
+  canRestart = false,
+}: Props) {
   const { language } = useSettings();
   const lang = language;
 
@@ -45,7 +59,10 @@ export default function EndGameModal({ rankings, winner, localPlayerId, onExit }
           })}
         </div>
         <div className="actions">
-          <button className="primary" onClick={onExit}>🚪 {t('exitToMenu', lang)}</button>
+          {canRestart && onRestart && (
+            <button className="primary" onClick={onRestart}>🔄 {t('playAgain', lang)}</button>
+          )}
+          <button className={canRestart ? 'ghost' : 'primary'} onClick={onExit}>🚪 {t('exitToMenu', lang)}</button>
         </div>
       </div>
     </div>

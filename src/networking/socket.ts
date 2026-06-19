@@ -259,6 +259,9 @@ export class SocketNetClient implements NetClient {
   onMessage(cb: (ev: NetEvent) => void) {
     this.listeners.add(cb);
   }
+  offMessage(cb: (ev: NetEvent) => void) {
+    this.listeners.delete(cb);
+  }
 
   private emit(ev: NetEvent) {
     this.listeners.forEach((cb) => cb(ev));

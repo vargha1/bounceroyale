@@ -190,6 +190,10 @@ export interface NetClient {
   readonly isHost: boolean;
   send(msg: NetMessage): void;
   onMessage(cb: (event: NetEvent) => void): void;
+  /** Remove a previously-registered onMessage callback. Important so an engine
+   *  that has been disposed (e.g. on restart) stops receiving events — without
+   *  this, both the old and new engine's listeners would fire on every event. */
+  offMessage(cb: (event: NetEvent) => void): void;
   onPeerChange?(cb: (peers: string[]) => void): void;
   close(): void;
 }

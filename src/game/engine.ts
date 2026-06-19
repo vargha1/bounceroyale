@@ -82,6 +82,11 @@ export interface EngineCallbacks {
   onEndGame: (rankings: { id: string; rank: number | null }[], winner: string | null) => void;
   onError: (message: string) => void;
   onConnectionLost: () => void;
+  /** Fired when the engine's match state has been reset for a restart (either
+   *  locally-initiated via restart() or remotely via a re-init from the host).
+   *  The UI layer uses this to clear its end-game modal, spectating banner,
+   *  and pause state so the new match starts fresh. */
+  onReset?: () => void;
 }
 
 export interface EngineHudState {
@@ -1256,9 +1261,15 @@ export function createGameEngine(opts: EngineOptions) {
   }
 
   // ---------- Networking ----------
+  /** The engine's own onMessage callback, kept here so dispose() can remove it
+   *  from the netClient's listener set. Without this, recreating the engine on
+   *  restart would leave the OLD engine's listener attached — both engines
+   *  would receive every event and step on each other. */
+  let engineNetListener: ((ev: NetEvent) => void) | null = null;
+
   function setupNetworking() {
     if (!netClient) return;
-    netClient.onMessage((ev: NetEvent) => {
+    engineNetListener = (ev: NetEvent) => {
       switch (ev.type) {
         case 'open':
           // In server mode, adopt the server-assigned socket id as our local
@@ -1316,6 +1327,15 @@ export function createGameEngine(opts: EngineOptions) {
           // host generated its own island in start()).
           const shouldProcessInit = !isHost || mode === 'server';
           if (shouldProcessInit) {
+            // RESTART DETECTION: if we already have tiles / players / a ball,
+            // this is a re-init (the host restarted the match). Tear down all
+            // existing game state BEFORE applying the new init so the new
+            // island / spawn positions are clean.
+            const isReinit = tiles.length > 0 || Object.keys(players).length > 0 || ballRigidBody !== null;
+            if (isReinit) {
+              console.log('[ENGINE] Re-init received — tearing down previous match state for restart.');
+              resetGameState({ keepListeners: true });
+            }
             // CLOCK-SKEW FIX: do NOT copy the host's `serverStartTime` verbatim.
             // The host computed it as `hostNow + timer*1000` using the HOST's
             // wall clock. If the guest's clock differs from the host's (which
@@ -1530,7 +1550,10 @@ export function createGameEngine(opts: EngineOptions) {
           }
           break;
       }
-    });
+    };
+    if (engineNetListener) {
+      netClient.onMessage(engineNetListener);
+    }
   }
 
   // ---------- Game start logic ----------
@@ -1969,6 +1992,212 @@ export function createGameEngine(opts: EngineOptions) {
     renderer.setSize(window.innerWidth, window.innerHeight);
   }
   function getFps() { return Math.round(fpsSmoothed); }
+
+  /**
+   * Tear down all per-match state: tiles, players, powerup pickups, particles,
+   * the local ball, and all bookkeeping (score/health/powerups/spectating/etc).
+   * The Three.js scene / renderer / physics world / camera / lighting / audio
+   * are kept intact — only match content is removed.
+   *
+   * Called from:
+   *  - restart() — when the user clicks the Restart button
+   *  - the init handler — when a re-init arrives from the host (guest side)
+   *
+   * `keepListeners` should be true when called from inside the init handler,
+   * because the listener is mid-dispatch and we still want the rest of the
+   * init handling to run after resetGameState returns.
+   */
+  function resetGameState(_opts?: { keepListeners?: boolean }) {
+    // Cancel any pending game-started fallback timer.
+    if (gameStartedFallbackTimer !== null) {
+      clearTimeout(gameStartedFallbackTimer);
+      gameStartedFallbackTimer = null;
+    }
+
+    // Remove all particles.
+    for (const p of particles) {
+      try { scene.remove(p.mesh); } catch { /* ignore */ }
+      try { (p.mesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
+      try { p.mesh.geometry.dispose(); } catch { /* ignore */ }
+    }
+    particles.length = 0;
+
+    // Remove all powerup pickups (mesh + halo + disposals).
+    for (const pickup of powerupPickups) {
+      try { scene.remove(pickup.mesh); } catch { /* ignore */ }
+      try { scene.remove(pickup.haloMesh); } catch { /* ignore */ }
+      try { (pickup.mesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
+      try { (pickup.haloMesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
+      try { pickup.mesh.geometry.dispose(); } catch { /* ignore */ }
+      try { pickup.haloMesh.geometry.dispose(); } catch { /* ignore */ }
+    }
+    powerupPickups.length = 0;
+    powerupPickupsById.clear();
+
+    // Remove all tiles (mesh + rigid body + disposals).
+    for (const tile of tiles) {
+      try { scene.remove(tile.mesh); } catch { /* ignore */ }
+      try {
+        if (tile.rigidBody) world.removeRigidBody(tile.rigidBody);
+      } catch { /* ignore */ }
+      try { (tile.mesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
+      try { tile.mesh.geometry.dispose(); } catch { /* ignore */ }
+    }
+    tiles.length = 0;
+    tilesById.clear();
+
+    // Remove all players (mesh + rigid body + collider bookkeeping).
+    for (const id of Object.keys(players)) {
+      const p = players[id];
+      try { scene.remove(p.mesh); } catch { /* ignore */ }
+      try {
+        if (p.rigidBody) world.removeRigidBody(p.rigidBody);
+      } catch { /* ignore */ }
+      try { (p.mesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
+      try { p.mesh.geometry.dispose(); } catch { /* ignore */ }
+      if (p.collider) delete colliderHandleToPlayerId[p.collider.handle];
+      delete players[id];
+    }
+
+    // Drop the local ball references — the rigid body was removed above as
+    // part of the players loop (local player is in `players`).
+    ballRigidBody = null;
+    ballCollider = null;
+
+    // Reset per-match bookkeeping.
+    playerScore = 0;
+    playerHealth = 100;
+    for (const k of Object.keys(powerUps)) delete powerUps[k];
+    isSpectating = false;
+    spectateTargetId = null;
+    isPaused = false;
+    physicsEnabled = false;
+    gameEnded = false;
+    disconnected = false;
+    serverStartTime = null;
+    cameraAzimuth = 0;
+    lookDelta = 0;
+    lastGroundedTileId = null;
+    canJump = false;
+    canJumpUntil = 0;
+    jumpBufferedUntil = 0;
+    wasAirborne = false;
+    maxFallSpeed = 0;
+    lastImpactTime = 0;
+    physicsAccumulator = 0;
+    keys.w = false; keys.a = false; keys.s = false; keys.d = false; keys.space = false;
+    joystickX = 0;
+    joystickY = 0;
+
+    // Notify the UI to clear its end-game / spectating / pause / countdown
+    // state. The new match will re-push all of these as it starts.
+    try { callbacks.onReset?.(); } catch { /* ignore */ }
+    callbacks.onSpectatingChange(false);
+    callbacks.onCountdown(null);
+    pushHud();
+  }
+
+  /**
+   * Restart the current match. Tears down all match state and starts a fresh
+   * round with a brand-new island seed.
+   *
+   * Behaviour by mode:
+   *  - single: regenerate the island + ball + powerups locally, restart the
+   *    countdown. No network involvement.
+   *  - LAN host: same as single, AND broadcast a fresh `init` message to all
+   *    connected guests so they tear down their state and start the new match
+   *    too. Only the host can restart in LAN mode — guests see a toast instead
+   *    (handled by the UI layer, which doesn't call this on guests).
+   *  - LAN guest: no-op (the UI layer shouldn't call this on guests; if it
+   *    does, we just bail out).
+   *  - server: not supported via this path (the server is authoritative).
+   *    Returns false so the UI can fall back to "exit to menu".
+   */
+  function restart(): boolean {
+    // Only the host (or single-player) can initiate a restart.
+    if (mode === 'lan' && !isHost) {
+      console.warn('[ENGINE] restart() called on a LAN guest — only the host can restart. Ignoring.');
+      return false;
+    }
+    if (mode === 'server') {
+      console.warn('[ENGINE] restart() not supported in server mode (server is authoritative).');
+      return false;
+    }
+
+    console.log('[ENGINE] restart() — tearing down match state and starting a new round.');
+
+    // Capture connected peers' last-known positions BEFORE resetGameState
+    // clears the players map. We'll include them in the init broadcast so
+    // guests can recreate their own local balls (otherwise they'd be left
+    // without a ball after the restart, since the host's init normally only
+    // contains the host's ball).
+    const peerSnapshots: { id: string; position: { x: number; y: number; z: number } }[] = [];
+    if (mode === 'lan' && isHost) {
+      for (const [id, p] of Object.entries(players)) {
+        if (id === localPlayerId) continue;
+        peerSnapshots.push({
+          id,
+          position: { x: p.targetPosition.x, y: p.targetPosition.y, z: p.targetPosition.z },
+        });
+      }
+    }
+
+    resetGameState();
+
+    // Generate a brand-new island seed so the new match has a different layout.
+    islandSeed = Math.floor(Math.random() * 1e9);
+
+    if (mode === 'single') {
+      const islandTiles = generateIsland(islandSize, islandSeed);
+      for (const t of islandTiles) createTile({ x: t.x, y: t.y, z: t.z }, t.id);
+      spawnPowerupPickups();
+      const spawn = getIslandSpawn(islandTiles);
+      createSphere('local', spawn, true);
+      serverStartTime = Date.now() + 5 * 1000;
+      startTimerValue = 5;
+      pushCountdown();
+    } else if (mode === 'lan' && isHost) {
+      // LAN host: regenerate the island locally, recreate our own ball, and
+      // broadcast a fresh init to all connected guests. Guests will tear down
+      // their old state when they receive the init (see the init handler's
+      // isReinit branch).
+      const islandTiles = generateIsland(islandSize, islandSeed);
+      for (const t of islandTiles) createTile({ x: t.x, y: t.y, z: t.z }, t.id);
+      spawnPowerupPickups();
+      const spawn = getIslandSpawn(islandTiles);
+      createSphere(localPlayerId, spawn, true);
+      serverStartTime = Date.now() + startTimerValue * 1000;
+      pushCountdown();
+      if (netClient) {
+        try {
+          // Include ALL previously-connected guests in the players list, with
+          // their last-known positions. Each guest will see itself in the
+          // list and recreate its local ball. Without this, guests would be
+          // left without a ball after restart (the host's init normally only
+          // lists the host's ball; guests add themselves via a new-player
+          // round-trip that doesn't happen on restart because the data
+          // channel is already open).
+          netClient.send({
+            kind: 'init',
+            gameId: 'lan',
+            creatorId: localPlayerId,
+            players: [
+              { id: localPlayerId, position: spawn },
+              ...peerSnapshots,
+            ],
+            islandSeed,
+            islandSize,
+            startTimer: startTimerValue,
+            serverStartTime: serverStartTime,
+          });
+        } catch (e) {
+          console.warn('[ENGINE] Failed to broadcast init on restart:', e);
+        }
+      }
+    }
+    return true;
+  }
+
   function dispose() {
     if (animationFrameId) cancelAnimationFrame(animationFrameId);
     animationFrameId = null;
@@ -1976,6 +2205,13 @@ export function createGameEngine(opts: EngineOptions) {
     if (gameStartedFallbackTimer !== null) {
       clearTimeout(gameStartedFallbackTimer);
       gameStartedFallbackTimer = null;
+    }
+    // Remove our onMessage listener from the net client so a subsequently-
+    // created engine (e.g. on restart) doesn't have its events double-handled
+    // by this disposed engine's listener.
+    if (netClient && engineNetListener) {
+      try { netClient.offMessage(engineNetListener); } catch { /* ignore */ }
+      engineNetListener = null;
     }
     try { renderer.dispose(); } catch { /* ignore */ }
     // NOTE: We deliberately do NOT close the net client here. The Game
@@ -2007,6 +2243,7 @@ export function createGameEngine(opts: EngineOptions) {
     resize,
     getFps,
     dispose,
+    restart,
     getLocalPlayerId: () => localPlayerId,
     getCanvas: () => renderer.domElement,
     ensureAudio,

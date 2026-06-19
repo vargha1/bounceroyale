@@ -178,6 +178,17 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
             onError(t('lostConnection', lang));
             setTimeout(() => exitGame(), 1200);
           },
+          onReset: () => {
+            // Engine's match state has been reset (either because the user
+            // clicked Restart, or because a re-init arrived from the host).
+            // Clear our local React UI state so the end-game modal, spectating
+            // banner, pause modal, and countdown are all dismissed — the new
+            // match will re-push them as needed.
+            setEndGame(null);
+            setSpectating(false);
+            setPaused(false);
+            setCountdown(null);
+          },
         },
       });
       engineRef.current = engine;
@@ -360,6 +371,38 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     engineRef.current?.switchSpectator();
   }, []);
 
+  // ---- Restart handling ----
+  // Restart is supported in single-player and when this client is the LAN host.
+  // LAN guests can't initiate a restart (only the host can — guests are
+  // auto-restarted when the host broadcasts a fresh init). Server mode isn't
+  // supported because the server is authoritative for the island seed.
+  //
+  // NOTE: in LAN mode, host status is determined by the net client
+  // (WebRTCNetHost vs WebRTCNetGuest), NOT by `isHostProp` (which is only
+  // meaningful in server mode). The engine pushes the correct `isHost` value
+  // to the HUD via pushHud(), so we read it from there.
+  const canRestart = mode === 'single' || (mode === 'lan' && hud.isHost);
+  const handleRestart = useCallback(() => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    // Defensive: shouldn't happen because the button is hidden, but check
+    // anyway in case canRestart logic is wrong.
+    if (mode === 'server') {
+      onError(t('restartOnlyHost', lang));
+      return;
+    }
+    if (mode === 'lan' && !hud.isHost) {
+      onError(t('restartOnlyHost', lang));
+      return;
+    }
+    // The engine's restart() will call onReset, which clears endGame/paused/
+    // spectating/countdown in our React state — so we don't need to do it here.
+    const ok = engine.restart();
+    if (!ok) {
+      onError(t('restartOnlyHost', lang));
+    }
+  }, [mode, hud.isHost, lang, onError]);
+
   return (
     <div className="game-container">
       <div className="game-canvas-wrap" ref={canvasWrapRef} />
@@ -405,6 +448,8 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
             setPaused(false);
             exitGame();
           }}
+          onRestart={handleRestart}
+          canRestart={canRestart}
         />
       )}
       {endGame && (
@@ -413,6 +458,8 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
           winner={endGame.winner}
           localPlayerId={localPlayerId}
           onExit={exitGame}
+          onRestart={handleRestart}
+          canRestart={canRestart}
         />
       )}
     </div>

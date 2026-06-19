@@ -1212,6 +1212,9 @@ export class WebRTCNetHost implements NetClient {
       });
     }
   }
+  offMessage(cb: (ev: NetEvent) => void) {
+    this.listeners.delete(cb);
+  }
   onPeerChange(cb: (peers: string[]) => void) {
     this.peerListeners.add(cb);
     cb(Array.from(this.dataChannels.keys()));
@@ -1621,6 +1624,9 @@ export class WebRTCNetGuest implements NetClient {
         }
       });
     }
+  }
+  offMessage(cb: (ev: NetEvent) => void) {
+    this.listeners.delete(cb);
   }
 
   private emit(ev: NetEvent) {

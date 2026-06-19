@@ -126,7 +126,10 @@ export type TranslationKey =
   | 'scanClose'
   | 'scanHint'
   | 'regenerateInvite'
-  | 'addPlayer';
+  | 'addPlayer'
+  | 'playAgain'
+  | 'restart'
+  | 'restartOnlyHost';
 
 type Dict = Record<TranslationKey, string>;
 
@@ -256,6 +259,9 @@ const en: Dict = {
   scanHint: 'Point the camera at the QR code',
   regenerateInvite: 'Regenerate invite code',
   addPlayer: 'Add another player',
+  playAgain: 'Play Again',
+  restart: 'Restart',
+  restartOnlyHost: 'Only the host can restart the match',
 };
 
 const fa: Dict = {
@@ -384,6 +390,9 @@ const fa: Dict = {
   scanHint: 'دوربین را روی QR کد بگیرید',
   regenerateInvite: 'تولید مجدد کد دعوت',
   addPlayer: 'افزودن بازیکن دیگر',
+  playAgain: 'بازی دوباره',
+  restart: 'شروع دوباره',
+  restartOnlyHost: 'فقط میزبان می‌تواند مسابقه را دوباره شروع کند',
 };
 
 const dicts: Record<Language, Dict> = { en, fa };
