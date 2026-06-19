@@ -1644,6 +1644,38 @@ export function createGameEngine(opts: EngineOptions) {
       return;
     }
 
+    // GAME ENDED: stop stepping physics / running match simulation. The loop
+    // keeps running (so the end-game scene stays visible and the camera can
+    // still orbit), but we skip:
+    //   - world.step() (the Rapier world may contain removed rigid bodies
+    //     whose colliders' handles have been recycled, which causes spurious
+    //     collision events and crashes when the loop tries to read
+    //     ballRigidBody.translation() on a body that was removed via
+    //     eliminatePlayer → world.removeRigidBody)
+    //   - send move/jump to peers (the match is over — sending moves just
+    //     wastes bandwidth and confuses guests that may already be showing
+    //     the end-game screen)
+    //   - per-second survival score
+    //   - powerup pickup collection / respawn (would otherwise keep
+    //     collecting pickups and broadcasting to peers after the game ended)
+    //   - tile impact damage (would otherwise keep damaging the island)
+    //
+    // We DO keep:
+    //   - particles (so death explosions finish playing)
+    //   - tweens (so any in-flight animations finish)
+    //   - camera (so the spectator cam can keep orbiting)
+    //   - renderer.render (so the canvas stays live)
+    if (gameEnded) {
+      // Only update cosmetic things — particles + tweens — so death effects
+      // and island-break animations finish gracefully. Use a real (unscaled)
+      // dt here so they don't speed up/slow down with gameSpeed after death.
+      updateParticles(realDt);
+      tweenGroup.update(now * 1000);
+      updateCamera(realDt);
+      renderer.render(scene, camera);
+      return;
+    }
+
     // Apply game speed by scaling simulated time.
     const scaledDt = realDt * settings.gameSpeed;
 
@@ -1680,7 +1712,8 @@ export function createGameEngine(opts: EngineOptions) {
       }
     }
 
-    // Send our movement to peers
+    // Send our movement to peers (skipped after the game has ended — see the
+    // gameEnded early-return above).
     if (mode !== 'single' && netClient && ballRigidBody && !isPaused) {
       const t = now * 1000;
       if (t - lastSendTime >= SEND_INTERVAL) {
@@ -1710,6 +1743,10 @@ export function createGameEngine(opts: EngineOptions) {
   }
 
   function stepPhysics(dt: number) {
+    // Defensive: never step physics after the game has ended. The world may
+    // contain removed rigid bodies, and calling world.step() with stale
+    // collider handles can crash Rapier or fire spurious collision events.
+    if (gameEnded) return;
     if (!physicsEnabled) {
       // Still step remote kinematic bodies so they appear in the right place even pre-game
       updateRemoteKinematics();
