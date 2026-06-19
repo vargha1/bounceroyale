@@ -91,6 +91,10 @@ export default function LanModal({ onCancel, onStart }: Props) {
   // manually using the quick-pick buttons or instructions).
   const [detectedIps, setDetectedIps] = useState<string[]>([]);
   const [detectingIps, setDetectingIps] = useState(false);
+  // Toggle for showing the troubleshooting panel. Closed by default to keep
+  // the UI clean; opens automatically when the user clicks "Regenerate" or
+  // when a connection attempt fails.
+  const [showTroubleshooting, setShowTroubleshooting] = useState(false);
 
   // Online/offline status badge — reflects the effective status (offline if
   // navigator.onLine is false OR the user toggled forceOffline).
@@ -207,11 +211,13 @@ export default function LanModal({ onCancel, onStart }: Props) {
       window.setTimeout(() => {
         if (status !== 'connected' && !startedRef.current) {
           setError(prev => prev ?? 'Connection is taking longer than expected. If it doesn\'t connect within a few more seconds, click "Regenerate invite code" and have the guest re-join with the new code.');
+          setShowTroubleshooting(true);
         }
       }, 8000);
     } catch (e: any) {
       const msg = e?.message ?? 'Failed to apply guest answer. Make sure you pasted the full code.';
       setError(msg);
+      setShowTroubleshooting(true);
       // If the error indicates the PC is in a wrong state or was already torn
       // down, surface a "regenerate" hint — the user needs a fresh invite code.
       if (msg.includes('wrong state') || msg.includes('No pending') || msg.includes('Cannot apply')) {
@@ -733,6 +739,85 @@ export default function LanModal({ onCancel, onStart }: Props) {
           </div>
         )}
         {error && <p style={{ color: 'var(--danger)', fontSize: '0.85rem', marginTop: '0.5rem' }}>{error}</p>}
+
+        {/* ============ Troubleshooting panel (collapsible) ============ */}
+        <div style={{ marginTop: '0.6rem' }}>
+          <button
+            className="ghost"
+            style={{ width: '100%', fontSize: '0.85rem', padding: '0.5rem 0.75rem', minHeight: 'auto' }}
+            onClick={() => setShowTroubleshooting((v) => !v)}
+          >
+            {showTroubleshooting ? '▼ Hide troubleshooting' : '▶ Connection not working? Show troubleshooting'}
+          </button>
+          {showTroubleshooting && (
+            <div style={{
+              marginTop: '0.4rem',
+              padding: '0.75rem',
+              borderRadius: '8px',
+              background: 'rgba(239, 68, 68, 0.06)',
+              border: '1px solid rgba(239, 68, 68, 0.25)',
+              fontSize: '0.82rem',
+              lineHeight: 1.55,
+            }}>
+              <strong style={{ display: 'block', marginBottom: '0.4rem' }}>🛠 Common causes & fixes</strong>
+              <ol style={{ paddingLeft: '1.2rem', margin: 0 }}>
+                <li style={{ marginBottom: '0.4rem' }}>
+                  <strong>Host's firewall is blocking inbound UDP.</strong> The
+                  host (especially a Windows laptop) MUST allow Chrome through
+                  the firewall for inbound UDP on private networks. On Windows:
+                  <br />
+                  → Control Panel → Windows Defender Firewall → Allow an app
+                  → find "Google Chrome" → tick both <em>Private</em> AND
+                  <em>Public</em> → OK. Then fully close Chrome and reopen.
+                  <br />
+                  <em>Or</em>: have the PHONE be the host (phones don't have
+                  software firewalls) and the laptop be the guest.
+                </li>
+                <li style={{ marginBottom: '0.4rem' }}>
+                  <strong>Host didn't enter its manual LAN IP on a hotspot.</strong>
+                  On a phone-hotspot network, mDNS hostnames don't resolve
+                  cross-device. The host MUST enter its own LAN IP (use the
+                  quick-pick buttons or run <code>ipconfig</code> on Windows).
+                </li>
+                <li style={{ marginBottom: '0.4rem' }}>
+                  <strong>"Force offline" not ticked on a hotspot.</strong>
+                  If the hotspot has no internet, STUN servers can't be
+                  reached and ICE gathering blocks for ~10 seconds. Tick
+                  "Force offline" at the top of this modal to skip STUN and
+                  get the invite code in &lt;1 second.
+                </li>
+                <li style={{ marginBottom: '0.4rem' }}>
+                  <strong>Wrong IP entered.</strong> The host's IP must be the
+                  one on the hotspot network (e.g. <code>10.181.207.139</code>),
+                  NOT the public IP, NOT the gateway IP. On Windows run
+                  <code>ipconfig</code> in cmd and look at "IPv4 Address" of
+                  the Wi-Fi adapter connected to the hotspot.
+                </li>
+                <li style={{ marginBottom: '0.4rem' }}>
+                  <strong>Guest connected to a different network.</strong> Both
+                  devices must be on the SAME hotspot. Check the guest's IP is
+                  in the same subnet as the host (e.g. both 10.181.207.x).
+                </li>
+                <li>
+                  <strong>Browser is blocking mDNS.</strong> Chrome's
+                  anti-fingerprinting hides local IPs as <code>*.local</code>
+                  hostnames that don't resolve across devices. Use the manual
+                  IP field. Firefox and Safari are more permissive.
+                </li>
+              </ol>
+              <div style={{ marginTop: '0.6rem', paddingTop: '0.5rem', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+                <strong>📋 Diagnostic checklist:</strong>
+                <ul style={{ paddingLeft: '1.2rem', marginTop: '0.3rem' }}>
+                  <li>Open the browser console (F12) on BOTH devices and look for
+                    <code>[HOST]</code> / <code>[GUEST]</code> / <code>[WebRTC]</code> log lines.</li>
+                  <li>Look for "Rewrote N mDNS candidate(s) in SDP to use manual IP" — confirms the manual IP was injected.</li>
+                  <li>Look for "ICE State: checking → disconnected → failed" — means the candidate was tried but the packets didn't get through (usually a firewall or wrong-IP issue).</li>
+                  <li>If you see "ICE State: connected" briefly then "disconnected", the connection was established but flapped — usually a NAT/firewall timeout, try keeping the game open.</li>
+                </ul>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

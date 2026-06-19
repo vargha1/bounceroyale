@@ -246,44 +246,48 @@ export const COMMON_HOTSPOT_HOST_IPS = [
 ];
 
 // ============================================================================
-// Extra ICE candidates for manual LAN IP (hotspot fix)
+// Manual LAN IP — SDP rewriting (hotspot fix, v2)
 // ============================================================================
 //
-// PROBLEM: On mobile hotspots without internet, Chrome's mDNS anti-fingerprinting
-// produces candidates like `a=candidate:1234 1 udp 2122252543 abcdef-1234.local
-// 54321 typ host` that don't resolve across devices (each device has its own
-// mDNS responder), and STUN can't reach the internet through the hotspot. So
-// the connection silently fails.
+// PROBLEM (v1 approach — extra candidates): We extracted extra IP candidates
+// and shipped them in a separate JSON field. The receiver applied them via
+// `addIceCandidate`. This was robust against SDP parser issues BUT had a
+// subtle problem: ICE tries candidates in PRIORITY ORDER. The original mDNS
+// candidate has priority 2113937151 (host, highest). Our extra IP candidate
+// was priority 2113937150 (decremented by 1). ICE tried mDNS first, the
+// mDNS hostname didn't resolve cross-device, and Chrome's ICE agent marked
+// the pair as "disconnected" before properly trying the IP candidate. The
+// connection then quickly went "failed" without ever giving the manual IP
+// candidate a fair chance.
 //
-// PREVIOUS APPROACH (BROKEN): Inject extra `a=candidate:` lines into the SDP
-// text by mirroring the mDNS ports but using the host's manual LAN IP. This
-// caused `Failed to parse SessionDescription` errors on some browsers because
-// the manually-constructed candidate strings didn't perfectly match the
-// browser's internal candidate format (missing optional fields like `ufrag`,
-// `network-id`, etc. that some parsers strictly require).
+// PROBLEM (v0 approach — SDP text manipulation): We tried to construct
+// candidate strings from scratch, which caused `Failed to parse
+// SessionDescription` on some browsers because we missed optional fields.
 //
-// CURRENT APPROACH (ROBUST): Don't touch the SDP at all. Instead:
-//   1. Sender (host or guest) inspects its own local SDP for mDNS candidates
-//      and constructs `RTCIceCandidateInit` objects using the manual IP and
-//      the same port as each mDNS candidate.
-//   2. Sender includes these `extraCandidates` as a separate JSON field in
-//      the compressed payload (alongside the untouched SDP).
-//   3. Receiver calls `setRemoteDescription(untouchedSdp)` — this ALWAYS
-//      parses because the SDP is exactly what the browser generated.
-//   4. Receiver calls `addIceCandidate(cand)` for each extra candidate.
-//      This is the proper WebRTC API for adding remote candidates, and the
-//      browser validates/handles them internally.
+// SOLUTION (v2 — surgical SDP rewrite): When the user provides a manual IP,
+// we surgically REWRITE the mDNS hostname in the existing candidate lines of
+// the LOCAL SDP. We:
+//   - ONLY replace the `<uuid>.local` token with the manual IP
+//   - Keep the rest of the candidate line byte-for-byte identical (foundation,
+//     component, transport, priority, port, all extensions, ufrag, etc.)
+//   - Also keep the mDNS candidate as a SECOND extra candidate (lower priority)
+//     so same-machine testing still works
 //
-// This is more robust than SDP text manipulation because:
-//   - The SDP is never modified, so it always parses.
-//   - The browser's `addIceCandidate` handles candidate validation
-//     internally, including any browser-specific quirks.
-//   - We don't need to worry about line endings, missing optional fields,
-//     or parser strictness differences between browsers.
+// This means:
+//   - The remote side receives a normal-looking SDP with a `host` candidate
+//     pointing at the manual IP. setRemoteDescription parses cleanly.
+//   - ICE has exactly ONE host candidate per m-line — the manual IP. No
+//     priority conflict, no wasted mDNS attempts.
+//   - We DON'T need addIceCandidate or extraCandidates in the payload anymore.
+//
+// For symmetric connections (same-machine testing where mDNS DOES work), we
+// also include the original mDNS candidate as an extra candidate with lower
+// priority. This is shipped in the `extraCandidates` field and applied by the
+// receiver via addIceCandidate.
 
 /** Shape of an extra ICE candidate we ship in the offer/answer payload. */
 export interface ExtraIceCandidate {
-  /** Candidate string WITHOUT the `a=` prefix, e.g. `"candidate:900000001 1 udp 2122252542 192.168.43.1 54321 typ host generation 0"`. */
+  /** Candidate string WITHOUT the `a=` prefix, e.g. `"candidate:800000000 1 udp 2113937 192.168.43.1 54321 typ host generation 0"`. */
   candidate: string;
   /** Media-section mid (e.g. "0"). */
   sdpMid: string | null;
@@ -294,63 +298,90 @@ export interface ExtraIceCandidate {
 }
 
 /**
- * Inspect an SDP body and produce extra IP-based ICE candidates by mirroring
- * the ports of existing mDNS (`*.local`) candidates. The returned candidates
- * use the manual IP instead of the mDNS hostname, with the same port — so the
- * browser IS actually listening on that port (it just advertised it via mDNS).
+ * Rewrite a local SDP body, replacing every `<uuid>.local` mDNS hostname in
+ * candidate lines with the manual IP. Returns the rewritten SDP. The rewrite
+ * is surgical — only the hostname token changes, everything else is
+ * byte-for-byte identical, so the browser accepts the SDP without parse
+ * errors.
  *
- * The priority is decremented by 1 so ICE prefers the original mDNS candidate
- * (which works for same-machine testing) but falls back to the IP candidate
- * when mDNS doesn't resolve (cross-device on a hotspot).
- *
- * We track the current `a=mid:` value and m-line index so each candidate
- * carries the right `sdpMid` / `sdpMLineIndex` for `addIceCandidate`.
+ * Returns the original SDP unchanged if `manualIp` is empty or invalid.
  */
-function extractExtraCandidates(sdp: string, manualIp: string): ExtraIceCandidate[] {
-  if (!sdp || !manualIp) return [];
+function rewriteSdpWithManualIp(sdp: string, manualIp: string): string {
+  if (!sdp || !manualIp) return sdp;
   const ip = manualIp.trim();
   if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) {
     console.warn('[WebRTC] manual IP is not a valid IPv4, ignoring:', ip);
-    return [];
+    return sdp;
   }
+  // Match mDNS hostnames in candidate lines. Chrome's format is
+  // `<8-4-4-4-12 hex>.local`. We're lenient and match any `<chars>.local`
+  // token inside a candidate line.
+  const lines = sdp.split(/\r?\n/);
+  let rewroteCount = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.startsWith('a=candidate:')) continue;
+    if (!line.includes('.local')) continue;
+    // Replace the FIRST occurrence of `<token>.local` with the manual IP.
+    // Candidate lines have the form:
+    //   a=candidate:<foundation> <component> <transport> <priority> <addr> <port> typ host ...
+    // The address (5th space-separated field after `a=candidate:`) is the
+    // mDNS hostname. We replace just that token.
+    const newLine = line.replace(/([a-f0-9-]{6,}|[a-zA-Z0-9-]{6,})\.local\b/, ip);
+    if (newLine !== line) {
+      lines[i] = newLine;
+      rewroteCount++;
+    }
+  }
+  if (rewroteCount > 0) {
+    console.log(`[WebRTC] Rewrote ${rewroteCount} mDNS candidate(s) in SDP to use manual IP ${ip}`);
+  }
+  return lines.join('\r\n');
+}
+
+/**
+ * Extract the original mDNS candidates from an SDP (BEFORE rewriting) as
+ * ExtraIceCandidate objects, so we can ship them in the `extraCandidates`
+ * field for same-machine testing. The receiver applies them via
+ * addIceCandidate with LOWER priority (so the manual IP wins cross-device,
+ * but mDNS still works for same-machine).
+ *
+ * This is symmetric: the host does this for its offer, the guest does it for
+ * its answer. Both sides end up with both candidates available.
+ */
+function extractMdnsCandidatesAsExtra(sdp: string): ExtraIceCandidate[] {
+  if (!sdp) return [];
   const out: ExtraIceCandidate[] = [];
   const lines = sdp.split(/\r?\n/);
   let currentMLineIndex = -1;
   let currentMid: string | null = null;
   let currentUfrag: string | null = null;
-  let foundationCounter = 900000000;
+  let foundationCounter = 800000000;
   for (const line of lines) {
     if (line.startsWith('m=')) {
       currentMLineIndex++;
-      // Reset per-media-section ufrag (it can be overridden at media level).
       currentUfrag = null;
     } else if (line.startsWith('a=mid:')) {
       currentMid = line.slice('a=mid:'.length).trim();
     } else if (line.startsWith('a=ice-ufrag:')) {
       currentUfrag = line.slice('a=ice-ufrag:'.length).trim();
     } else if (line.startsWith('a=candidate:') && line.includes('.local')) {
-      // Parse: a=candidate:<foundation> <component> <transport> <priority> <addr> <port> typ host ...
-      // We rebuild the candidate string with the manual IP and a fresh numeric
-      // foundation. We KEEP all the optional extensions (ufrag, generation,
-      // network-id, etc.) from the original line so the browser accepts it.
+      // Rebuild the candidate with a fresh foundation and a much lower
+      // priority so the manual IP (in the rewritten SDP) wins cross-device
+      // but the mDNS candidate still works for same-machine testing.
       const candidateValue = line.slice('a=candidate:'.length);
       const parts = candidateValue.split(' ');
       if (parts.length >= 6) {
-        const component = parts[1];
-        const transport = parts[2];
         const priorityStr = parts[3];
-        const port = parts[5];
-        // Swap foundation (parts[0]) and address (parts[4]).
         const newFoundation = String(foundationCounter++);
         parts[0] = newFoundation;
-        // Decrement priority by 1 so mDNS is preferred (works for same-machine).
+        // Drop priority dramatically (1000x lower) so ICE only tries mDNS
+        // after the manual IP candidate fails. This avoids the
+        // "mDNS-fails-first-then-ICE-gives-up" race.
         const priorityNum = parseInt(priorityStr, 10);
-        if (!isNaN(priorityNum)) parts[3] = String(Math.max(1, priorityNum - 1));
-        // Swap the .local address for the manual IP.
-        parts[4] = ip;
-        const newCandidateValue = parts.join(' ');
+        if (!isNaN(priorityNum)) parts[3] = String(Math.max(1, Math.floor(priorityNum / 1000)));
         out.push({
-          candidate: `candidate:${newCandidateValue}`,
+          candidate: `candidate:${parts.join(' ')}`,
           sdpMid: currentMid,
           sdpMLineIndex: currentMLineIndex >= 0 ? currentMLineIndex : null,
           usernameFragment: currentUfrag,
@@ -358,7 +389,6 @@ function extractExtraCandidates(sdp: string, manualIp: string): ExtraIceCandidat
       }
     }
   }
-  console.log(`[WebRTC] Extracted ${out.length} extra IP candidates for ${ip}`);
   return out;
 }
 
@@ -489,43 +519,64 @@ export class WebRTCNetHost implements NetClient {
    * SDP offer. The guest will accept this offer and produce an answer, which
    * the host then applies via acceptAnswer().
    *
+   * AUTOMATIC OFFLINE DETECTION: If `manualHostIp` is provided (the user
+   * explicitly entered a LAN IP), we treat that as a strong hint that we're
+   * on a hotspot and should skip STUN — STUN's public-IP candidates would
+   * just confuse ICE and waste 5-10s of gathering time. We temporarily
+   * override the offline flag for this connection.
+   *
    * @param manualHostIp Optional host LAN IP (e.g. `192.168.43.1` or
-   *                     `10.181.207.147`). When set, we extract extra IP-based
-   *                     ICE candidates from the host's local SDP (mirroring the
-   *                     mDNS ports but using the manual IP) and include them in
-   *                     the compressed payload. The guest applies them via
-   *                     `addIceCandidate`, which lets ICE reach the host on
-   *                     networks where mDNS is blocked (mobile hotspots,
-   *                     restrictive routers).
+   *                     `10.181.207.147`). When set, we rewrite the SDP's
+   *                     mDNS hostnames to use this IP directly, so the remote
+   *                     side gets a clean `host` candidate pointing at the
+   *                     manual IP. This is the v2 fix — see the comment block
+   *                     above `rewriteSdpWithManualIp`.
    */
   async createOffer(manualHostIp?: string): Promise<string> {
     this.lastManualHostIp = manualHostIp;
+    // If the user provided a manual LAN IP, treat that as a hint that we're
+    // on a hotspot. Skip STUN entirely — its public-IP candidates would
+    // confuse ICE on a hotspot (the guest can't route back to the host's
+    // public IP). This is the v2 automatic offline detection.
+    const effectiveOffline = this.forceOffline || !!manualHostIp;
+    if (effectiveOffline !== this.forceOffline) {
+      console.log('[HOST] Manual IP provided — automatically enabling offline mode (skipping STUN)');
+    }
     const peerId = `g-${Math.random().toString(36).slice(2, 9)}`;
-    const pc = this.createPeerConnection(peerId);
+    const pc = this.createPeerConnection(peerId, effectiveOffline);
     // Host creates the data channel — the guest receives it via ondatachannel.
     const dc = pc.createDataChannel(LABEL, { ordered: false, maxRetransmits: 0 });
     this.bindDataChannel(peerId, dc);
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    await waitForIceComplete(pc, 12000, this.forceOffline);
+    await waitForIceComplete(pc, 12000, effectiveOffline);
 
     this.pendingOffers.set(peerId, pc);
 
-    // IMPORTANT: we do NOT modify the SDP text. The local description is
-    // sent as-is. If the host provided a manual IP, we extract extra IP-based
-    // ICE candidates and include them as a separate field in the payload —
-    // the guest applies them via `addIceCandidate` (the proper WebRTC API).
-    // This avoids `Failed to parse SessionDescription` errors that arise
-    // from manually editing SDP candidate lines.
-    const localSdp = pc.localDescription ?? undefined;
+    // Manual-IP fix: if the user provided a manual LAN IP, surgically rewrite
+    // the mDNS hostnames in the local SDP to use that IP. This way the remote
+    // side gets a clean `host` candidate pointing at the manual IP and ICE
+    // tries it FIRST (no priority conflict with mDNS). We also extract the
+    // original mDNS candidate(s) as low-priority extras so same-machine
+    // testing still works (mDNS resolves between two tabs on the same
+    // browser).
+    const localSdpInit = pc.localDescription ?? undefined;
+    let sdpToSend = localSdpInit;
     let extraCandidates: ExtraIceCandidate[] = [];
-    if (manualHostIp && localSdp && typeof localSdp.sdp === 'string') {
-      extraCandidates = extractExtraCandidates(localSdp.sdp, manualHostIp);
+    if (manualHostIp && localSdpInit && typeof localSdpInit.sdp === 'string') {
+      // Extract the original mDNS candidates FIRST (before rewriting), so we
+      // can ship them as low-priority extras for same-machine testing.
+      extraCandidates = extractMdnsCandidatesAsExtra(localSdpInit.sdp);
+      // Rewrite the SDP — replace mDNS hostnames with the manual IP.
+      const rewrittenSdp = rewriteSdpWithManualIp(localSdpInit.sdp, manualHostIp);
+      sdpToSend = { ...localSdpInit, sdp: rewrittenSdp };
+      console.log(`[HOST] Offer SDP rewritten with manual IP ${manualHostIp}. ` +
+        `${extraCandidates.length} mDNS candidate(s) shipped as low-priority extras.`);
     }
 
     const payload = JSON.stringify({
-      sdp: localSdp,
+      sdp: sdpToSend,
       peerId,
       hostId: this.id,
       extraCandidates,
@@ -677,12 +728,16 @@ export class WebRTCNetHost implements NetClient {
     return false;
   }
 
-  private createPeerConnection(peerId: string): RTCPeerConnection {
+  private createPeerConnection(peerId: string, forceOfflineOverride?: boolean): RTCPeerConnection {
     // Build the ICE config dynamically — when forceOffline is set (or
     // navigator.onLine is false), we skip STUN servers entirely so ICE
     // gathering completes in milliseconds instead of waiting 5-10s for STUN
     // to time out on a hotspot without internet.
-    const pc = new RTCPeerConnection(createPCConfig(this.forceOffline));
+    //
+    // forceOfflineOverride lets createOffer() temporarily enable offline mode
+    // when the user provided a manual IP (a strong hint they're on a hotspot).
+    const offline = forceOfflineOverride ?? this.forceOffline;
+    const pc = new RTCPeerConnection(createPCConfig(offline));
     this.peerConns.set(peerId, pc);
 
     // Log every local ICE candidate as it's gathered. This is critical for
@@ -729,12 +784,25 @@ export class WebRTCNetHost implements NetClient {
         } catch { /* ignore */ }
       }
       if (pc.iceConnectionState === 'failed') {
-        try { pc.restartIce(); } catch { }
+        // Trigger an ICE restart. The PC will re-gather candidates and try
+        // again. Don't immediately tear down — give ICE restart a chance.
+        try { pc.restartIce(); } catch { /* ignore */ }
       }
     };
     pc.onconnectionstatechange = () => {
       console.log('[HOST]', peerId, 'Connection State:', pc.connectionState);
-      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      if (pc.connectionState === 'failed') {
+        // Don't immediately disconnect — give ICE restart (triggered above)
+        // a 5-second window to recover. Only tear down if we're still failed
+        // after that. This handles transient firewall flaps and NAT timeouts
+        // that often happen on hotspot connections.
+        setTimeout(() => {
+          // Re-check: maybe ICE recovered.
+          if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+            this.handlePeerDisconnect(peerId);
+          }
+        }, 5000);
+      } else if (pc.connectionState === 'closed') {
         this.handlePeerDisconnect(peerId);
       }
     };
@@ -1009,7 +1077,19 @@ export class WebRTCNetGuest implements NetClient {
       console.log('[GUEST] Adopted host-assigned peerId:', parsed.peerId);
     }
 
-    this.pc = new RTCPeerConnection(createPCConfig(this.forceOffline));
+    // AUTOMATIC OFFLINE DETECTION (symmetric to host): if the guest provided a
+    // manual LAN IP, OR if the host's offer SDP contains a manual IP (not a
+    // *.local hostname), we infer we're on a hotspot and skip STUN. The host's
+    // offer SDP having an IP instead of mDNS is a strong signal that the host
+    // is in manual-IP mode (hotspot).
+    const offerSdp = typeof parsed.sdp?.sdp === 'string' ? parsed.sdp.sdp : '';
+    const offerHasManualIp = /\.local\b/.test(offerSdp) === false && /a=candidate:.*\d+\.\d+\.\d+\.\d+/.test(offerSdp);
+    const effectiveOffline = this.forceOffline || !!manualGuestIp || offerHasManualIp;
+    if (effectiveOffline !== this.forceOffline) {
+      console.log('[GUEST] Detected hotspot/manual-IP scenario — automatically enabling offline mode (skipping STUN)');
+    }
+
+    this.pc = new RTCPeerConnection(createPCConfig(effectiveOffline));
     // Guest receives the host's data channel.
     this.pc.ondatachannel = (e) => {
       this.dc = e.channel;
@@ -1030,10 +1110,16 @@ export class WebRTCNetGuest implements NetClient {
     this.pc.onconnectionstatechange = () => {
       console.log('[GUEST]', 'Connection State:', this.pc?.connectionState);
       if (!this.pc) return;
-      if (
-        this.pc.connectionState === 'failed' ||
-        this.pc.connectionState === 'closed'
-      ) {
+      if (this.pc.connectionState === 'failed') {
+        // Don't immediately close — give ICE restart (triggered in the ice
+        // state handler) a 5-second window to recover. Only schedule a close
+        // if we're still failed after that.
+        setTimeout(() => {
+          if (this.pc && (this.pc.connectionState === 'failed' || this.pc.connectionState === 'closed')) {
+            this.scheduleClose();
+          }
+        }, 5000);
+      } else if (this.pc.connectionState === 'closed') {
         this.scheduleClose();
       }
     };
@@ -1068,13 +1154,14 @@ export class WebRTCNetGuest implements NetClient {
       }
     };
 
-    // Apply the host's offer SDP. The SDP is sent UNMODIFIED by the host
-    // (we no longer inject candidates into the SDP text), so this call
-    // always parses cleanly. If the host included `extraCandidates`, we
-    // apply them via `addIceCandidate` AFTER setRemoteDescription succeeds.
+    // Apply the host's offer SDP. The host may have rewritten its mDNS
+    // hostnames to use a manual IP (when the user provided one) — that's
+    // fine, the SDP still parses cleanly because we only swapped the
+    // hostname token. If the host also shipped extra mDNS candidates (for
+    // same-machine testing), apply them via addIceCandidate.
     await this.pc.setRemoteDescription(parsed.sdp);
     if (parsed.extraCandidates && parsed.extraCandidates.length > 0) {
-      console.log('[GUEST] Applying', parsed.extraCandidates.length, 'extra candidates from host');
+      console.log('[GUEST] Applying', parsed.extraCandidates.length, 'low-priority mDNS extras from host');
       // Apply asynchronously — don't block the answer generation. Any
       // failures are non-fatal (logged inside applyExtraCandidates).
       applyExtraCandidates(this.pc, parsed.extraCandidates).catch((e) => {
@@ -1084,20 +1171,25 @@ export class WebRTCNetGuest implements NetClient {
 
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
-    await waitForIceComplete(this.pc, 12000, this.forceOffline);
+    await waitForIceComplete(this.pc, 12000, effectiveOffline);
 
-    // IMPORTANT: we do NOT modify the SDP text. If the guest provided a
-    // manual IP, we extract extra IP-based ICE candidates from the local
-    // SDP and include them as a separate field in the answer payload —
-    // the host applies them via `addIceCandidate`.
-    const localSdp = this.pc.localDescription ?? undefined;
+    // Manual-IP fix (symmetric to host side): if the guest provided a manual
+    // IP, rewrite the local SDP's mDNS hostnames to use it. We also extract
+    // the original mDNS candidates as low-priority extras so same-machine
+    // testing still works.
+    const localSdpInit = this.pc.localDescription ?? undefined;
+    let sdpToSend = localSdpInit;
     let extraCandidates: ExtraIceCandidate[] = [];
-    if (manualGuestIp && localSdp && typeof localSdp.sdp === 'string') {
-      extraCandidates = extractExtraCandidates(localSdp.sdp, manualGuestIp);
+    if (manualGuestIp && localSdpInit && typeof localSdpInit.sdp === 'string') {
+      extraCandidates = extractMdnsCandidatesAsExtra(localSdpInit.sdp);
+      const rewrittenSdp = rewriteSdpWithManualIp(localSdpInit.sdp, manualGuestIp);
+      sdpToSend = { ...localSdpInit, sdp: rewrittenSdp };
+      console.log(`[GUEST] Answer SDP rewritten with manual IP ${manualGuestIp}. ` +
+        `${extraCandidates.length} mDNS candidate(s) shipped as low-priority extras.`);
     }
 
     const payload = JSON.stringify({
-      sdp: localSdp,
+      sdp: sdpToSend,
       peerId: parsed.peerId,
       extraCandidates,
     });
