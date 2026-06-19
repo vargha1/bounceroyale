@@ -96,9 +96,29 @@ export default function LanModal({ onCancel, onStart }: Props) {
   // when a connection attempt fails.
   const [showTroubleshooting, setShowTroubleshooting] = useState(false);
 
+  // Detect the user's OS so we can show targeted firewall instructions.
+  // Windows is the most common case where the firewall blocks inbound UDP
+  // and causes "ICE failed" errors on hotspot play.
+  const isWindows = typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent);
+  const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.userAgent) && !/iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const isIOS = typeof navigator !== 'undefined' && /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const isAndroid = typeof navigator !== 'undefined' && /Android/i.test(navigator.userAgent);
+
   // Online/offline status badge — reflects the effective status (offline if
   // navigator.onLine is false OR the user toggled forceOffline).
   const effectiveStatus = getNetworkStatus(forceOffline);
+
+  // "High-risk" scenario: the user is the HOST, on a desktop OS (Windows/Mac),
+  // in offline/hotspot mode, AND has entered a manual IP. This is the scenario
+  // where the firewall is most likely to block the connection. Show a prominent
+  // warning banner AND auto-open the troubleshooting panel.
+  const isHighRiskHost = tab === 'host' && manualHostIp.trim() && (isWindows || isMac);
+
+  // Auto-open troubleshooting when the user is in the high-risk scenario,
+  // so they see the firewall fix immediately without having to click.
+  useEffect(() => {
+    if (isHighRiskHost) setShowTroubleshooting(true);
+  }, [isHighRiskHost]);
 
   // Run IP detection. We auto-run once on mount so the user immediately sees
   // suggestions, and re-run when the user clicks "Detect my IP".
@@ -216,7 +236,19 @@ export default function LanModal({ onCancel, onStart }: Props) {
       // a few seconds so they know to regenerate.
       window.setTimeout(() => {
         if (status !== 'connected' && !startedRef.current) {
-          setError(prev => prev ?? 'Connection is taking longer than expected. If it doesn\'t connect within a few more seconds, click "Regenerate invite code" and have the guest re-join with the new code.');
+          // Generate a targeted error message based on the user's setup.
+          // The #1 cause is the host's firewall blocking inbound UDP.
+          let msg = 'Connection failed — packets are not getting through.\n\n';
+          if (isWindows || isMac) {
+            msg += `⚠️ Most likely cause: your ${isWindows ? 'Windows' : 'macOS'} firewall is blocking inbound UDP.\n`;
+            msg += `→ Fix A (easiest): Use a PHONE as the host instead of this laptop.\n`;
+            msg += `→ Fix B: Allow your browser through the firewall (see troubleshooting panel below).\n\n`;
+          }
+          if (isIOS) {
+            msg += `⚠️ iOS hotspots do NOT support device-to-device communication. Use an Android hotspot or a real router.\n\n`;
+          }
+          msg += 'Click "Regenerate invite code" to try again after fixing the issue.';
+          setError(prev => prev ?? msg);
           setShowTroubleshooting(true);
         }
       }, 8000);
@@ -578,6 +610,72 @@ export default function LanModal({ onCancel, onStart }: Props) {
                     Leave blank on normal Wi-Fi.
                   </div>
                 </div>
+
+                {/* ===== Firewall warning for desktop hosts on hotspot =====
+                    When the host is a Windows/Mac laptop on a phone hotspot
+                    with a manual IP, the #1 cause of "ICE failed" is the
+                    laptop's firewall blocking inbound UDP. We can't fix the
+                    firewall from JS — the user MUST allow Chrome through.
+                    This banner makes that crystal clear BEFORE they click
+                    "Start Hosting" so they don't waste time on a connection
+                    that's doomed to fail. */}
+                {isHighRiskHost && (
+                  <div style={{
+                    marginTop: '0.6rem',
+                    padding: '0.75rem',
+                    borderRadius: '8px',
+                    background: 'rgba(239, 68, 68, 0.1)',
+                    border: '1px solid rgba(239, 68, 68, 0.4)',
+                    fontSize: '0.82rem',
+                    lineHeight: 1.55,
+                  }}>
+                    <strong style={{ display: 'block', marginBottom: '0.35rem', color: '#fca5a5' }}>
+                      ⚠️ {isWindows ? 'Windows Firewall' : 'macOS Firewall'} will likely block this connection!
+                    </strong>
+                    <p style={{ margin: '0 0 0.5rem 0' }}>
+                      You're hosting from a <strong>{isWindows ? 'Windows' : 'Mac'}</strong> laptop on a
+                      phone hotspot. The laptop's firewall blocks inbound UDP by default, which means the
+                      guest's phone CANNOT send packets to your laptop — even with the correct IP.
+                    </p>
+                    <p style={{ margin: '0 0 0.5rem 0' }}>
+                      <strong>You have two options:</strong>
+                    </p>
+                    <ol style={{ paddingLeft: '1.2rem', margin: '0 0 0.5rem 0' }}>
+                      <li style={{ marginBottom: '0.3rem' }}>
+                        <strong>Recommended: use a PHONE as the host instead.</strong> Phones don't have
+                        software firewalls, so connections just work. Open the game on a phone connected to
+                        the hotspot, click "Host Game" there, and use this laptop as the guest.
+                      </li>
+                      <li>
+                        <strong>{isWindows ? 'Allow Chrome through Windows Firewall' : 'Allow Chrome through macOS Firewall'}:</strong>
+                        {isWindows ? (
+                          <>
+                            <br />
+                            → Control Panel → Windows Defender Firewall → "Allow an app through Windows Firewall"
+                            <br />
+                            → Find "Google Chrome" (or "Microsoft Edge") → tick <strong>Private</strong> AND <strong>Public</strong>
+                            <br />
+                            → Click OK → <strong>fully close and reopen</strong> your browser
+                          </>
+                        ) : (
+                          <>
+                            <br />
+                            → System Settings → Network → Firewall → Options
+                            <br />
+                            → Add your browser to the "Allow incoming connections" list
+                          </>
+                        )}
+                      </li>
+                    </ol>
+                    <p style={{ margin: 0, fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                      💡 Also verify: some phone hotspots have "AP Isolation" which blocks all inter-device
+                      communication. iOS Personal Hotspot does NOT support device-to-device communication at
+                      all — if your hotspot is an iPhone, hotspot LAN play is impossible. Use an Android
+                      hotspot or a real router instead.
+                    </p>
+                  </div>
+                )}
+
                 <div className="actions">
                   <button className="ghost" onClick={backToMenu}>{t('back', lang)}</button>
                   <button className="primary" onClick={startHost} disabled={busy}>
@@ -772,60 +870,96 @@ export default function LanModal({ onCancel, onStart }: Props) {
               fontSize: '0.82rem',
               lineHeight: 1.55,
             }}>
-              <strong style={{ display: 'block', marginBottom: '0.4rem' }}>🛠 Common causes & fixes</strong>
+              <strong style={{ display: 'block', marginBottom: '0.4rem' }}>
+                🛠 If ICE State goes "checking → disconnected → failed"
+              </strong>
+              <p style={{ margin: '0 0 0.5rem 0' }}>
+                This means the two devices tried to connect but the network packets didn't get through.
+                The cause is <strong>ALWAYS</strong> one of the following — check each one:
+              </p>
+
+              {/* Most common cause first */}
+              <div style={{
+                background: 'rgba(239, 68, 68, 0.1)',
+                border: '1px solid rgba(239, 68, 68, 0.3)',
+                borderRadius: '6px',
+                padding: '0.5rem 0.6rem',
+                marginBottom: '0.5rem',
+              }}>
+                <strong style={{ color: '#fca5a5' }}>
+                  #1 cause (90% of failures): Host's firewall blocks inbound UDP
+                </strong>
+                <p style={{ margin: '0.3rem 0 0 0' }}>
+                  You're hosting from a {isWindows ? 'Windows' : isMac ? 'Mac' : 'desktop'} {isWindows || isMac ? 'laptop' : 'device'}.
+                  {isWindows ? ' Windows Defender Firewall' : isMac ? ' macOS Firewall' : ' The firewall'} blocks
+                  inbound UDP by default. The guest's phone sends packets to your IP but they're silently
+                  dropped. <strong>The browser CANNOT fix this — you must change a system setting.</strong>
+                </p>
+                <p style={{ margin: '0.4rem 0 0.2rem 0' }}><strong>Fix A (recommended): Use a PHONE as the host</strong></p>
+                <ul style={{ paddingLeft: '1.2rem', margin: '0 0 0.4rem 0' }}>
+                  <li>Phones don't have software firewalls — connections just work</li>
+                  <li>Open the game on a phone connected to the hotspot, click "Host Game" there</li>
+                  <li>Use this {isWindows ? 'laptop' : 'device'} as the guest instead</li>
+                </ul>
+                <p style={{ margin: '0.4rem 0 0.2rem 0' }}>
+                  <strong>Fix B: Allow your browser through the firewall</strong>
+                </p>
+                {isWindows ? (
+                  <ul style={{ paddingLeft: '1.2rem', margin: '0 0 0.4rem 0' }}>
+                    <li>Win+R → type <code>control firewall.cpl</code> → Enter</li>
+                    <li>Click "Allow an app or feature through Windows Defender Firewall"</li>
+                    <li>Find "Google Chrome" (or your browser) → tick <strong>Private</strong> AND <strong>Public</strong></li>
+                    <li>If Chrome isn't listed: "Allow another app" → browse to chrome.exe</li>
+                    <li>Click OK → <strong>fully quit Chrome</strong> (right-click taskbar icon → Quit, or Ctrl+Shift+Q) → reopen</li>
+                  </ul>
+                ) : (
+                  <ul style={{ paddingLeft: '1.2rem', margin: '0 0 0.4rem 0' }}>
+                    <li>System Settings → Network → Firewall</li>
+                    <li>Click the lock to make changes → enter admin password</li>
+                    <li>Click "Firewall Options" → add your browser → set to "Allow incoming connections"</li>
+                    <li>Click OK → <strong>fully quit and reopen</strong> your browser</li>
+                  </ul>
+                )}
+              </div>
+
               <ol style={{ paddingLeft: '1.2rem', margin: 0 }}>
                 <li style={{ marginBottom: '0.4rem' }}>
-                  <strong>Host's firewall is blocking inbound UDP.</strong> The
-                  host (especially a Windows laptop) MUST allow Chrome through
-                  the firewall for inbound UDP on private networks. On Windows:
-                  <br />
-                  → Control Panel → Windows Defender Firewall → Allow an app
-                  → find "Google Chrome" → tick both <em>Private</em> AND
-                  <em>Public</em> → OK. Then fully close Chrome and reopen.
-                  <br />
-                  <em>Or</em>: have the PHONE be the host (phones don't have
-                  software firewalls) and the laptop be the guest.
+                  <strong>iOS hotspot limitation.</strong> If the hotspot is an iPhone's "Personal Hotspot",
+                  devices connected to it <strong>CANNOT communicate with each other</strong>. This is an Apple
+                  limitation — iOS hotspots only provide internet access, not LAN connectivity. Use an Android
+                  hotspot or a real Wi-Fi router instead.
                 </li>
                 <li style={{ marginBottom: '0.4rem' }}>
-                  <strong>Host didn't enter its manual LAN IP on a hotspot.</strong>
-                  On a phone-hotspot network, mDNS hostnames don't resolve
-                  cross-device. The host MUST enter its own LAN IP (use the
-                  quick-pick buttons or run <code>ipconfig</code> on Windows).
+                  <strong>AP Isolation on the hotspot.</strong> Some Android hotspots (especially Samsung/Xiaomi)
+                  enable "AP Isolation" which blocks inter-device communication. Check your hotspot settings for
+                  an option like "Allow connected devices to share files" or "AP isolation" and disable it.
                 </li>
                 <li style={{ marginBottom: '0.4rem' }}>
-                  <strong>"Force offline" not ticked on a hotspot.</strong>
-                  If the hotspot has no internet, STUN servers can't be
-                  reached and ICE gathering blocks for ~10 seconds. Tick
-                  "Force offline" at the top of this modal to skip STUN and
-                  get the invite code in &lt;1 second.
+                  <strong>Wrong IP entered.</strong> The host's IP must be the one on the hotspot network (e.g.
+                  <code>10.181.207.139</code>), NOT the public IP, NOT the gateway IP. On Windows run
+                  <code>ipconfig</code> and look at "IPv4 Address" of the Wi-Fi adapter connected to the hotspot.
+                  If you see multiple adapters, pick the one whose "Default Gateway" is the hotspot phone's IP.
                 </li>
                 <li style={{ marginBottom: '0.4rem' }}>
-                  <strong>Wrong IP entered.</strong> The host's IP must be the
-                  one on the hotspot network (e.g. <code>10.181.207.139</code>),
-                  NOT the public IP, NOT the gateway IP. On Windows run
-                  <code>ipconfig</code> in cmd and look at "IPv4 Address" of
-                  the Wi-Fi adapter connected to the hotspot.
-                </li>
-                <li style={{ marginBottom: '0.4rem' }}>
-                  <strong>Guest connected to a different network.</strong> Both
-                  devices must be on the SAME hotspot. Check the guest's IP is
-                  in the same subnet as the host (e.g. both 10.181.207.x).
+                  <strong>Guest on a different network.</strong> Both devices must be on the SAME hotspot. Check
+                  the guest's IP is in the same subnet as the host (e.g. both 10.181.207.x).
                 </li>
                 <li>
-                  <strong>Browser is blocking mDNS.</strong> Chrome's
-                  anti-fingerprinting hides local IPs as <code>*.local</code>
-                  hostnames that don't resolve across devices. Use the manual
-                  IP field. Firefox and Safari are more permissive.
+                  <strong>Guest should also provide its IP (advanced).</strong> If the host's firewall is open
+                  but the connection still fails, the guest can ALSO enter its own LAN IP (on the Join tab).
+                  This gives ICE an extra candidate pair to try. The guest's IP is visible in its Wi-Fi settings
+                  or via the "Detected IPs" panel at the top of this modal.
                 </li>
               </ol>
+
               <div style={{ marginTop: '0.6rem', paddingTop: '0.5rem', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
-                <strong>📋 Diagnostic checklist:</strong>
+                <strong>📋 How to read the console logs (F12):</strong>
                 <ul style={{ paddingLeft: '1.2rem', marginTop: '0.3rem' }}>
-                  <li>Open the browser console (F12) on BOTH devices and look for
-                    <code>[HOST]</code> / <code>[GUEST]</code> / <code>[WebRTC]</code> log lines.</li>
-                  <li>Look for "Rewrote N mDNS candidate(s) in SDP to use manual IP" — confirms the manual IP was injected.</li>
-                  <li>Look for "ICE State: checking → disconnected → failed" — means the candidate was tried but the packets didn't get through (usually a firewall or wrong-IP issue).</li>
-                  <li>If you see "ICE State: connected" briefly then "disconnected", the connection was established but flapped — usually a NAT/firewall timeout, try keeping the game open.</li>
+                  <li><code>"Rewrote N mDNS candidate(s) in SDP to use manual IP"</code> — confirms the manual IP was injected into the SDP ✓</li>
+                  <li><code>"Guest answer candidates (N):"</code> — shows what candidates the host received from the guest. If all are <code>[✗] mDNS does NOT resolve cross-device</code>, the guest needs to provide its IP too.</li>
+                  <li><code>"ICE State: checking → disconnected → failed"</code> — packets didn't get through. 90% chance it's the firewall (see #1 above).</li>
+                  <li><code>"ICE State: connected"</code> then <code>"disconnected"</code> — connection flapped, usually a NAT timeout. Try keeping the game open longer.</li>
+                  <li><code>"selected ICE pair:"</code> — if you see this, ICE succeeded! The connection is working.</li>
                 </ul>
               </div>
             </div>

@@ -393,6 +393,62 @@ function extractMdnsCandidatesAsExtra(sdp: string): ExtraIceCandidate[] {
 }
 
 /**
+ * Extract and log all candidate lines from an SDP body. Used for diagnostics
+ * — when a connection fails, this tells you exactly what candidates ICE had
+ * to work with (host mDNS, host IP, srflx, etc.) and whether any of them are
+ * reachable cross-device.
+ *
+ * The log output looks like:
+ *   [HOST] Guest answer candidates (3):
+ *     1. host  10.181.207.148:54321  (reachable ✓)
+ *     2. host  <mdns>.local:54321    (NOT reachable cross-device ✗)
+ *     3. srflx 37.202.130.141:38533  (public IP, useless on LAN ✗)
+ */
+function logSdpCandidates(sdp: string, prefix: string): void {
+  if (!sdp) return;
+  const lines = sdp.split(/\r?\n/);
+  const candidates: string[] = [];
+  for (const line of lines) {
+    if (!line.startsWith('a=candidate:')) continue;
+    const value = line.slice('a=candidate:'.length);
+    const parts = value.split(' ');
+    if (parts.length < 6) continue;
+    const priority = parts[3];
+    const addr = parts[4];
+    const port = parts[5];
+    const typMatch = value.match(/typ (\w+)/);
+    const typ = typMatch ? typMatch[1] : 'unknown';
+    // Determine reachability for cross-device LAN play
+    let reachable = '?';
+    let note = '';
+    if (typ === 'host') {
+      if (addr.endsWith('.local')) {
+        reachable = '✗';
+        note = 'mDNS does NOT resolve cross-device';
+      } else if (/^(\d{1,3}\.){3}\d{1,3}$/.test(addr)) {
+        reachable = '✓';
+        note = 'IP candidate — reachable if firewall allows';
+      }
+    } else if (typ === 'srflx') {
+      reachable = '✗';
+      note = 'public IP — useless on LAN/hotspot';
+    } else if (typ === 'relay') {
+      reachable = '✓';
+      note = 'TURN relay — needs internet';
+    }
+    // Truncate mDNS hostnames for readability
+    const prettyAddr = addr.replace(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.local/g, '<mdns>.local');
+    candidates.push(`${typ}\t${prettyAddr}:${port}\t[${reachable}]\t${note}`);
+  }
+  if (candidates.length === 0) {
+    console.warn(`${prefix} candidates: NONE — the remote side didn't gather any candidates. ICE will fail.`);
+  } else {
+    console.log(`${prefix} candidates (${candidates.length}):`);
+    candidates.forEach((c, i) => console.log(`  ${i + 1}. ${c}`));
+  }
+}
+
+/**
  * Apply a list of extra ICE candidates to a peer connection via the proper
  * `addIceCandidate` API. Must be called AFTER `setRemoteDescription` has
  * succeeded. Errors on individual candidates are logged but don't abort the
@@ -670,6 +726,15 @@ export class WebRTCNetHost implements NetClient {
       throw new Error('Guest answer SDP is empty or missing. Please ask the guest to regenerate the answer code.');
     }
     console.log('[HOST] setRemoteDescription — type:', answerSdpInit.type, 'sdp length:', answerSdpInit.sdp.length);
+
+    // Log the candidates we received from the guest. This is CRITICAL for
+    // diagnosing connection failures — if the guest's answer only contains
+    // mDNS candidates (which the host can't resolve cross-device) and no
+    // IP candidates, the connection will fail unless the guest also provided
+    // a manual IP. This log tells you exactly what candidates ICE has to
+    // work with.
+    logSdpCandidates(answerSdpInit.sdp!, '[HOST] Guest answer');
+
     try {
       await pc.setRemoteDescription(answerSdpInit);
     } catch (e: any) {
@@ -864,9 +929,26 @@ export class WebRTCNetHost implements NetClient {
     // freshness checks.
     dc.onclose = () => {
       console.log('[HOST]', peerId, 'DataChannel CLOSED');
+      // Wait 5 seconds before tearing down — matches the grace period in
+      // onconnectionstatechange. During this window, ICE restart might
+      // recover the connection (e.g. after a transient firewall flap or
+      // NAT timeout). If the data channel reopens, we cancel the teardown.
       setTimeout(() => {
-        if (dc.readyState === 'closed') this.handlePeerDisconnect(peerId);
-      }, 1500);
+        // Re-check: maybe the data channel reopened (ICE recovered) or a
+        // new data channel was bound to this peerId.
+        const currentDc = this.dataChannels.get(peerId);
+        if (currentDc && currentDc.readyState === 'open') {
+          console.log('[HOST]', peerId, 'DataChannel recovered — skipping teardown');
+          return;
+        }
+        // Also check if the PC is still in a recovering state
+        const pc = this.peerConns.get(peerId);
+        if (pc && (pc.connectionState === 'connected' || pc.connectionState === 'connecting')) {
+          console.log('[HOST]', peerId, 'PC still recovering — skipping teardown');
+          return;
+        }
+        this.handlePeerDisconnect(peerId);
+      }, 5000);
     };
     dc.onerror = (e) => {
       console.warn('DataChannel error from', peerId, e);
@@ -1206,6 +1288,12 @@ export class WebRTCNetGuest implements NetClient {
       throw new Error('Host offer SDP is empty or missing. Please ask the host to regenerate the invite code.');
     }
     console.log('[GUEST] setRemoteDescription — type:', offerSdpInit.type, 'sdp length:', offerSdpInit.sdp.length);
+
+    // Log the candidates we received from the host. This tells us whether
+    // the host provided a manual IP (which we can reach) or only mDNS
+    // (which we can't resolve cross-device).
+    logSdpCandidates(offerSdpInit.sdp!, '[GUEST] Host offer');
+
     await this.pc.setRemoteDescription(offerSdpInit);
     if (parsed.extraCandidates && parsed.extraCandidates.length > 0) {
       console.log('[GUEST] Applying', parsed.extraCandidates.length, 'low-priority mDNS extras from host');
@@ -1358,13 +1446,16 @@ export class WebRTCNetGuest implements NetClient {
   private scheduleClose() {
     if (this.closeTimer !== null) return;
     if (this.closed) return;
+    // Wait 5 seconds before declaring the connection lost — matches the
+    // host-side grace period. During this window, ICE restart might recover
+    // the connection (e.g. after a transient firewall flap or NAT timeout).
     this.closeTimer = window.setTimeout(() => {
       this.closeTimer = null;
       // Re-check: maybe the channel reopened during the wait.
       if (this.dc && this.dc.readyState === 'open') return;
       if (this.pc && (this.pc.connectionState === 'connected' || this.pc.connectionState === 'connecting')) return;
       this.emit({ type: 'close' });
-    }, 2000);
+    }, 5000);
   }
 
   send(msg: NetMessage) {
