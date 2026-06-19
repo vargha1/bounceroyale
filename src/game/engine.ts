@@ -1171,7 +1171,26 @@ export function createGameEngine(opts: EngineOptions) {
     netClient.onMessage((ev: NetEvent) => {
       switch (ev.type) {
         case 'open':
-          // For guests: send join request
+          // In server mode, adopt the server-assigned socket id as our local
+          // player id. This is critical because the server's `init` event
+          // references players by their socket.id, and our `localPlayerId`
+          // started as 'local-host' (a placeholder). Without this update, the
+          // host never creates its own sphere (the init handler's
+          // `if (p.id === localPlayerId)` check never matches).
+          if (mode === 'server' && ev.id && ev.id !== localPlayerId) {
+            // Migrate any existing local player state to the new id.
+            const oldEntry = players[localPlayerId];
+            if (oldEntry) {
+              players[ev.id] = oldEntry;
+              delete players[localPlayerId];
+            }
+            localPlayerId = ev.id;
+            // Update the netClient's id too (defensive — socket.ts already
+            // does this, but LAN mode doesn't).
+            try { (netClient as any).id = ev.id; } catch { /* ignore */ }
+            console.log('[ENGINE] Adopted server-assigned id:', localPlayerId);
+          }
+          // For LAN/server guests: send join request
           if (!isHost) {
             netClient.send({ kind: 'new-player', id: localPlayerId, position: { x: (Math.random() - 0.5) * 6, y: 5, z: (Math.random() - 0.5) * 6 } });
           }
@@ -1201,23 +1220,35 @@ export function createGameEngine(opts: EngineOptions) {
           break;
         }
         case 'init': {
-          // We are a guest receiving init from host
-          if (!isHost) {
+          // In server mode, BOTH host and guest receive 'init' from the server
+          // (the server generates the island seed and sends it to everyone).
+          // In LAN mode, only the guest receives 'init' from the host (the
+          // host generated its own island in start()).
+          const shouldProcessInit = !isHost || mode === 'server';
+          if (shouldProcessInit) {
             serverStartTime = ev.data.serverStartTime;
             startTimerValue = ev.data.startTimer;
-            // Re-generate the island from the host's seed + size so both
-            // peers have the exact same layout.
+            // Re-generate the island from the host's/server's seed + size so
+            // both peers have the exact same layout.
             islandSeed = ev.data.islandSeed;
             islandSize = (ev.data.islandSize as IslandSize) || 'medium';
-            const islandTiles = generateIsland(islandSize, islandSeed);
-            for (const t of islandTiles) createTile({ x: t.x, y: t.y, z: t.z }, t.id);
-            // Spawn the deterministic powerup pickups — same positions on
-            // every peer because they're derived from the island seed.
-            spawnPowerupPickups();
+            // Only generate the island if we haven't already (the LAN host
+            // generates it in start(); server-mode host and all guests get
+            // it here). We check tiles.length to avoid double-generating.
+            if (tiles.length === 0) {
+              const islandTiles = generateIsland(islandSize, islandSeed);
+              for (const t of islandTiles) createTile({ x: t.x, y: t.y, z: t.z }, t.id);
+              // Spawn the deterministic powerup pickups — same positions on
+              // every peer because they're derived from the island seed.
+              spawnPowerupPickups();
+            }
             // Create remote players (and ourselves)
             for (const p of ev.data.players) {
               if (p.id === localPlayerId) {
-                createSphere(p.id, p.position, true);
+                // Only create our local sphere if it doesn't exist yet
+                if (!players[p.id]) {
+                  createSphere(p.id, p.position, true);
+                }
               } else if (!players[p.id]) {
                 createSphere(p.id, p.position, false);
               }
@@ -1346,8 +1377,8 @@ export function createGameEngine(opts: EngineOptions) {
       serverStartTime = Date.now() + 5 * 1000;
       startTimerValue = 5;
       pushCountdown();
-    } else if (isHost) {
-      // LAN/Server host: generate the island, wait for guests, count down.
+    } else if (isHost && mode === 'lan') {
+      // LAN host: generate the island, wait for guests, count down.
       // The seed + size are sent to guests in the init message so they
       // regenerate the exact same island.
       const islandTiles = generateIsland(islandSize, islandSeed);
@@ -1360,7 +1391,15 @@ export function createGameEngine(opts: EngineOptions) {
       serverStartTime = Date.now() + startTimerValue * 1000;
       pushCountdown();
     }
-    // LAN guest: waits for 'init' message from host (handled in setupNetworking).
+    // SERVER host & SERVER guest: BOTH wait for the 'init' event from the
+    // server. The server generates the island seed and sends it in init, so
+    // the host doesn't generate its own island (unlike LAN mode where the
+    // host IS the authority). This was a bug — the previous code generated
+    // the island on the host's side AND ignored the init event (because of
+    // the `if (!isHost)` guard in the init handler), so the host's island
+    // seed didn't match what the server sent to guests.
+    //
+    // LAN guest: also waits for 'init' from the host (handled in setupNetworking).
     setupNetworking();
     // Safety net for guests: the WebRTC data channel may have opened BEFORE
     // the engine was created (the LanModal's `open` listener fires onStart →

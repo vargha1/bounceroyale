@@ -20,7 +20,7 @@ type Screen =
   | { kind: 'create-server' }
   | { kind: 'join-server' }
   | { kind: 'lan' }
-  | { kind: 'game'; mode: 'single' | 'lan' | 'server'; serverUrl?: string; startTimer: number; gameId?: string };
+  | { kind: 'game'; mode: 'single' | 'lan' | 'server'; serverUrl?: string; gameId?: string; isHost?: boolean; startTimer: number };
 
 export default function App() {
   const { language } = useSettings();
@@ -68,14 +68,14 @@ export default function App() {
       {screen.kind === 'create-server' && (
         <CreateGameModal
           onCancel={() => setScreen({ kind: 'mode' })}
-          onStart={(timer) => setScreen({ kind: 'game', mode: 'server', startTimer: timer })}
+          onStart={(url, timer) => setScreen({ kind: 'game', mode: 'server', serverUrl: url, isHost: true, startTimer: timer })}
         />
       )}
 
       {screen.kind === 'join-server' && (
         <JoinServerModal
           onCancel={() => setScreen({ kind: 'mode' })}
-          onConnect={(url, gameId) => setScreen({ kind: 'game', mode: 'server', serverUrl: url, gameId, startTimer: 30 })}
+          onConnect={(url, gameId) => setScreen({ kind: 'game', mode: 'server', serverUrl: url, gameId, isHost: false, startTimer: 30 })}
         />
       )}
 
@@ -91,6 +91,7 @@ export default function App() {
           mode={screen.mode}
           serverUrl={screen.serverUrl}
           gameId={screen.gameId}
+          isHost={screen.isHost}
           startTimer={screen.startTimer}
           onExit={() => setScreen({ kind: 'menu' })}
           onError={(m) => showToast(m)}

@@ -173,13 +173,17 @@ io.on('connection', (socket) => {
 
     socket.on('create-game', (data) => {
         const gameId = Date.now().toString(); // Unique game ID
-        const startTimer = data && data.startTimer ? parseInt(data.startTimer) : 30;
-        if (startTimer < 5 || startTimer > 60 || isNaN(startTimer)) {
+        // Use `let` so we can reassign if the value is out of range. (Previous
+        // code used `const` and then tried to reassign, which throws a
+        // TypeError in strict mode and crashes the server.)
+        let startTimer = data && data.startTimer ? parseInt(data.startTimer) : 30;
+        if (isNaN(startTimer) || startTimer < 5 || startTimer > 60) {
             startTimer = 30;
         }
 
         // The host client generates the island seed + size; the server just
-        // stores and relays them to joining guests.
+        // stores and relays them to joining guests. If the host didn't send
+        // them, generate sensible defaults so guests still get a valid island.
         const islandSeed = (data && typeof data.islandSeed === 'number') ? data.islandSeed : Math.floor(Math.random() * 1e9);
         const islandSize = (data && typeof data.islandSize === 'string') ? data.islandSize : 'medium';
 
@@ -217,7 +221,21 @@ io.on('connection', (socket) => {
     });
 
     socket.on('join-game', (data) => {
-        const gameId = data.gameId;
+        // If no gameId provided, auto-join the most recent active game. This
+        // makes the JoinServerModal simpler — the guest just enters the server
+        // URL and doesn't need to know the gameId. (If multiple games exist,
+        // we pick the one with the most players, or the most recently created.)
+        let gameId = data && data.gameId;
+        if (!gameId) {
+            const activeGameIds = Object.keys(games);
+            if (activeGameIds.length === 0) {
+                socket.emit('error', { message: 'No active games on this server. Ask the host to create a game first.' });
+                return;
+            }
+            // Pick the most recently created game (highest timestamp gameId).
+            gameId = activeGameIds.sort().reverse()[0];
+            console.log('Auto-joined game:', gameId);
+        }
         if (!games[gameId]) {
             socket.emit('error', { message: 'No such game exists' });
             return;
@@ -310,12 +328,50 @@ io.on('connection', (socket) => {
         }
     });
 
+    // Relay powerup collection/respawn events so all peers hide/show the
+    // pickup at the same time. The collecting peer applies the effect locally
+    // and broadcasts; other peers just hide the pickup.
+    socket.on('powerup-collected', (data) => {
+        const gameId = data.gameId;
+        if (games[gameId]) {
+            socket.to(gameId).emit('powerup-collected', data);
+        }
+    });
+
+    socket.on('powerup-respawned', (data) => {
+        const gameId = data.gameId;
+        if (games[gameId]) {
+            socket.to(gameId).emit('powerup-respawned', data);
+        }
+    });
+
+    // Relay game-started and game-ended events. The host emits game-started
+    // when the countdown ends; the server broadcasts to all players in the
+    // room. game-ended is similarly relayed (host decides the winner).
+    socket.on('game-started', (data) => {
+        const gameId = data?.gameId;
+        if (gameId && games[gameId]) {
+            io.to(gameId).emit('game-started', data || {});
+        }
+    });
+
+    socket.on('game-ended', (data) => {
+        const gameId = data?.gameId;
+        if (gameId && games[gameId]) {
+            io.to(gameId).emit('game-ended', data || {});
+        }
+    });
+
     socket.on('break-hexagon', (data) => {
         const gameId = data.gameId;
-        // Verify it's the creator
-        if (games[gameId] && socket.id === games[gameId].creatorId && games[gameId].hexagons[data.index]) {
-            games[gameId].hexagons.splice(data.index, 1);
-            io.to(gameId).emit('hexagon-broken', data); // Use io.to to include sender (creator)
+        // Verify it's the creator (only the host can break hexagons/tiles).
+        // NOTE: The old code referenced `games[gameId].hexagons[data.index]`
+        // but `games[gameId]` doesn't have a `hexagons` property (the
+        // destructible-island rewrite removed it). We now just broadcast the
+        // break event to all players in the game so everyone removes the
+        // tile on their local copy. The host is authoritative for breaks.
+        if (games[gameId] && socket.id === games[gameId].creatorId) {
+            io.to(gameId).emit('hexagon-broken', data);
             console.log('Hexagon broken:', { gameId, index: data.index });
         }
     });

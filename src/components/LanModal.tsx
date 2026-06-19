@@ -172,7 +172,13 @@ export default function LanModal({ onCancel, onStart }: Props) {
       const host = new WebRTCNetHost(id, { forceOffline });
       webrtcHostRef.current = host;
       host.onPeerChange((peers) => {
-        if (peers.length > 0 && !startedRef.current) {
+        // Only trigger onStart when a data channel is actually OPEN, not just
+        // present in the map. During regeneration, the old PC's dc.onclose
+        // can fire emitPeerChange while the new PC's data channel is still
+        // in "connecting" state — without this guard, that would spuriously
+        // trigger onStart and transition to the game screen.
+        const hasOpen = host.hasOpenDataChannel();
+        if (peers.length > 0 && hasOpen && !startedRef.current) {
           startedRef.current = true;
           setStatus('connected');
           (window as any).__bounceroyale_pendingNet = host;
@@ -235,6 +241,13 @@ export default function LanModal({ onCancel, onStart }: Props) {
     if (!webrtcHostRef.current) return;
     setError(null);
     setBusy(true);
+    // CRITICAL: Reset the startedRef so that when a new guest connects with
+    // the regenerated code, onPeerChange can fire onStart again. Without this
+    // reset, if the first attempt briefly opened a data channel (setting
+    // startedRef=true) before failing, the regenerated connection would never
+    // trigger onStart and the user would be stuck.
+    startedRef.current = false;
+    setStatus('idle');
     setStatusText(forceOffline
       ? 'Gathering ICE candidates (offline mode — should be fast)...'
       : 'Gathering ICE candidates (up to 10s for STUN)...');

@@ -13,12 +13,16 @@ interface Props {
   mode: 'single' | 'lan' | 'server';
   serverUrl?: string;
   gameId?: string;
+  /** For server mode: true if the user clicked "Create Game" (host), false if
+   *  "Join Game" (guest). For LAN mode, this is determined by the net client.
+   *  For single-player, it's always true. */
+  isHost?: boolean;
   startTimer: number;
   onExit: () => void;
   onError: (m: string) => void;
 }
 
-export default function Game({ mode, serverUrl, gameId, startTimer, onExit, onError }: Props) {
+export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, startTimer, onExit, onError }: Props) {
   const settings = useSettings();
   const lang = settings.language;
   const canvasWrapRef = useRef<HTMLDivElement | null>(null);
@@ -30,7 +34,7 @@ export default function Game({ mode, serverUrl, gameId, startTimer, onExit, onEr
     powerUps: [],
     aliveCount: 1,
     totalPlayers: 1,
-    isHost: mode === 'single' || mode === 'lan',
+    isHost: mode === 'single' || mode === 'lan' || !!isHostProp,
   });
   const [countdown, setCountdown] = useState<number | null>(null);
   const [spectating, setSpectating] = useState(false);
@@ -118,14 +122,27 @@ export default function Game({ mode, serverUrl, gameId, startTimer, onExit, onEr
           isHost = netClient.isHost;
         }
       } else if (mode === 'server') {
-        // Only create the socket client once (StrictMode safe).
+        // Server mode: the user is the host if they clicked "Create Game"
+        // (isHostProp === true), or a guest if they clicked "Join Game"
+        // (isHostProp === false). The previous code hardcoded `isHost: false`
+        // which meant the host never sent `create-game` to the server and the
+        // game never started. Fixed by passing isHostProp through from App.
+        const serverIsHost = !!isHostProp;
         if (!netClientRef.current) {
           const id = `pending-${Math.random().toString(36).slice(2, 8)}`;
+          // Normalize the URL: if the user entered just "host:port" without a
+          // protocol, prepend ws:// or wss:// based on the current page's
+          // protocol. Socket.io accepts both http(s):// and ws(s):// URLs.
           const url = serverUrl?.startsWith('http') || serverUrl?.startsWith('ws')
             ? serverUrl
             : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${serverUrl}`;
-          const client = new SocketNetClient(url!, {
-            isHost: false,
+          if (!url) {
+            onError('Server URL is missing. Please go back and enter the server URL.');
+            onExit();
+            return;
+          }
+          const client = new SocketNetClient(url, {
+            isHost: serverIsHost,
             gameId: gameId ?? null,
             startTimer,
             playerId: id,
@@ -138,7 +155,7 @@ export default function Game({ mode, serverUrl, gameId, startTimer, onExit, onEr
           netClientRef.current = client;
         }
         netClient = netClientRef.current;
-        isHost = false;
+        isHost = serverIsHost;
       }
 
       if (cancelled) {

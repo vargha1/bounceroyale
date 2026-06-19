@@ -26,9 +26,17 @@ export class SocketNetClient implements NetClient {
       // (Engine uses whatever id we pass to it via constructor — we set it before.)
       // Emit our open event so the engine knows we're ready.
       if (opts.isHost) {
-        this.socket.emit('create-game', { startTimer: opts.startTimer ?? 30, serverStartTime: Date.now() + (opts.startTimer ?? 30) * 1000 });
-      } else if (opts.gameId) {
-        this.socket.emit('join-game', { gameId: opts.gameId });
+        // Host: create a new game. Send startTimer + islandSeed/size if we
+        // have them (the engine generates the seed, but at socket-creation
+        // time we don't have it yet — the server generates a fallback).
+        this.socket.emit('create-game', {
+          startTimer: opts.startTimer ?? 30,
+          serverStartTime: Date.now() + (opts.startTimer ?? 30) * 1000,
+        });
+      } else {
+        // Guest: join an existing game. If gameId is null/empty, the server
+        // auto-joins us to the most recent active game (see server.cjs).
+        this.socket.emit('join-game', { gameId: opts.gameId ?? null });
       }
       if (this.socket.id) (this as any).id = this.socket.id;
       this.emit({ type: 'open', id: this.socket.id ?? this.id });
@@ -93,11 +101,16 @@ export class SocketNetClient implements NetClient {
       case 'new-player':
       case 'init':
       case 'game-ended':
-      case 'game-started':
       case 'player-disconnected':
       case 'hexagon-broken':
       case 'hexagon-collided':
         // Server-controlled or handled above; we don't send these from client.
+        break;
+      case 'game-started':
+        // Host broadcasts game-started when the countdown ends. The server
+        // relays it to all players in the room. Include the gameId so the
+        // server knows which room to broadcast to.
+        this.socket.emit('game-started', { gameId: gameIdStore });
         break;
       case 'powerup-collected':
         this.socket.emit('powerup-collected', { gameId: gameIdStore, powerupId: msg.powerupId, playerId: msg.playerId, powerupType: msg.powerupType });

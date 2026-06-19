@@ -561,18 +561,29 @@ export class WebRTCNetHost implements NetClient {
     // original mDNS candidate(s) as low-priority extras so same-machine
     // testing still works (mDNS resolves between two tabs on the same
     // browser).
-    const localSdpInit = pc.localDescription ?? undefined;
-    let sdpToSend = localSdpInit;
+    const localSdp = pc.localDescription;
+    let sdpToSend: RTCSessionDescriptionInit | undefined;
     let extraCandidates: ExtraIceCandidate[] = [];
-    if (manualHostIp && localSdpInit && typeof localSdpInit.sdp === 'string') {
+    if (manualHostIp && localSdp && typeof localSdp.sdp === 'string') {
       // Extract the original mDNS candidates FIRST (before rewriting), so we
       // can ship them as low-priority extras for same-machine testing.
-      extraCandidates = extractMdnsCandidatesAsExtra(localSdpInit.sdp);
+      extraCandidates = extractMdnsCandidatesAsExtra(localSdp.sdp);
       // Rewrite the SDP — replace mDNS hostnames with the manual IP.
-      const rewrittenSdp = rewriteSdpWithManualIp(localSdpInit.sdp, manualHostIp);
-      sdpToSend = { ...localSdpInit, sdp: rewrittenSdp };
+      const rewrittenSdp = rewriteSdpWithManualIp(localSdp.sdp, manualHostIp);
+      // IMPORTANT: Build the RTCSessionDescriptionInit as a PLAIN OBJECT with
+      // explicit `type` and `sdp` fields. Spreading `pc.localDescription`
+      // (an RTCSessionDescription WebIDL object) does NOT reliably copy the
+      // `type` field because it may not be enumerable — and the receiver's
+      // `setRemoteDescription` then fails with "Failed to parse
+      // SessionDescription". Building it explicitly avoids this.
+      sdpToSend = { type: 'offer', sdp: rewrittenSdp };
       console.log(`[HOST] Offer SDP rewritten with manual IP ${manualHostIp}. ` +
         `${extraCandidates.length} mDNS candidate(s) shipped as low-priority extras.`);
+    } else {
+      // No manual IP — send the original local description as-is.
+      sdpToSend = localSdp
+        ? { type: localSdp.type, sdp: localSdp.sdp }
+        : undefined;
     }
 
     const payload = JSON.stringify({
@@ -649,8 +660,18 @@ export class WebRTCNetHost implements NetClient {
     }
 
     console.log('Applying answer for peer:', peerId, '(state:', pc.signalingState + ')');
+    // Defensive: normalize the parsed answer SDP into a clean init object with
+    // explicit type + sdp. Guards against malformed payloads from the guest.
+    const answerSdpInit: RTCSessionDescriptionInit = {
+      type: (parsed.sdp && parsed.sdp.type) ? parsed.sdp.type : 'answer',
+      sdp: (parsed.sdp && typeof parsed.sdp.sdp === 'string') ? parsed.sdp.sdp : '',
+    };
+    if (!answerSdpInit.sdp) {
+      throw new Error('Guest answer SDP is empty or missing. Please ask the guest to regenerate the answer code.');
+    }
+    console.log('[HOST] setRemoteDescription — type:', answerSdpInit.type, 'sdp length:', answerSdpInit.sdp.length);
     try {
-      await pc.setRemoteDescription(parsed.sdp);
+      await pc.setRemoteDescription(answerSdpInit);
     } catch (e: any) {
       // setRemoteDescription failed — the PC is now in a broken state. Tear
       // it down so a subsequent attempt can create a fresh PC.
@@ -692,6 +713,10 @@ export class WebRTCNetHost implements NetClient {
     for (const [pid, pc] of this.pendingOffers.entries()) {
       if (!this.dataChannels.has(pid) || this.dataChannels.get(pid)!.readyState !== 'open') {
         console.log('[HOST] Tearing down stale pending PC for', pid);
+        // Clean up dataChannels IMMEDIATELY so emitPeerChange (fired by
+        // dc.onclose after a delay) doesn't see a stale entry and mistakenly
+        // trigger the host's onPeerChange callback with a non-empty list.
+        this.dataChannels.delete(pid);
         try { pc.close(); } catch { /* ignore */ }
         this.pendingOffers.delete(pid);
         this.peerConns.delete(pid);
@@ -705,11 +730,19 @@ export class WebRTCNetHost implements NetClient {
       if (this.dataChannels.has(pid) && this.dataChannels.get(pid)!.readyState === 'open') continue;
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
         console.log('[HOST] Tearing down failed PC for', pid);
+        this.dataChannels.delete(pid);
         try { pc.close(); } catch { /* ignore */ }
         this.peerConns.delete(pid);
         this.appliedAnswers.delete(pid);
       }
     }
+    // NOTE: We intentionally do NOT call emitPeerChange() here. The new
+    // createOffer() below will add a new peerId to dataChannels (via
+    // bindDataChannel), but that data channel is in "connecting" state, not
+    // "open". Calling emitPeerChange now would emit [newPeerId] with
+    // length > 0, which would trigger the host's onPeerChange callback and
+    // mistakenly start the game. The next legitimate emitPeerChange will
+    // fire when the new data channel actually opens (dc.onopen).
     return this.createOffer(ip);
   }
 
@@ -1159,7 +1192,21 @@ export class WebRTCNetGuest implements NetClient {
     // fine, the SDP still parses cleanly because we only swapped the
     // hostname token. If the host also shipped extra mDNS candidates (for
     // same-machine testing), apply them via addIceCandidate.
-    await this.pc.setRemoteDescription(parsed.sdp);
+    // Defensive: normalize the parsed SDP into a clean RTCSessionDescriptionInit
+    // with explicit type + sdp fields. This guards against malformed payloads
+    // (e.g. if the host's JSON.stringify produced an RTCSessionDescription with
+    // a toJSON that lost the type, or if the SDP was corrupted in transit).
+    // Without this, setRemoteDescription can throw "Failed to parse
+    // SessionDescription" which is hard to debug.
+    const offerSdpInit: RTCSessionDescriptionInit = {
+      type: (parsed.sdp && parsed.sdp.type) ? parsed.sdp.type : 'offer',
+      sdp: (parsed.sdp && typeof parsed.sdp.sdp === 'string') ? parsed.sdp.sdp : '',
+    };
+    if (!offerSdpInit.sdp) {
+      throw new Error('Host offer SDP is empty or missing. Please ask the host to regenerate the invite code.');
+    }
+    console.log('[GUEST] setRemoteDescription — type:', offerSdpInit.type, 'sdp length:', offerSdpInit.sdp.length);
+    await this.pc.setRemoteDescription(offerSdpInit);
     if (parsed.extraCandidates && parsed.extraCandidates.length > 0) {
       console.log('[GUEST] Applying', parsed.extraCandidates.length, 'low-priority mDNS extras from host');
       // Apply asynchronously — don't block the answer generation. Any
@@ -1177,15 +1224,21 @@ export class WebRTCNetGuest implements NetClient {
     // IP, rewrite the local SDP's mDNS hostnames to use it. We also extract
     // the original mDNS candidates as low-priority extras so same-machine
     // testing still works.
-    const localSdpInit = this.pc.localDescription ?? undefined;
-    let sdpToSend = localSdpInit;
+    const localSdp = this.pc.localDescription;
+    let sdpToSend: RTCSessionDescriptionInit | undefined;
     let extraCandidates: ExtraIceCandidate[] = [];
-    if (manualGuestIp && localSdpInit && typeof localSdpInit.sdp === 'string') {
-      extraCandidates = extractMdnsCandidatesAsExtra(localSdpInit.sdp);
-      const rewrittenSdp = rewriteSdpWithManualIp(localSdpInit.sdp, manualGuestIp);
-      sdpToSend = { ...localSdpInit, sdp: rewrittenSdp };
+    if (manualGuestIp && localSdp && typeof localSdp.sdp === 'string') {
+      extraCandidates = extractMdnsCandidatesAsExtra(localSdp.sdp);
+      const rewrittenSdp = rewriteSdpWithManualIp(localSdp.sdp, manualGuestIp);
+      // Build a PLAIN object with explicit type+sdp (see host-side comment
+      // for why we don't spread the RTCSessionDescription directly).
+      sdpToSend = { type: 'answer', sdp: rewrittenSdp };
       console.log(`[GUEST] Answer SDP rewritten with manual IP ${manualGuestIp}. ` +
         `${extraCandidates.length} mDNS candidate(s) shipped as low-priority extras.`);
+    } else {
+      sdpToSend = localSdp
+        ? { type: localSdp.type, sdp: localSdp.sdp }
+        : undefined;
     }
 
     const payload = JSON.stringify({
