@@ -396,6 +396,7 @@ export default function QrScanner({ onDecode, onClose, title = 'Scan QR Code' }:
                 justifyContent: 'center',
                 boxShadow: torchOn ? '0 0 20px rgba(250, 204, 21, 0.6)' : 'none',
                 transition: 'background 0.2s, box-shadow 0.2s',
+                zIndex: 1000
               }}
             >
               🔦
