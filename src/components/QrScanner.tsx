@@ -25,6 +25,9 @@ interface Props {
  *  - Renders the video element full-screen so it's easy to aim at a QR.
  *  - Handles the common error cases (permission denied, no camera, insecure
  *    context) with clear messages.
+ *  - **Flashlight/torch toggle**: if the device supports torch (most phones
+ *    do, desktops usually don't), a 🔦 button appears in the bottom bar so
+ *    the user can turn the LED flash on/off for scanning in low light.
  *
  * Security/privacy:
  *  - Camera access requires HTTPS (or localhost). On http:// the browser
@@ -39,6 +42,10 @@ export default function QrScanner({ onDecode, onClose, title = 'Scan QR Code' }:
   const decodedRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
+  /** Whether the device's camera track supports torch (LED flash). */
+  const [torchSupported, setTorchSupported] = useState(false);
+  /** Whether the torch is currently on. */
+  const [torchOn, setTorchOn] = useState(false);
 
   const stop = useCallback(() => {
     if (rafRef.current !== null) {
@@ -53,6 +60,37 @@ export default function QrScanner({ onDecode, onClose, title = 'Scan QR Code' }:
       streamRef.current = null;
     }
   }, []);
+
+  /**
+   * Toggle the device's LED flash (torch) on/off. Uses the MediaStreamTrack
+   * `torch` constraint via `applyConstraints`. Not all devices support this —
+   * we detect support via `getCapabilities()` after the camera starts and only
+   * show the torch button if supported.
+   *
+   * Common support:
+   *  - Android Chrome: ✓ (most phones with rear LED flash)
+   *  - iOS Safari: ✗ (Apple doesn't expose torch to web pages as of iOS 17)
+   *  - Desktop: ✗ (no LED flash hardware)
+   */
+  const toggleTorch = useCallback(async () => {
+    const stream = streamRef.current;
+    if (!stream) return;
+    const track = stream.getVideoTracks()[0];
+    if (!track) return;
+    try {
+      const caps = track.getCapabilities?.() as MediaTrackCapabilities & { torch?: boolean };
+      if (!caps?.torch) {
+        console.warn('[QR Scanner] Torch not supported on this device.');
+        return;
+      }
+      const next = !torchOn;
+      await track.applyConstraints({ advanced: [{ torch: next } as any] });
+      setTorchOn(next);
+      console.log('[QR Scanner] Torch:', next ? 'ON' : 'OFF');
+    } catch (e) {
+      console.warn('[QR Scanner] Failed to toggle torch:', e);
+    }
+  }, [torchOn]);
 
   // Start the camera + scan loop on mount; stop on unmount.
   useEffect(() => {
@@ -84,6 +122,22 @@ export default function QrScanner({ onDecode, onClose, title = 'Scan QR Code' }:
           return;
         }
         streamRef.current = stream;
+
+        // Detect torch support. `getCapabilities()` is not available on all
+        // browsers (e.g. older Safari), so guard with optional chaining.
+        const track = stream.getVideoTracks()[0];
+        try {
+          const caps = track?.getCapabilities?.() as MediaTrackCapabilities & { torch?: boolean } | undefined;
+          if (caps?.torch) {
+            setTorchSupported(true);
+            console.log('[QR Scanner] Torch is supported on this device.');
+          } else {
+            console.log('[QR Scanner] Torch not supported (desktop or iOS).');
+          }
+        } catch {
+          // getCapabilities not available — torch not supported.
+        }
+
         const video = videoRef.current;
         if (!video) return;
         video.srcObject = stream;
@@ -157,6 +211,12 @@ export default function QrScanner({ onDecode, onClose, title = 'Scan QR Code' }:
           if (code && code.data && !decodedRef.current) {
             decodedRef.current = true;
             console.log('[QR Scanner] Decoded:', code.data.slice(0, 60) + (code.data.length > 60 ? '…' : ''));
+            // Turn off the torch before stopping (some devices keep the LED
+            // on after the track is stopped if we don't explicitly disable it).
+            const track = streamRef.current?.getVideoTracks()[0];
+            if (track) {
+              try { track.applyConstraints({ advanced: [{ torch: false } as any] }); } catch { /* ignore */ }
+            }
             // Stop the camera BEFORE calling onDecode — onDecode will likely
             // unmount this component, and we want to release the camera
             // synchronously to avoid the "camera still on" race.
@@ -182,6 +242,11 @@ export default function QrScanner({ onDecode, onClose, title = 'Scan QR Code' }:
   }, [onDecode, stop]);
 
   const handleClose = useCallback(() => {
+    // Turn off the torch before closing (defensive — see comment in decode handler).
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (track) {
+      try { track.applyConstraints({ advanced: [{ torch: false } as any] }); } catch { /* ignore */ }
+    }
     stop();
     onClose();
   }, [onClose, stop]);
@@ -289,10 +354,53 @@ export default function QrScanner({ onDecode, onClose, title = 'Scan QR Code' }:
         </div>
       )}
 
-      {/* Hint text */}
+      {/* Bottom bar: hint text + flashlight toggle */}
       {ready && !error && (
-        <div style={{ position: 'absolute', bottom: '2rem', left: 0, right: 0, textAlign: 'center', color: '#fff', fontSize: '0.9rem', padding: '0 1rem' }}>
-          Point the camera at the QR code
+        <div
+          style={{
+            position: 'absolute',
+            bottom: 0,
+            left: 0,
+            right: 0,
+            padding: '1rem 1rem max(1rem, env(safe-area-inset-bottom))',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: '0.75rem',
+            background: 'linear-gradient(to top, rgba(0,0,0,0.7), transparent)',
+          }}
+        >
+          <div style={{ color: '#fff', fontSize: '0.9rem', textAlign: 'center' }}>
+            Point the camera at the QR code
+          </div>
+          {/* Flashlight / torch toggle — only shown if the device supports it.
+              Most Android phones with a rear LED flash support this via
+              MediaTrackConstraints.torch. iOS Safari does NOT expose torch
+              (Apple limitation), so the button is hidden on iOS. Desktop
+              browsers don't have a flash, so it's hidden there too. */}
+          {torchSupported && (
+            <button
+              onClick={toggleTorch}
+              aria-label={torchOn ? 'Turn off flashlight' : 'Turn on flashlight'}
+              style={{
+                background: torchOn ? 'rgba(250, 204, 21, 0.9)' : 'rgba(255,255,255,0.15)',
+                border: 'none',
+                color: torchOn ? '#000' : '#fff',
+                width: 56,
+                height: 56,
+                borderRadius: '50%',
+                fontSize: '1.5rem',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                boxShadow: torchOn ? '0 0 20px rgba(250, 204, 21, 0.6)' : 'none',
+                transition: 'background 0.2s, box-shadow 0.2s',
+              }}
+            >
+              🔦
+            </button>
+          )}
         </div>
       )}
 

@@ -269,6 +269,10 @@ export function createGameEngine(opts: EngineOptions) {
   let physicsEnabled = false;
   let isPaused = false;
   let isSpectating = false;
+  /** Which player the camera follows while spectating. null = auto-pick the
+   *  first alive player. Set by switchSpectator() and reset when the spectated
+   *  player dies or disconnects. */
+  let spectateTargetId: string | null = null;
   let cameraAzimuth = 0;
   let lastGroundedTileId: string | null = null;
   let canJump = false;
@@ -1163,6 +1167,19 @@ export function createGameEngine(opts: EngineOptions) {
   }
 
   // ---------- Elimination ----------
+  // The HOST is the single authority for eliminations and ranks in LAN mode.
+  // Flow:
+  //   - A player dies locally (falls off, HP=0) → local engine calls eliminatePlayer(id).
+  //   - If the local player IS the host: compute rank, apply elimination, broadcast
+  //     `player-eliminated` with the rank to all guests.
+  //   - If the local player is a GUEST: send `player-eliminated` with rank=0 to the
+  //     host. The host calls its own eliminatePlayer(id), which computes the rank
+  //     and broadcasts the authoritative elimination to all OTHER guests.
+  //   - Guests receiving `player-eliminated` with rank>0 apply the elimination
+  //     locally using the host's rank (they do NOT recompute or re-broadcast).
+  //
+  // This ensures every peer sees the same ranks in the same order, even if two
+  // players die at nearly the same time (the host serializes them).
   function eliminatePlayer(id: string) {
     const p = players[id];
     if (!p || p.eliminated) return;
@@ -1173,6 +1190,9 @@ export function createGameEngine(opts: EngineOptions) {
       isSpectating = true;
       callbacks.onSpectatingChange(true);
       if (ballRigidBody) ballRigidBody.setEnabled(false);
+      // Pick the first alive player to spectate.
+      const aliveForSpectate = Object.values(players).filter((pp) => !pp.eliminated);
+      spectateTargetId = aliveForSpectate[0]?.id ?? null;
     }
     try { scene.remove(p.mesh); } catch { /* ignore */ }
     try {
@@ -1180,35 +1200,59 @@ export function createGameEngine(opts: EngineOptions) {
     } catch { /* ignore */ }
     if (p.collider) delete colliderHandleToPlayerId[p.collider.handle];
 
-    // Single-player & LAN host: compute rank locally. Server-mode: server sends rank.
-    if (mode === 'single' || mode === 'lan') {
+    // Compute rank: the host (and single-player) is authoritative.
+    // Rank = (number of players still alive AFTER this elimination) + 1.
+    // E.g. 4 players, one dies → 3 alive → rank = 4 (last place).
+    //      2 players, one dies → 1 alive → rank = 2 (second place).
+    //      The last alive player gets rank 1 (winner) in endGame().
+    if (isHost || mode === 'single') {
       const alive = Object.values(players).filter((pp) => !pp.eliminated);
       p.rank = alive.length + 1;
+      console.log(`[ENGINE] Player ${id.slice(0, 8)} eliminated. Rank: ${p.rank}. Alive: ${alive.length}`);
     }
 
     if (netClient && mode !== 'single') {
-      // Host broadcasts elimination with the rank it computed.
       if (isHost) {
+        // Host broadcasts the AUTHORITATIVE elimination with the computed rank.
         netClient.send({ kind: 'player-eliminated', id, rank: p.rank ?? 0 });
       } else {
-        // Guest tells host it died; host will broadcast the rank.
+        // Guest tells the host it died (rank=0 = "please compute my rank").
+        // The host will call eliminatePlayer(id) and broadcast the real rank.
         netClient.send({ kind: 'player-eliminated', id, rank: 0 });
       }
     }
 
-    // End game?
+    // End game check: if <= 1 players are alive, the game is over.
     const alive = Object.values(players).filter((pp) => !pp.eliminated);
     if (alive.length <= 1) {
+      // Assign rank 1 to the winner (if there is one).
+      if (alive[0]) alive[0].rank = 1;
       endGame(alive[0]?.id ?? null);
     }
     pushHud();
   }
 
+  /** Guard against endGame being called multiple times (e.g. host calls it
+   *  locally AND receives a game-ended broadcast). */
+  let gameEnded = false;
+
   function endGame(winner: string | null) {
+    if (gameEnded) return;
+    gameEnded = true;
+    // Ensure the winner has rank 1.
+    if (winner) {
+      const wp = players[winner];
+      if (wp && !wp.rank) wp.rank = 1;
+    }
     const rankings = Object.values(players)
       .map((p) => ({ id: p.id, rank: p.rank ?? null }))
       .sort((a, b) => (a.rank ?? 99) - (b.rank ?? 99));
+    console.log('[ENGINE] endGame. Winner:', winner?.slice(0, 8) ?? 'none', 'Rankings:', rankings.map((r) => `${r.id.slice(0, 6)}:#${r.rank}`).join(', '));
     callbacks.onEndGame(rankings, winner);
+    // Host broadcasts game-ended so all guests show the end screen.
+    if (netClient && mode !== 'single' && isHost) {
+      netClient.send({ kind: 'game-ended', winner });
+    }
   }
 
   // ---------- Networking ----------
@@ -1272,8 +1316,21 @@ export function createGameEngine(opts: EngineOptions) {
           // host generated its own island in start()).
           const shouldProcessInit = !isHost || mode === 'server';
           if (shouldProcessInit) {
-            serverStartTime = ev.data.serverStartTime;
+            // CLOCK-SKEW FIX: do NOT copy the host's `serverStartTime` verbatim.
+            // The host computed it as `hostNow + timer*1000` using the HOST's
+            // wall clock. If the guest's clock differs from the host's (which
+            // is common — phones, laptops, and servers rarely have perfectly
+            // synced clocks), the guest's `remaining = serverStartTime -
+            // guestNow` would be wildly wrong (e.g. 3637 seconds instead of 30).
+            //
+            // Instead, compute our OWN serverStartTime using our OWN clock +
+            // the startTimer duration. This makes the countdown UI correct on
+            // every device regardless of clock skew. The actual physics-enable
+            // moment is already synchronized via the host's `game-started`
+            // broadcast (guests don't enable physics on their own countdown),
+            // so using different clocks for the UI is safe.
             startTimerValue = ev.data.startTimer;
+            serverStartTime = Date.now() + startTimerValue * 1000;
             // Re-generate the island from the host's/server's seed + size so
             // both peers have the exact same layout.
             islandSeed = ev.data.islandSeed;
@@ -1346,20 +1403,43 @@ export function createGameEngine(opts: EngineOptions) {
         case 'player-eliminated': {
           const p = players[ev.data.id];
           if (p && !p.eliminated) {
-            p.eliminated = true;
-            p.rank = ev.data.rank || (Object.values(players).filter((pp) => !pp.eliminated).length + 1);
-            if (ev.data.id === localPlayerId) {
-              isSpectating = true;
-              callbacks.onSpectatingChange(true);
-              if (ballRigidBody) ballRigidBody.setEnabled(false);
+            if (isHost && ev.data.rank === 0) {
+              // A guest is telling us it died (rank=0 = "please compute my
+              // rank"). As the host, we're the authority — call our own
+              // eliminatePlayer(id), which computes the rank, applies the
+              // elimination locally, AND broadcasts the authoritative
+              // elimination (with the real rank) to all OTHER guests.
+              eliminatePlayer(ev.data.id);
+            } else if (ev.data.rank > 0) {
+              // We're a guest receiving the host's AUTHORITATIVE elimination
+              // broadcast (rank > 0). Apply the elimination locally using the
+              // host's rank. Do NOT recompute or re-broadcast — the host is
+              // the authority and has already informed everyone.
+              p.eliminated = true;
+              p.rank = ev.data.rank;
+              createParticleEffect(p.mesh.position, 0xff4444, 22);
+              if (ev.data.id === localPlayerId) {
+                isSpectating = true;
+                callbacks.onSpectatingChange(true);
+                if (ballRigidBody) ballRigidBody.setEnabled(false);
+                // Pick the first alive player to spectate.
+                const aliveForSpectate = Object.values(players).filter((pp) => !pp.eliminated);
+                spectateTargetId = aliveForSpectate[0]?.id ?? null;
+              }
+              try { scene.remove(p.mesh); } catch { /* ignore */ }
+              try {
+                if (p.rigidBody) world.removeRigidBody(p.rigidBody);
+              } catch { /* ignore */ }
+              if (p.collider) delete colliderHandleToPlayerId[p.collider.handle];
+              const alive = Object.values(players).filter((pp) => !pp.eliminated);
+              if (alive.length <= 1) {
+                if (alive[0]) alive[0].rank = 1;
+                endGame(alive[0]?.id ?? null);
+              }
+              pushHud();
             }
-            try { scene.remove(p.mesh); } catch { /* ignore */ }
-            try {
-              if (p.rigidBody) world.removeRigidBody(p.rigidBody);
-            } catch { /* ignore */ }
-            const alive = Object.values(players).filter((pp) => !pp.eliminated);
-            if (alive.length <= 1) endGame(alive[0]?.id ?? null);
-            pushHud();
+            // If rank === 0 and we're NOT the host, ignore — the host will
+            // process it and broadcast the authoritative rank back to us.
           }
           break;
         }
@@ -1371,8 +1451,16 @@ export function createGameEngine(opts: EngineOptions) {
               if (p.rigidBody) world.removeRigidBody(p.rigidBody);
             } catch { /* ignore */ }
             delete players[ev.data.id];
+            // If the spectated target disconnected, auto-switch to another
+            // alive player.
+            if (spectateTargetId === ev.data.id) {
+              spectateTargetId = null;
+            }
             const alive = Object.values(players).filter((pp) => !pp.eliminated);
-            if (alive.length <= 1) endGame(alive[0]?.id ?? null);
+            if (alive.length <= 1) {
+              if (alive[0]) alive[0].rank = 1;
+              endGame(alive[0]?.id ?? null);
+            }
             pushHud();
           }
           break;
@@ -1791,11 +1879,17 @@ export function createGameEngine(opts: EngineOptions) {
   }
 
   function updateCamera(dt: number) {
-    // Determine follow target
+    // Determine follow target.
     let targetId: string | null = localPlayerId;
     if (isSpectating) {
       const alive = Object.values(players).filter((p) => !p.eliminated);
-      targetId = alive[0]?.id ?? null;
+      // If our current spectate target is dead, gone, or unset, auto-pick
+      // the first alive player. This handles the case where the spectated
+      // player dies or disconnects mid-spectate.
+      if (!spectateTargetId || !players[spectateTargetId] || players[spectateTargetId].eliminated) {
+        spectateTargetId = alive[0]?.id ?? null;
+      }
+      targetId = spectateTargetId;
     }
     if (!targetId || !players[targetId]) return;
     const tp = players[targetId].mesh.position;
@@ -1810,7 +1904,9 @@ export function createGameEngine(opts: EngineOptions) {
     const desiredX = tp.x - offsetDistance * Math.cos(cameraAzimuth);
     const desiredY = tp.y + offsetHeight;
     const desiredZ = tp.z - offsetDistance * Math.sin(cameraAzimuth);
-    // Smooth camera follow using dt-independent lerp factor
+    // Smooth camera follow using dt-independent lerp factor. The smoothing
+    // also handles spectate switches gracefully — instead of instantly
+    // teleporting the camera, it glides to the new target.
     const k = 1 - Math.exp(-dt * 12);
     camera.position.x += (desiredX - camera.position.x) * k;
     camera.position.y += (desiredY - camera.position.y) * k;
@@ -1844,18 +1940,19 @@ export function createGameEngine(opts: EngineOptions) {
     if (!isSpectating) return;
     const alive = Object.values(players).filter((p) => !p.eliminated);
     if (alive.length < 2) return;
-    // Find current target (closest mesh to camera) and move to next
-    let curIdx = 0;
-    let bestDist = Infinity;
-    alive.forEach((p, i) => {
-      const d = p.mesh.position.distanceTo(camera.position);
-      if (d < bestDist) { bestDist = d; curIdx = i; }
-    });
+    // Sort by id for a STABLE, predictable order. The old code used camera
+    // distance to guess the "current" target, which was unreliable because
+    // the camera smoothly follows the target and might be far from it by the
+    // time the user presses switch.
+    alive.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    let curIdx = alive.findIndex((p) => p.id === spectateTargetId);
+    if (curIdx < 0) curIdx = 0;
     const next = alive[(curIdx + 1) % alive.length];
     if (next) {
-      const pos = next.mesh.position;
-      camera.position.set(pos.x - 12, pos.y + 8, pos.z - 12);
-      camera.lookAt(pos);
+      spectateTargetId = next.id;
+      // Don't instantly teleport the camera — updateCamera() will smoothly
+      // glide to the new target. This avoids the jarring jump of the old code.
+      console.log('[ENGINE] Spectate target switched to:', next.id.slice(0, 8));
     }
   }
   function updateSettings(s: Settings) {
