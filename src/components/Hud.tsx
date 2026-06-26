@@ -20,9 +20,17 @@ const POWERUP_LABELS: Record<string, string> = {
   health_regen: '❤️ Regen',
 };
 
+const WEAPON_NAMES: Record<string, string> = {
+  ak47: 'AK-47',
+  desert_eagle: 'Desert Eagle',
+};
+
 export default function Hud({ hud, fps, showFps, localPlayerId, mode, onPause, onSwitchSpectate, spectating }: Props) {
   const { language } = useSettings();
   const lang = language;
+
+  const weaponName = WEAPON_NAMES[hud.weapon] ?? hud.weapon;
+  const ammoPct = hud.maxAmmo > 0 ? hud.ammo / hud.maxAmmo : 0;
 
   return (
     <div className="hud">
@@ -82,7 +90,25 @@ export default function Hud({ hud, fps, showFps, localPlayerId, mode, onPause, o
         </div>
       </div>
 
-      {/* Spectate switch button — for mobile (no Tab key) */}
+      {/* Weapon display — bottom center */}
+      <div className="hud-weapon">
+        <div className="weapon-name">{weaponName}</div>
+        <div className="ammo-display">
+          <span className={`ammo-count ${ammoPct <= 0.2 ? 'low' : ammoPct <= 0.5 ? 'mid' : ''}`}>
+            {hud.ammo}
+          </span>
+          <span className="ammo-separator">/</span>
+          <span className="ammo-max">{hud.maxAmmo}</span>
+        </div>
+        {hud.isReloading && (
+          <div className="reload-bar">
+            <div className="reload-bar-fill" style={{ width: `${hud.reloadProgress * 100}%` }} />
+          </div>
+        )}
+        <div className="weapon-switch-hint">[1] AK-47 · [2] Desert Eagle · [R] Reload</div>
+      </div>
+
+      {/* Spectate switch button — for mobile (no V key) */}
       {spectating && onSwitchSpectate && (
         <button
           className="spectate-switch-btn"

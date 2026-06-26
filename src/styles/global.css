@@ -1253,3 +1253,147 @@ body.rtl .toast {
 .center {
   text-align: center;
 }
+/* ===== Crosshair ===== */
+.crosshair {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 15;
+  pointer-events: none;
+}
+
+.crosshair-dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.8);
+}
+
+.crosshair-line {
+  position: absolute;
+  background: rgba(255, 255, 255, 0.7);
+  box-shadow: 0 0 3px rgba(0, 0, 0, 0.7);
+}
+
+.crosshair-top {
+  width: 2px;
+  height: 10px;
+  top: -16px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.crosshair-bottom {
+  width: 2px;
+  height: 10px;
+  bottom: -16px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.crosshair-left {
+  width: 10px;
+  height: 2px;
+  left: -16px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.crosshair-right {
+  width: 10px;
+  height: 2px;
+  right: -16px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+/* ===== Weapon HUD ===== */
+.hud-weapon {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  z-index: 10;
+  pointer-events: none;
+}
+
+.weapon-name {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--accent);
+  text-shadow: 0 0 8px rgba(192, 132, 252, 0.5);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.ammo-display {
+  font-size: 1.5rem;
+  font-weight: 800;
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.6);
+}
+
+.ammo-count {
+  color: #fff;
+}
+
+.ammo-count.low {
+  color: #ef4444;
+  animation: pulse-red 0.5s ease-in-out infinite alternate;
+}
+
+.ammo-count.mid {
+  color: #f59e0b;
+}
+
+.ammo-separator {
+  color: rgba(255, 255, 255, 0.4);
+  margin: 0 2px;
+}
+
+.ammo-max {
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 1rem;
+}
+
+.reload-bar {
+  width: 120px;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.reload-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  border-radius: 2px;
+  transition: width 0.1s linear;
+}
+
+.weapon-switch-hint {
+  font-size: 0.6rem;
+  color: rgba(255, 255, 255, 0.35);
+  margin-top: 2px;
+}
+
+@keyframes pulse-red {
+  from { opacity: 1; }
+  to { opacity: 0.5; }
+}
+
+/* ===== Player name labels ===== */
+.player-name-label {
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+  transition: opacity 0.2s;
+}

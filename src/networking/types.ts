@@ -143,6 +143,19 @@ export type StartCountdownMessage = {
   startTimer: number;
 };
 
+/** A player shot a weapon. Broadcast so all peers can render muzzle flash / hit effects. */
+export type PlayerShotMessage = {
+  kind: 'player-shot';
+  /** ID of the player who fired. */
+  id: string;
+  /** Weapon type: 'ak47' or 'desert_eagle'. */
+  weapon: string;
+  /** Direction the shot was fired (normalized). */
+  direction: { x: number; y: number; z: number };
+  /** Origin of the shot (player position). */
+  origin: { x: number; y: number; z: number };
+};
+
 export type NetMessage =
   | MoveMessage
   | JumpMessage
@@ -161,7 +174,8 @@ export type NetMessage =
   | PowerupCollectedMessage
   | PowerupRespawnedMessage
   | PeerListMessage
-  | StartCountdownMessage;
+  | StartCountdownMessage
+  | PlayerShotMessage;
 
 export type NetEvent =
   | { type: 'open'; id: string }
@@ -182,6 +196,7 @@ export type NetEvent =
   | { type: 'powerup-respawned'; data: Omit<PowerupRespawnedMessage, 'kind'> }
   | { type: 'peer-list'; data: Omit<PeerListMessage, 'kind'> }
   | { type: 'start-countdown'; data: Omit<StartCountdownMessage, 'kind'> }
+  | { type: 'player-shot'; data: Omit<PlayerShotMessage, 'kind'> }
   | { type: 'error'; message: string }
   | { type: 'close' };
 

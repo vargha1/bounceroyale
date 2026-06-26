@@ -35,6 +35,11 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     aliveCount: 1,
     totalPlayers: 1,
     isHost: mode === 'single' || mode === 'lan' || !!isHostProp,
+    weapon: 'ak47',
+    ammo: 30,
+    maxAmmo: 30,
+    isReloading: false,
+    reloadProgress: 0,
   });
   const [countdown, setCountdown] = useState<number | null>(null);
   const [spectating, setSpectating] = useState(false);
@@ -48,6 +53,7 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     joyStart: { x: 0, y: 0 },
     lookId: null as number | null,
     lastLookX: 0,
+    lastLookY: 0,
   }).current;
 
   const [mobileStick, setMobileStick] = useState({
@@ -57,8 +63,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
   const jumpBtnRef = useRef<HTMLButtonElement | null>(null);
 
   // Centralized exit: closes the net client (if any) and notifies parent.
-  // Defined before the main useEffect so the engine's onConnectionLost
-  // callback can close over it.
   const exitGame = useCallback(() => {
     const client = netClientRef.current;
     if (client) {
@@ -69,11 +73,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
   }, [onExit]);
 
   // NOTE: We intentionally do NOT auto-close the net client on unmount here.
-  // React StrictMode in dev double-invokes effects (mount → cleanup → mount),
-  // and any "close on unmount" logic would close the client during the first
-  // cleanup, breaking the second mount. Instead, the net client is closed
-  // explicitly when the user exits the game (via onExit / PauseModal exit),
-  // and on real page unload via the beforeunload listener below.
   useEffect(() => {
     const onUnload = () => {
       const client = netClientRef.current;
@@ -97,12 +96,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     async function init() {
       // Determine host status and create the network client if needed
       if (mode === 'lan') {
-        // Take ownership of the net client created by the LanModal. Both
-        // BroadcastChannel (quick local) and WebRTC (cross-device) clients
-        // are stashed in the same global slot.
-        // NOTE: React StrictMode double-invokes effects in dev. We stash the
-        // client on the ref so the second mount can reuse it instead of
-        // finding the global empty and erroring out.
         let pending = (window as any).__bounceroyale_pendingNet as NetClient | undefined;
         if (netClientRef.current) {
           pending = netClientRef.current;
@@ -122,11 +115,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
           isHost = netClient.isHost;
         }
       } else if (mode === 'server') {
-        // Server mode: the user is the host if they clicked "Create Game"
-        // (isHostProp === true), or a guest if they clicked "Join Game"
-        // (isHostProp === false). The previous code hardcoded `isHost: false`
-        // which meant the host never sent `create-game` to the server and the
-        // game never started. Fixed by passing isHostProp through from App.
         const serverIsHost = !!isHostProp;
         if (!netClientRef.current) {
           const id = `pending-${Math.random().toString(36).slice(2, 8)}`;
@@ -135,11 +123,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
             onExit();
             return;
           }
-          // The SocketNetClient constructor normalizes the URL internally:
-          //   - prepends http(s):// if the user entered a bare host:port
-          //   - auto-upgrades http→https on HTTPS pages (mixed-content protection)
-          //   - converts ws://→http:// and wss://→https://
-          // So we just pass the raw user-entered URL here.
           const client = new SocketNetClient(serverUrl, {
             isHost: serverIsHost,
             gameId: gameId ?? null,
@@ -158,7 +141,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
       }
 
       if (cancelled) {
-        // If the component unmounted before we finished, clean up the client.
         return;
       }
 
@@ -179,11 +161,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
             setTimeout(() => exitGame(), 1200);
           },
           onReset: () => {
-            // Engine's match state has been reset (either because the user
-            // clicked Restart, or because a re-init arrived from the host).
-            // Clear our local React UI state so the end-game modal, spectating
-            // banner, pause modal, and countdown are all dismissed — the new
-            // match will re-push them as needed.
             setEndGame(null);
             setSpectating(false);
             setPaused(false);
@@ -195,11 +172,16 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
       setLocalPlayerId(engine.getLocalPlayerId());
       engine.start();
 
-      
       // Attach canvas
       const canvas = engine.getCanvas();
       if (canvasWrapRef.current) {
         canvasWrapRef.current.appendChild(canvas);
+      }
+
+      // Attach CSS2D renderer element
+      const css2dEl = engine.getCss2dElement();
+      if (canvasWrapRef.current && css2dEl) {
+        canvasWrapRef.current.appendChild(css2dEl);
       }
 
       const onTouchStart = (e: TouchEvent) => {
@@ -208,7 +190,7 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         for (let i = 0; i < e.changedTouches.length; i++) {
           const touch = e.changedTouches[i];
           const target = touch.target as HTMLElement | null;
-          if (target?.closest('.jump-btn') || target?.closest('.pause-btn') || target?.closest('.spectate-switch-btn')) continue;
+          if (target?.closest('.jump-btn') || target?.closest('.pause-btn') || target?.closest('.spectate-switch-btn') || target?.closest('.fire-btn')) continue;
 
           if (touch.clientX < w * 0.45) {
             mobileTouchState.joyId = touch.identifier;
@@ -217,6 +199,9 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
           } else {
             mobileTouchState.lookId = touch.identifier;
             mobileTouchState.lastLookX = touch.clientX;
+            mobileTouchState.lastLookY = touch.clientY;
+            // Start firing on right-side touch
+            engine.setFiring(true);
           }
         }
       };
@@ -226,7 +211,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         for (let i = 0; i < e.changedTouches.length; i++) {
           const touch = e.changedTouches[i];
           if (touch.identifier === mobileTouchState.joyId || touch.clientX < window.innerWidth * 0.45) {
-            // Re-claim if Android reassigned the identifier
             if (touch.clientX < window.innerWidth * 0.45) mobileTouchState.joyId = touch.identifier;
             const dx = (touch.clientX - mobileTouchState.joyStart.x) / 50;
             const dy = (touch.clientY - mobileTouchState.joyStart.y) / 50;
@@ -236,8 +220,11 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
             setMobileStick(prev => ({ ...prev, x: cx * 30, y: cy * 30 }));
           } else if (touch.identifier === mobileTouchState.lookId) {
             const dx = touch.clientX - mobileTouchState.lastLookX;
+            const dy = touch.clientY - mobileTouchState.lastLookY;
             mobileTouchState.lastLookX = touch.clientX;
+            mobileTouchState.lastLookY = touch.clientY;
             engine.addLookDelta(dx * 0.006);
+            engine.addLookDeltaY(dy * 0.006);
           }
         }
       };
@@ -252,6 +239,7 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
             setMobileStick({ vis: false, x: 0, y: 0, baseX: 0, baseY: 0 });
           } else if (touch.identifier === mobileTouchState.lookId) {
             mobileTouchState.lookId = null;
+            engine.setFiring(false);
           }
         }
       };
@@ -283,7 +271,8 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
           if (!paused) setPaused(true);
           return;
         }
-        if (e.key === 'Tab' && spectating) {
+        // Changed from Tab to V for spectate switching (Tab does browser things)
+        if ((e.key === 'v' || e.key === 'V') && spectating) {
           e.preventDefault();
           engine.switchSpectator();
           return;
@@ -294,6 +283,12 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
           engine.setInput(k as 'w' | 'a' | 's' | 'd', true);
         } else if (e.key === ' ') {
           engine.setInput('space', true);
+        } else if (k === '1') {
+          engine.switchWeapon('ak47');
+        } else if (k === '2') {
+          engine.switchWeapon('desert_eagle');
+        } else if (k === 'r') {
+          engine.startReload();
         }
         if (settings.pointerLock && !paused) {
           const canvas2 = engine.getCanvas();
@@ -311,7 +306,37 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
       const onMouseMove = (e: MouseEvent) => {
         if (paused) return;
         const dx = (e as any).movementX || 0;
+        const dy = (e as any).movementY || 0;
         engine.addLookDelta(dx * 0.002);
+        engine.addLookDeltaY(dy * 0.002);
+      };
+      const onMouseDown = (e: MouseEvent) => {
+        if (paused || spectating) return;
+        if (e.button === 0) { // Left click = fire
+          engine.setFiring(true);
+          engine.ensureAudio();
+        }
+        // Request pointer lock on click
+        if (settings.pointerLock) {
+          const canvas2 = engine.getCanvas();
+          if (canvas2.requestPointerLock) canvas2.requestPointerLock();
+        }
+      };
+      const onMouseUp = (e: MouseEvent) => {
+        if (e.button === 0) {
+          engine.setFiring(false);
+        }
+      };
+      const onWheel = (e: WheelEvent) => {
+        if (paused || spectating) return;
+        if (e.deltaY > 0) {
+          // Scroll down = switch to next weapon
+          const current = engine.getCurrentWeapon();
+          engine.switchWeapon(current === 'ak47' ? 'desert_eagle' : 'ak47');
+        } else {
+          const current = engine.getCurrentWeapon();
+          engine.switchWeapon(current === 'ak47' ? 'desert_eagle' : 'ak47');
+        }
       };
       const onResize = () => engine.resize();
       const onContext = (e: Event) => e.preventDefault();
@@ -319,16 +344,21 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
       window.addEventListener('keydown', onKeyDown);
       window.addEventListener('keyup', onKeyUp);
       window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mousedown', onMouseDown);
+      window.addEventListener('mouseup', onMouseUp);
+      window.addEventListener('wheel', onWheel);
       window.addEventListener('resize', onResize);
       const canvas3 = engine.getCanvas();
       canvas3.addEventListener('contextmenu', onContext);
 
-      // Cleanup — this runs on every StrictMode remount in dev, but the
-      // netClient is preserved on netClientRef so we can re-create the engine.
+      // Cleanup
       return () => {
         window.removeEventListener('keydown', onKeyDown);
         window.removeEventListener('keyup', onKeyUp);
         window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mousedown', onMouseDown);
+        window.removeEventListener('mouseup', onMouseUp);
+        window.removeEventListener('wheel', onWheel);
         window.removeEventListener('resize', onResize);
         canvas3.removeEventListener('contextmenu', onContext);
         window.clearInterval(fpsInterval);
@@ -371,22 +401,10 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     engineRef.current?.switchSpectator();
   }, []);
 
-  // ---- Restart handling ----
-  // Restart is supported in single-player and when this client is the LAN host.
-  // LAN guests can't initiate a restart (only the host can — guests are
-  // auto-restarted when the host broadcasts a fresh init). Server mode isn't
-  // supported because the server is authoritative for the island seed.
-  //
-  // NOTE: in LAN mode, host status is determined by the net client
-  // (WebRTCNetHost vs WebRTCNetGuest), NOT by `isHostProp` (which is only
-  // meaningful in server mode). The engine pushes the correct `isHost` value
-  // to the HUD via pushHud(), so we read it from there.
   const canRestart = mode === 'single' || (mode === 'lan' && hud.isHost);
   const handleRestart = useCallback(() => {
     const engine = engineRef.current;
     if (!engine) return;
-    // Defensive: shouldn't happen because the button is hidden, but check
-    // anyway in case canRestart logic is wrong.
     if (mode === 'server') {
       onError(t('restartOnlyHost', lang));
       return;
@@ -395,8 +413,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
       onError(t('restartOnlyHost', lang));
       return;
     }
-    // The engine's restart() will call onReset, which clears endGame/paused/
-    // spectating/countdown in our React state — so we don't need to do it here.
     const ok = engine.restart();
     if (!ok) {
       onError(t('restartOnlyHost', lang));
@@ -437,10 +453,19 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
           }} />
         </div>
       )}
-      {/* <MobileControls onJoystick={handleJoystick} onJump={handleJump} onLook={handleLook} disabled={spectating || paused || !!endGame} /> */}
       {countdown !== null && <div className="countdown">{countdown}</div>}
       {spectating && !endGame && <div className="spectator-banner">👁 {t('spectating', lang)}</div>}
       <div className="controls-hint">{t('controlsHint', lang)}</div>
+      {/* Crosshair */}
+      {!spectating && !paused && !endGame && (
+        <div className="crosshair">
+          <div className="crosshair-dot" />
+          <div className="crosshair-line crosshair-top" />
+          <div className="crosshair-line crosshair-bottom" />
+          <div className="crosshair-line crosshair-left" />
+          <div className="crosshair-line crosshair-right" />
+        </div>
+      )}
       {paused && !endGame && (
         <PauseModal
           onResume={() => setPaused(false)}
@@ -465,4 +490,3 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     </div>
   );
 }
-

@@ -25,6 +25,7 @@
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d';
 import { Tween, Group, Easing } from '@tweenjs/tween.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 
 import type { NetClient, NetMessage, NetEvent } from '../networking/types';
 import type { Settings } from '../store/settings';
@@ -36,6 +37,43 @@ const PHYSICS_HZ = 60;
 const PHYSICS_DT = 1 / PHYSICS_HZ;
 const MAX_STEPS_PER_FRAME = 5; // safety cap to prevent spiral-of-death
 const PLAYER_RADIUS = 0.5;
+const PLAYER_HEIGHT = 1.8; // First-person eye height
+
+// ---------- Weapon Definitions ----------
+type WeaponType = 'ak47' | 'desert_eagle';
+interface WeaponDef {
+  name: string;
+  damage: number;
+  fireRate: number; // shots per second
+  maxAmmo: number;
+  reloadTime: number; // seconds
+  spread: number; // radians
+  range: number;
+  knockback: number;
+}
+const WEAPONS: Record<WeaponType, WeaponDef> = {
+  ak47: {
+    name: 'AK-47',
+    damage: 15,
+    fireRate: 10,
+    maxAmmo: 30,
+    reloadTime: 2.5,
+    spread: 0.04,
+    range: 50,
+    knockback: 3,
+  },
+  desert_eagle: {
+    name: 'Desert Eagle',
+    damage: 45,
+    fireRate: 2.5,
+    maxAmmo: 7,
+    reloadTime: 1.8,
+    spread: 0.015,
+    range: 70,
+    knockback: 8,
+  },
+};
+const WEAPON_SWITCH_TIME = 0.4; // seconds to switch weapon
 
 // Island tile geometry — smaller than the old hexagons so destruction feels granular.
 const TILE_RADIUS = 0.6;
@@ -96,6 +134,11 @@ export interface EngineHudState {
   aliveCount: number;
   totalPlayers: number;
   isHost: boolean;
+  weapon: WeaponType;
+  ammo: number;
+  maxAmmo: number;
+  isReloading: boolean;
+  reloadProgress: number; // 0..1
 }
 
 export interface EngineOptions {
@@ -137,6 +180,15 @@ export function createGameEngine(opts: EngineOptions) {
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.1;
+
+  // CSS2D renderer for player name labels
+  const css2dRenderer = new CSS2DRenderer();
+  css2dRenderer.setSize(window.innerWidth, window.innerHeight);
+  css2dRenderer.domElement.style.position = 'absolute';
+  css2dRenderer.domElement.style.top = '0';
+  css2dRenderer.domElement.style.left = '0';
+  css2dRenderer.domElement.style.pointerEvents = 'none';
+  renderer.domElement.style.position = 'relative';
 
   // Lighting
   const ambient = new THREE.AmbientLight(0x6a6a8a, 0.6);
@@ -227,6 +279,9 @@ export function createGameEngine(opts: EngineOptions) {
     color: number;
     targetPosition: { x: number; y: number; z: number };
     targetRotation: { x: number; y: number; z: number; w: number };
+    nameLabel?: CSS2DObject;
+    weaponGroup?: THREE.Group;
+    muzzleFlash?: THREE.PointLight;
   };
   /**
    * A powerup pickup scattered on the map. Players collect these by moving
@@ -302,6 +357,24 @@ export function createGameEngine(opts: EngineOptions) {
   let joystickX = 0;
   let joystickY = 0;
   let lookDelta = 0; // accumulated mouse/touch delta for camera
+  let lookDeltaY = 0; // vertical look delta for FPS camera
+
+  // Weapon state
+  let currentWeapon: WeaponType = 'ak47';
+  let ammo: number = WEAPONS.ak47.maxAmmo;
+  let isReloading = false;
+  let reloadStartTime = 0;
+  let lastFireTime = 0;
+  let isSwitchingWeapon = false;
+  let weaponSwitchStartTime = 0;
+  let pendingWeapon: WeaponType | null = null;
+  let isFiring = false; // mouse held down
+  let weaponRecoilOffset = 0;
+  let weaponBobTime = 0;
+  let muzzleFlashTimer = 0;
+
+  // FPS camera pitch
+  let cameraPitch = -0.3; // slight downward look
 
   // Game start
   let serverStartTime: number | null = opts.serverStartTime ?? null;
@@ -325,6 +398,7 @@ export function createGameEngine(opts: EngineOptions) {
 
   // ---------- Helpers ----------
   function pushHud() {
+    const wdef = WEAPONS[currentWeapon];
     callbacks.onState({
       score: playerScore,
       health: Math.round(playerHealth),
@@ -334,6 +408,11 @@ export function createGameEngine(opts: EngineOptions) {
       aliveCount: Object.values(players).filter((p) => !p.eliminated).length,
       totalPlayers: Object.keys(players).length,
       isHost,
+      weapon: currentWeapon,
+      ammo,
+      maxAmmo: wdef.maxAmmo,
+      isReloading,
+      reloadProgress: isReloading ? Math.min(1, (performance.now() - reloadStartTime) / (wdef.reloadTime * 1000)) : 0,
     });
   }
 
@@ -1033,6 +1112,29 @@ export function createGameEngine(opts: EngineOptions) {
     mesh.position.set(pos.x, pos.y, pos.z);
     scene.add(mesh);
 
+    // Player name label (Minecraft-style, above head)
+    const nameDiv = document.createElement('div');
+    nameDiv.className = 'player-name-label';
+    nameDiv.textContent = id.length > 10 ? id.slice(0, 10) + '...' : id;
+    nameDiv.style.cssText = 'background: rgba(0,0,0,0.6); color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-family: monospace; white-space: nowrap; text-align: center; pointer-events: none; user-select: none;';
+    const nameLabel = new CSS2DObject(nameDiv);
+    nameLabel.position.set(0, PLAYER_RADIUS + 0.6, 0);
+    mesh.add(nameLabel);
+
+    // Weapon group for this player (visible on remote players)
+    const weaponGroup = new THREE.Group();
+    weaponGroup.position.set(0.3, 0.1, -0.5); // offset to the right and forward
+    mesh.add(weaponGroup);
+
+    // Muzzle flash light
+    const muzzleFlash = new THREE.PointLight(0xffaa00, 0, 5);
+    muzzleFlash.position.set(0.3, 0.1, -1.0);
+    mesh.add(muzzleFlash);
+
+    // Build a simple weapon mesh for remote players
+    const remoteWeaponMesh = buildWeaponMesh('ak47');
+    weaponGroup.add(remoteWeaponMesh);
+
     let rigidBody: RAPIER.RigidBody | undefined;
     let collider: RAPIER.Collider | undefined;
     try {
@@ -1064,8 +1166,302 @@ export function createGameEngine(opts: EngineOptions) {
     } catch (e) {
       console.error('Failed to create sphere physics', e);
     }
-    players[id] = { id, mesh, rigidBody, collider, eliminated: false, color, targetPosition: pos, targetRotation: { x: 0, y: 0, z: 0, w: 1 } };
+    players[id] = { id, mesh, rigidBody, collider, eliminated: false, color, targetPosition: pos, targetRotation: { x: 0, y: 0, z: 0, w: 1 }, nameLabel, weaponGroup, muzzleFlash };
     pushHud();
+  }
+
+  /** Build a simple geometric weapon mesh */
+  function buildWeaponMesh(type: WeaponType): THREE.Group {
+    const group = new THREE.Group();
+    const gunMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.3, metalness: 0.8 });
+    const woodMat = new THREE.MeshStandardMaterial({ color: 0x8B4513, roughness: 0.7, metalness: 0.1 });
+
+    if (type === 'ak47') {
+      // Barrel
+      const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.04, 0.6), gunMat);
+      barrel.position.set(0, 0, -0.3);
+      group.add(barrel);
+      // Body
+      const body = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.08, 0.3), gunMat);
+      body.position.set(0, -0.02, 0.05);
+      group.add(body);
+      // Stock
+      const stock = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.06, 0.2), woodMat);
+      stock.position.set(0, -0.02, 0.25);
+      group.add(stock);
+      // Magazine
+      const mag = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.12, 0.06), gunMat);
+      mag.position.set(0, -0.1, 0.05);
+      mag.rotation.x = 0.15;
+      group.add(mag);
+    } else {
+      // Desert Eagle - pistol shape
+      // Barrel
+      const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.03, 0.35), gunMat);
+      barrel.position.set(0, 0, -0.17);
+      group.add(barrel);
+      // Body/Slide
+      const slide = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.06, 0.25), gunMat);
+      slide.position.set(0, -0.01, 0.0);
+      group.add(slide);
+      // Grip
+      const grip = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.1, 0.05), woodMat);
+      grip.position.set(0, -0.08, 0.1);
+      grip.rotation.x = 0.3;
+      group.add(grip);
+    }
+    return group;
+  }
+
+  // ---------- FPS Weapon View Model ----------
+  // A separate scene rendered on top for the first-person weapon
+  const fpsWeaponScene = new THREE.Scene();
+  const fpsWeaponCamera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 10);
+  fpsWeaponCamera.position.set(0, 0, 0);
+  const fpsAmbient = new THREE.AmbientLight(0xffffff, 0.5);
+  fpsWeaponScene.add(fpsAmbient);
+  const fpsDirLight = new THREE.DirectionalLight(0xffe4b5, 1.0);
+  fpsDirLight.position.set(1, 2, 1);
+  fpsWeaponScene.add(fpsDirLight);
+
+  let fpsWeaponGroup = new THREE.Group();
+  fpsWeaponScene.add(fpsWeaponGroup);
+  let currentFpsWeaponMesh: THREE.Group | null = null;
+
+  function setFpsWeapon(type: WeaponType) {
+    if (currentFpsWeaponMesh) {
+      fpsWeaponGroup.remove(currentFpsWeaponMesh);
+    }
+    currentFpsWeaponMesh = buildWeaponMesh(type);
+    // Scale up for first-person view
+    currentFpsWeaponMesh.scale.set(2.5, 2.5, 2.5);
+    fpsWeaponGroup.add(currentFpsWeaponMesh);
+  }
+  setFpsWeapon('ak47');
+
+  // ---------- Shooting System ----------
+  function handleShooting(dt: number) {
+    if (!ballRigidBody || isSpectating || !physicsEnabled || isPaused) return;
+
+    const wdef = WEAPONS[currentWeapon];
+    const now = performance.now();
+
+    // Handle reload
+    if (isReloading) {
+      if (now - reloadStartTime >= wdef.reloadTime * 1000) {
+        isReloading = false;
+        ammo = wdef.maxAmmo;
+        pushHud();
+      }
+      return;
+    }
+
+    // Handle weapon switch
+    if (isSwitchingWeapon) {
+      if (now - weaponSwitchStartTime >= WEAPON_SWITCH_TIME * 1000) {
+        isSwitchingWeapon = false;
+        if (pendingWeapon) {
+          currentWeapon = pendingWeapon;
+          pendingWeapon = null;
+          ammo = WEAPONS[currentWeapon].maxAmmo;
+          isReloading = false;
+          setFpsWeapon(currentWeapon);
+          // Update remote weapon mesh too
+          const lp = players[localPlayerId];
+          if (lp?.weaponGroup) {
+            while (lp.weaponGroup.children.length > 0) {
+              lp.weaponGroup.remove(lp.weaponGroup.children[0]);
+            }
+            lp.weaponGroup.add(buildWeaponMesh(currentWeapon));
+          }
+        }
+        pushHud();
+      }
+      return;
+    }
+
+    // Auto-reload when empty
+    if (ammo <= 0 && isFiring) {
+      startReload();
+      return;
+    }
+
+    // Fire
+    if (isFiring && ammo > 0) {
+      const fireInterval = 1000 / wdef.fireRate;
+      if (now - lastFireTime >= fireInterval) {
+        lastFireTime = now;
+        fire();
+      }
+    }
+  }
+
+  function fire() {
+    if (!ballRigidBody) return;
+    const wdef = WEAPONS[currentWeapon];
+    ammo--;
+    weaponRecoilOffset = 0.1;
+
+    // Muzzle flash
+    muzzleFlashTimer = 50; // ms
+
+    // Calculate shot direction from camera
+    const pos = ballRigidBody.translation();
+    const direction = new THREE.Vector3(0, 0, -1);
+    // Apply camera azimuth and pitch
+    const euler = new THREE.Euler(cameraPitch, cameraAzimuth, 0, 'YXZ');
+    direction.applyEuler(euler);
+
+    // Add spread
+    const spreadX = (Math.random() - 0.5) * wdef.spread;
+    const spreadY = (Math.random() - 0.5) * wdef.spread;
+    direction.x += spreadX;
+    direction.y += spreadY;
+    direction.normalize();
+
+    // Raycaster origin for hit detection
+    const rayOrigin = new THREE.Vector3(pos.x, pos.y + 0.8, pos.z); // eye level
+
+    // Check hits against other players
+    let hitPlayer: PlayerClient | null = null;
+    let hitDistance = wdef.range;
+
+    for (const [id, p] of Object.entries(players)) {
+      if (id === localPlayerId || p.eliminated) continue;
+      // Simple sphere-ray intersection
+      const playerPos = new THREE.Vector3(p.mesh.position.x, p.mesh.position.y, p.mesh.position.z);
+      const toPlayer = playerPos.clone().sub(rayOrigin);
+      const projLen = toPlayer.dot(direction);
+      if (projLen < 0 || projLen > wdef.range) continue;
+      const closestPoint = rayOrigin.clone().add(direction.clone().multiplyScalar(projLen));
+      const distToCenter = closestPoint.distanceTo(playerPos);
+      if (distToCenter < PLAYER_RADIUS && projLen < hitDistance) {
+        hitPlayer = p;
+        hitDistance = projLen;
+      }
+    }
+
+    if (hitPlayer) {
+      const hitId = hitPlayer.id;
+      // Deal damage to hit player via knockback impulse
+      const knockbackDir = direction.clone().multiplyScalar(wdef.knockback);
+      knockbackDir.y = Math.max(knockbackDir.y, 2.0); // minimum upward impulse
+
+      if (netClient && mode !== 'single') {
+        netClient.send({ kind: 'player-hit', targetId: hitId, impulse: { x: knockbackDir.x, y: knockbackDir.y, z: knockbackDir.z } });
+      } else if (hitPlayer.rigidBody && mode === 'single') {
+        try { hitPlayer.rigidBody.applyImpulse({ x: knockbackDir.x, y: knockbackDir.y, z: knockbackDir.z }, true); } catch { /* ignore */ }
+      }
+
+      // Hit effect
+      createParticleEffect(hitPlayer.mesh.position.clone().add(new THREE.Vector3(0, 0.5, 0)), 0xff0000, 6);
+      addScore(25);
+    }
+
+    // Hit particles at impact point or end of range
+    const impactPoint = rayOrigin.clone().add(direction.clone().multiplyScalar(hitDistance));
+    if (!hitPlayer) {
+      createParticleEffect(impactPoint, 0xffaa00, 3);
+    }
+
+    // Broadcast shot
+    if (netClient && mode !== 'single') {
+      netClient.send({
+        kind: 'player-shot',
+        id: localPlayerId,
+        weapon: currentWeapon,
+        direction: { x: direction.x, y: direction.y, z: direction.z },
+        origin: { x: rayOrigin.x, y: rayOrigin.y, z: rayOrigin.z },
+      });
+    }
+
+    // Play collision sound as gunshot substitute
+    playSound(collisionSound, 0.5);
+    pushHud();
+  }
+
+  function startReload() {
+    if (isReloading || isSwitchingWeapon) return;
+    const wdef = WEAPONS[currentWeapon];
+    if (ammo >= wdef.maxAmmo) return;
+    isReloading = true;
+    reloadStartTime = performance.now();
+    pushHud();
+  }
+
+  function switchWeapon(weapon: WeaponType) {
+    if (weapon === currentWeapon || isSwitchingWeapon || isReloading) return;
+    isSwitchingWeapon = true;
+    weaponSwitchStartTime = performance.now();
+    pendingWeapon = weapon;
+    pushHud();
+  }
+
+  function updateFpsWeapon(dt: number) {
+    if (isSpectating) {
+      fpsWeaponScene.visible = false;
+      return;
+    }
+    fpsWeaponScene.visible = true;
+
+    // Weapon position
+    const bobSpeed = 8;
+    const bobAmount = 0.02;
+    const isMoving = keys.w || keys.a || keys.s || keys.d || Math.abs(joystickX) > 0.15 || Math.abs(joystickY) > 0.15;
+
+    if (isMoving && physicsEnabled) {
+      weaponBobTime += dt * bobSpeed;
+    } else {
+      weaponBobTime += dt * 1.5;
+    }
+
+    const bobX = Math.sin(weaponBobTime) * (isMoving ? bobAmount * 3 : bobAmount);
+    const bobY = Math.abs(Math.cos(weaponBobTime)) * (isMoving ? bobAmount * 2 : bobAmount * 0.5);
+
+    // Recoil recovery
+    weaponRecoilOffset *= 0.85;
+
+    // Position weapon in front of camera
+    fpsWeaponGroup.position.set(
+      0.25 + bobX,
+      -0.2 + bobY,
+      -0.4 + weaponRecoilOffset
+    );
+
+    // Weapon switch animation (lower weapon)
+    if (isSwitchingWeapon) {
+      const progress = (performance.now() - weaponSwitchStartTime) / (WEAPON_SWITCH_TIME * 1000);
+      if (progress < 0.5) {
+        fpsWeaponGroup.position.y -= progress * 0.8;
+      } else {
+        fpsWeaponGroup.position.y -= (1 - progress) * 0.8;
+      }
+    }
+
+    // Reload animation
+    if (isReloading) {
+      const wdef = WEAPONS[currentWeapon];
+      const progress = (performance.now() - reloadStartTime) / (wdef.reloadTime * 1000);
+      fpsWeaponGroup.rotation.x = Math.sin(progress * Math.PI) * 0.5;
+    } else {
+      fpsWeaponGroup.rotation.x *= 0.9;
+    }
+
+    // Muzzle flash timer
+    if (muzzleFlashTimer > 0) {
+      muzzleFlashTimer -= dt * 1000;
+      const lp = players[localPlayerId];
+      if (lp?.muzzleFlash) {
+        lp.muzzleFlash.intensity = muzzleFlashTimer > 0 ? 3 : 0;
+      }
+    }
+
+    // Hide local player mesh from own camera (first-person)
+    const lp = players[localPlayerId];
+    if (lp) {
+      // Hide the sphere mesh but keep it in scene for physics
+      // We'll handle visibility in the camera update
+    }
   }
 
   // ---------- Movement / jump ----------
@@ -1540,6 +1936,23 @@ export function createGameEngine(opts: EngineOptions) {
           }
           break;
         }
+        case 'player-shot': {
+          // Remote player fired a weapon — show muzzle flash effect
+          const shooter = players[ev.data.id];
+          if (shooter && ev.data.id !== localPlayerId) {
+            // Flash the muzzle light
+            if (shooter.muzzleFlash) {
+              shooter.muzzleFlash.intensity = 3;
+              setTimeout(() => {
+                if (shooter.muzzleFlash) shooter.muzzleFlash.intensity = 0;
+              }, 50);
+            }
+            // Create a small tracer/particle effect
+            const origin = new THREE.Vector3(ev.data.origin.x, ev.data.origin.y, ev.data.origin.z);
+            createParticleEffect(origin, 0xffaa00, 3);
+          }
+          break;
+        }
         case 'error':
           callbacks.onError(ev.message);
           break;
@@ -1641,6 +2054,7 @@ export function createGameEngine(opts: EngineOptions) {
 
     if (isPaused) {
       renderer.render(scene, camera);
+      css2dRenderer.render(scene, camera);
       return;
     }
 
@@ -1673,6 +2087,7 @@ export function createGameEngine(opts: EngineOptions) {
       tweenGroup.update(now * 1000);
       updateCamera(realDt);
       renderer.render(scene, camera);
+      css2dRenderer.render(scene, camera);
       return;
     }
 
@@ -1739,7 +2154,20 @@ export function createGameEngine(opts: EngineOptions) {
     // Camera (uses real dt so it feels identical at any FPS)
     updateCamera(realDt);
 
+    // FPS weapon rendering
+    updateFpsWeapon(realDt);
+    handleShooting(realDt);
+
     renderer.render(scene, camera);
+    // Render FPS weapon on top
+    if (!isSpectating && !isPaused) {
+      renderer.autoClear = false;
+      renderer.clearDepth();
+      renderer.render(fpsWeaponScene, fpsWeaponCamera);
+      renderer.autoClear = true;
+    }
+    // Render CSS2D labels
+    css2dRenderer.render(scene, camera);
   }
 
   function stepPhysics(dt: number) {
@@ -1944,8 +2372,7 @@ export function createGameEngine(opts: EngineOptions) {
     if (isSpectating) {
       const alive = Object.values(players).filter((p) => !p.eliminated);
       // If our current spectate target is dead, gone, or unset, auto-pick
-      // the first alive player. This handles the case where the spectated
-      // player dies or disconnects mid-spectate.
+      // the first alive player.
       if (!spectateTargetId || !players[spectateTargetId] || players[spectateTargetId].eliminated) {
         spectateTargetId = alive[0]?.id ?? null;
       }
@@ -1954,24 +2381,77 @@ export function createGameEngine(opts: EngineOptions) {
     if (!targetId || !players[targetId]) return;
     const tp = players[targetId].mesh.position;
 
-    // Consume look delta (scaled by sensitivity & frame dt for smoothing)
-    const sens = settings.cameraSensitivity;
-    cameraAzimuth += lookDelta * sens;
-    lookDelta = 0;
+    if (isSpectating) {
+      // Spectating: third-person follow camera
+      const sens = settings.cameraSensitivity;
+      cameraAzimuth += lookDelta * sens;
+      lookDelta = 0;
+      lookDeltaY = 0;
 
-    const offsetDistance = 11;
-    const offsetHeight = 6;
-    const desiredX = tp.x - offsetDistance * Math.cos(cameraAzimuth);
-    const desiredY = tp.y + offsetHeight;
-    const desiredZ = tp.z - offsetDistance * Math.sin(cameraAzimuth);
-    // Smooth camera follow using dt-independent lerp factor. The smoothing
-    // also handles spectate switches gracefully — instead of instantly
-    // teleporting the camera, it glides to the new target.
-    const k = 1 - Math.exp(-dt * 12);
-    camera.position.x += (desiredX - camera.position.x) * k;
-    camera.position.y += (desiredY - camera.position.y) * k;
-    camera.position.z += (desiredZ - camera.position.z) * k;
-    camera.lookAt(tp.x, tp.y + 0.5, tp.z);
+      const offsetDistance = 11;
+      const offsetHeight = 6;
+      const desiredX = tp.x - offsetDistance * Math.cos(cameraAzimuth);
+      const desiredY = tp.y + offsetHeight;
+      const desiredZ = tp.z - offsetDistance * Math.sin(cameraAzimuth);
+      const k = 1 - Math.exp(-dt * 12);
+      camera.position.x += (desiredX - camera.position.x) * k;
+      camera.position.y += (desiredY - camera.position.y) * k;
+      camera.position.z += (desiredZ - camera.position.z) * k;
+      camera.lookAt(tp.x, tp.y + 0.5, tp.z);
+
+      // Show the spectated player
+      const spectatedPlayer = players[targetId];
+      if (spectatedPlayer) {
+        spectatedPlayer.mesh.visible = true;
+        if (spectatedPlayer.nameLabel) spectatedPlayer.nameLabel.visible = true;
+      }
+    } else {
+      // First-person camera
+      const sens = settings.cameraSensitivity;
+      cameraAzimuth += lookDelta * sens;
+      cameraPitch += lookDeltaY * sens;
+      lookDelta = 0;
+      lookDeltaY = 0;
+
+      // Clamp pitch
+      cameraPitch = Math.max(-Math.PI / 2.2, Math.min(Math.PI / 2.2, cameraPitch));
+
+      // Position camera at eye level
+      const eyeOffset = PLAYER_HEIGHT * 0.4; // Eyes near top of the sphere
+      const desiredX = tp.x;
+      const desiredY = tp.y + eyeOffset;
+      const desiredZ = tp.z;
+
+      const k = 1 - Math.exp(-dt * 30); // Snappier follow for FPS
+      camera.position.x += (desiredX - camera.position.x) * k;
+      camera.position.y += (desiredY - camera.position.y) * k;
+      camera.position.z += (desiredZ - camera.position.z) * k;
+
+      // Look direction based on azimuth + pitch
+      const lookTarget = new THREE.Vector3(
+        desiredX - Math.sin(cameraAzimuth) * Math.cos(cameraPitch),
+        desiredY + Math.sin(cameraPitch),
+        desiredZ - Math.cos(cameraAzimuth) * Math.cos(cameraPitch),
+      );
+      camera.lookAt(lookTarget);
+
+      // Hide local player mesh in first-person (don't see your own sphere)
+      const localPlayer = players[localPlayerId];
+      if (localPlayer) {
+        localPlayer.mesh.visible = false;
+        if (localPlayer.nameLabel) localPlayer.nameLabel.visible = false;
+        if (localPlayer.weaponGroup) localPlayer.weaponGroup.visible = false;
+      }
+
+      // Show remote player meshes and name labels
+      for (const [id, p] of Object.entries(players)) {
+        if (id !== localPlayerId && !p.eliminated) {
+          p.mesh.visible = true;
+          if (p.nameLabel) p.nameLabel.visible = true;
+          if (p.weaponGroup) p.weaponGroup.visible = true;
+        }
+      }
+    }
     void dt;
   }
 
@@ -2027,6 +2507,9 @@ export function createGameEngine(opts: EngineOptions) {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    css2dRenderer.setSize(window.innerWidth, window.innerHeight);
+    fpsWeaponCamera.aspect = window.innerWidth / window.innerHeight;
+    fpsWeaponCamera.updateProjectionMatrix();
   }
   function getFps() { return Math.round(fpsSmoothed); }
 
@@ -2125,6 +2608,23 @@ export function createGameEngine(opts: EngineOptions) {
     keys.w = false; keys.a = false; keys.s = false; keys.d = false; keys.space = false;
     joystickX = 0;
     joystickY = 0;
+
+    // Reset weapon state
+    currentWeapon = 'ak47';
+    ammo = WEAPONS.ak47.maxAmmo;
+    isReloading = false;
+    reloadStartTime = 0;
+    lastFireTime = 0;
+    isSwitchingWeapon = false;
+    weaponSwitchStartTime = 0;
+    pendingWeapon = null;
+    isFiring = false;
+    weaponRecoilOffset = 0;
+    weaponBobTime = 0;
+    muzzleFlashTimer = 0;
+    cameraPitch = -0.3;
+    lookDeltaY = 0;
+    setFpsWeapon('ak47');
 
     // Notify the UI to clear its end-game / spectating / pause / countdown
     // state. The new match will re-push all of these as it starts.
@@ -2273,6 +2773,7 @@ export function createGameEngine(opts: EngineOptions) {
     setInput,
     setJoystick,
     addLookDelta,
+    addLookDeltaY: (dy: number) => { lookDeltaY += dy; },
     jump,
     setPaused,
     switchSpectator,
@@ -2283,6 +2784,12 @@ export function createGameEngine(opts: EngineOptions) {
     restart,
     getLocalPlayerId: () => localPlayerId,
     getCanvas: () => renderer.domElement,
+    getCss2dElement: () => css2dRenderer.domElement,
     ensureAudio,
+    // Weapon API
+    switchWeapon,
+    startReload,
+    setFiring: (v: boolean) => { isFiring = v; },
+    getCurrentWeapon: () => currentWeapon,
   };
 }
