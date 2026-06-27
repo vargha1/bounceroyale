@@ -152,7 +152,7 @@ export class SocketNetClient implements NetClient {
     });
 
     this.socket.on('new-player', (data: any) => this.emit({ type: 'new-player', data: { id: data.id, position: data.position } }));
-    this.socket.on('player-moved', (data: any) => this.emit({ type: 'move', data: { id: data.id, position: data.position, rotation: data.rotation } }));
+    this.socket.on('player-moved', (data: any) => this.emit({ type: 'move', data: { id: data.id, position: data.position, rotation: data.rotation, cameraAzimuth: data.cameraAzimuth } }));
     this.socket.on('player-jumped', (data: any) => this.emit({ type: 'jump', data: { id: data.id } }));
     this.socket.on('player-rotated', (data: any) => this.emit({ type: 'rotate', data: { id: data.id, cameraAzimuth: data.cameraAzimuth } }));
     this.socket.on('hexagon-collided', (data: any) => this.emit({ type: 'hexagon-collided', data: { index: data.index, playerId: data.playerId } }));
@@ -203,7 +203,7 @@ export class SocketNetClient implements NetClient {
     // Translate back to socket.io event names matching server.js
     switch (msg.kind) {
       case 'move':
-        this.socket.emit('move', { gameId: gameIdStore, id: msg.id, position: msg.position, rotation: msg.rotation });
+        this.socket.emit('move', { gameId: gameIdStore, id: msg.id, position: msg.position, rotation: msg.rotation, cameraAzimuth: msg.cameraAzimuth });
         break;
       case 'jump':
         this.socket.emit('jump', { gameId: gameIdStore, id: msg.id, eventId: Date.now().toString() });

@@ -14,6 +14,8 @@ export type MoveMessage = {
   id: string;
   position: { x: number; y: number; z: number };
   rotation: { x: number; y: number; z: number; w: number };
+  /** Camera azimuth (facing direction) so remote peers can orient the weapon model. */
+  cameraAzimuth?: number;
 };
 
 export type JumpMessage = {

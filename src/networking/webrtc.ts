@@ -1035,7 +1035,7 @@ export class WebRTCNetHost implements NetClient {
         : fromPeer;
       switch (msg.kind) {
         case 'move':
-          this.emit({ type: 'move', data: { id: playerId, position: msg.position, rotation: msg.rotation } });
+          this.emit({ type: 'move', data: { id: playerId, position: msg.position, rotation: msg.rotation, cameraAzimuth: msg.cameraAzimuth } });
           break;
         case 'jump':
           this.emit({ type: 'jump', data: { id: playerId } });
@@ -1510,7 +1510,7 @@ export class WebRTCNetGuest implements NetClient {
             this.emit({ type: 'new-player', data: { id: msg.id, position: msg.position } });
             break;
           case 'move':
-            this.emit({ type: 'move', data: { id: msg.id, position: msg.position, rotation: msg.rotation } });
+            this.emit({ type: 'move', data: { id: msg.id, position: msg.position, rotation: msg.rotation, cameraAzimuth: msg.cameraAzimuth } });
             break;
           case 'jump':
             this.emit({ type: 'jump', data: { id: msg.id } });

@@ -163,9 +163,9 @@ export function createGameEngine(opts: EngineOptions) {
   // Three.js core
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0a0a14);
-  scene.fog = new THREE.Fog(0x0a0a14, 30, 80);
+  scene.fog = new THREE.Fog(0x0a0a14, 25, 60);
 
-  const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 200);
+  const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 100);
   camera.position.set(0, 8, 14);
 
   const renderer = new THREE.WebGLRenderer({
@@ -173,14 +173,13 @@ export function createGameEngine(opts: EngineOptions) {
     powerPreference: 'high-performance',
     alpha: false,
   });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, settings.graphicsQuality === 'high' ? 2 : 1));
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
   renderer.setSize(window.innerWidth, window.innerHeight);
   // Critical for mobile: prevent the canvas from triggering browser gestures
   // (pan, zoom, pull-to-refresh) that would otherwise eat our touch events.
   renderer.domElement.style.touchAction = 'none';
   renderer.domElement.style.display = 'block';
-  renderer.shadowMap.enabled = settings.graphicsQuality === 'high';
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.enabled = false; // Shadows disabled for FPS — re-enable only on high-end
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.1;
@@ -195,24 +194,13 @@ export function createGameEngine(opts: EngineOptions) {
   renderer.domElement.style.position = 'relative';
 
   // Lighting
-  const ambient = new THREE.AmbientLight(0x6a6a8a, 0.6);
-  scene.add(ambient);
+  // Use hemisphere light for cheaper ambient + directional in one pass
+  const hemiLight = new THREE.HemisphereLight(0x8899bb, 0x444422, 0.8);
+  scene.add(hemiLight);
 
-  const sun = new THREE.DirectionalLight(0xffe4b5, 1.4);
+  const sun = new THREE.DirectionalLight(0xffe4b5, 1.2);
   sun.position.set(10, 20, 8);
-  sun.castShadow = settings.graphicsQuality === 'high';
-  if (sun.castShadow) {
-    sun.shadow.mapSize.set(1024, 1024);
-    sun.shadow.camera.left = -20;
-    sun.shadow.camera.right = 20;
-    sun.shadow.camera.top = 20;
-    sun.shadow.camera.bottom = -20;
-  }
   scene.add(sun);
-
-  const rim = new THREE.DirectionalLight(0x4060ff, 0.4);
-  rim.position.set(-8, 5, -10);
-  scene.add(rim);
 
   // Audio
   const audioListener = new THREE.AudioListener();
@@ -331,6 +319,9 @@ export function createGameEngine(opts: EngineOptions) {
     color: number;
     targetPosition: { x: number; y: number; z: number };
     targetRotation: { x: number; y: number; z: number; w: number };
+    /** Remote player's camera azimuth (facing direction), sent via 'move' messages.
+     *  Used to orient their weapon model so other players can see where they aim. */
+    targetAzimuth: number;
     nameLabel?: CSS2DObject;
     weaponGroup?: THREE.Group;
     muzzleFlash?: THREE.PointLight;
@@ -397,7 +388,7 @@ export function createGameEngine(opts: EngineOptions) {
    *  the guest's own countdown reaching 0, enable physics anyway (the message
    *  may have been lost on the unreliable WebRTC data channel). */
   let gameStartedFallbackTimer: number | null = null;
-  const SEND_INTERVAL = 33; // ~30 updates/s
+  const SEND_INTERVAL = 50; // ~20 updates/s — reduces network overhead for smoother gameplay
 
   // Fall-speed tracking for impact damage. While the ball is airborne we
   // record the peak downward velocity; on landing we convert that into
@@ -988,15 +979,29 @@ export function createGameEngine(opts: EngineOptions) {
     if (changed) pushHud();
   }
 
+  // Shared geometry for particles — one SphereGeometry reused by all particles
+  // instead of creating a new one per particle (saves GPU memory and draw calls).
+  const particleGeo = new THREE.SphereGeometry(0.1, 4, 4);
+  const MAX_PARTICLES = 60;
+
   function createParticleEffect(pos: THREE.Vector3, color: number, count: number) {
-    const geo = new THREE.SphereGeometry(0.12, 6, 6);
-    for (let i = 0; i < count; i++) {
+    // Cap count to avoid particle explosion lag
+    const clampedCount = Math.min(count, 8);
+    for (let i = 0; i < clampedCount; i++) {
+      // If we're at the particle limit, remove the oldest one
+      if (particles.length >= MAX_PARTICLES) {
+        const oldest = particles.shift();
+        if (oldest) {
+          scene.remove(oldest.mesh);
+          (oldest.mesh.material as THREE.Material).dispose();
+        }
+      }
       const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 });
-      const m = new THREE.Mesh(geo, mat);
+      const m = new THREE.Mesh(particleGeo, mat);
       m.position.copy(pos);
       m.position.add(new THREE.Vector3((Math.random() - 0.5) * 1.5, Math.random() * 1.5, (Math.random() - 0.5) * 1.5));
       const vel = new THREE.Vector3((Math.random() - 0.5) * 8, Math.random() * 8 + 4, (Math.random() - 0.5) * 8);
-      const life = 0.8 + Math.random() * 0.5;
+      const life = 0.6 + Math.random() * 0.3;
       particles.push({ mesh: m, vel, life, maxLife: life });
       scene.add(m);
     }
@@ -1009,6 +1014,7 @@ export function createGameEngine(opts: EngineOptions) {
       if (p.life <= 0) {
         scene.remove(p.mesh);
         (p.mesh.material as THREE.Material).dispose();
+        // Don't dispose geometry — it's shared (particleGeo)
         particles.splice(i, 1);
         continue;
       }
@@ -1049,6 +1055,12 @@ export function createGameEngine(opts: EngineOptions) {
     return geometry;
   }
 
+  // Shared tile geometries — one per tile type (ground vs wall), reused by
+  // ALL tiles of that type instead of creating a new geometry per tile.
+  // This is a major memory + draw-call optimization with hundreds of tiles.
+  const groundTileGeo = createHexagonGeometry(TILE_RADIUS, TILE_HEIGHT);
+  const wallTileGeo = createHexagonGeometry(TILE_RADIUS, 1.5);
+
   function createTile(pos: { x: number; y: number; z: number }, id: string) {
     if (tilesById.has(id)) return; // dedupe — stable IDs mean this can be called twice in multiplayer
 
@@ -1058,7 +1070,8 @@ export function createGameEngine(opts: EngineOptions) {
     const tileHeight = isWall ? 1.5 : TILE_HEIGHT;
     const tileHealth = isWall ? 500 : TILE_MAX_HEALTH;
 
-    const geo = createHexagonGeometry(TILE_RADIUS, tileHeight);
+    // Reuse shared geometry for all tiles of the same type
+    const geo = isWall ? wallTileGeo : groundTileGeo;
     // Colour by type and height.
     const baseColor = new THREE.Color();
     if (isWall) {
@@ -1073,20 +1086,17 @@ export function createGameEngine(opts: EngineOptions) {
         baseColor.setHSL(0.08, 0.15, 0.45); // rock grey-brown
       }
     }
-    const mat = new THREE.MeshStandardMaterial({
+    // Use MeshLambertMaterial instead of MeshStandardMaterial for tiles —
+    // much cheaper per-pixel shading, big FPS win with hundreds of tiles.
+    const mat = new THREE.MeshLambertMaterial({
       color: baseColor.clone(),
       side: THREE.DoubleSide,
       transparent: true,
       opacity: 1,
-      roughness: isWall ? 0.95 : 0.85,
-      metalness: isWall ? 0.02 : 0.05,
       emissive: baseColor.clone(),
-      emissiveIntensity: isWall ? 0.05 : 0.12,
     });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.position.set(pos.x, pos.y, pos.z);
-    mesh.castShadow = settings.graphicsQuality === 'high';
-    mesh.receiveShadow = settings.graphicsQuality === 'high';
     scene.add(mesh);
 
     let rigidBody: RAPIER.RigidBody | undefined;
@@ -1121,7 +1131,7 @@ export function createGameEngine(opts: EngineOptions) {
   /** Update a tile's colour to reflect its current health (green → yellow → red). */
   function updateTileColor(tile: TileClient) {
     const pct = Math.max(0, tile.health / tile.maxHealth);
-    const mat = tile.mesh.material as THREE.MeshStandardMaterial;
+    const mat = tile.mesh.material as THREE.MeshLambertMaterial;
     // Hue from 0.33 (green) at full health → 0.0 (red) at zero.
     const hue = pct * 0.33;
     // Darken slightly as the tile gets damaged.
@@ -1210,10 +1220,37 @@ export function createGameEngine(opts: EngineOptions) {
     tw.start();
   }
 
+  /**
+   * Generate distributed spawn positions around the island center.
+   * Players are placed in a circle with random offsets so they don't
+   * overlap at the start. The host uses the same seed for all peers
+   * so positions are deterministic across the network.
+   */
+  function getDistributedSpawns(
+    center: { x: number; y: number; z: number },
+    count: number,
+    radius: number = 3,
+  ): { x: number; y: number; z: number }[] {
+    if (count <= 0) return [];
+    if (count === 1) return [center];
+    const positions: { x: number; y: number; z: number }[] = [];
+    for (let i = 0; i < count; i++) {
+      const angle = (2 * Math.PI * i) / count;
+      const jitterX = (Math.random() - 0.5) * 0.5;
+      const jitterZ = (Math.random() - 0.5) * 0.5;
+      positions.push({
+        x: center.x + Math.cos(angle) * radius + jitterX,
+        y: center.y,
+        z: center.z + Math.sin(angle) * radius + jitterZ,
+      });
+    }
+    return positions;
+  }
+
   function createSphere(id: string, pos: { x: number; y: number; z: number }, isLocal: boolean) {
     if (players[id]) return;
     const color = id === localPlayerId ? 0xff5252 : PLAYER_COLORS[Object.keys(players).length % PLAYER_COLORS.length];
-    const geo = new THREE.SphereGeometry(PLAYER_RADIUS, 24, 24);
+    const geo = new THREE.SphereGeometry(PLAYER_RADIUS, 12, 12);
     const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.4, metalness: 0.3, emissive: new THREE.Color(color), emissiveIntensity: 0.2 });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.castShadow = settings.graphicsQuality === 'high';
@@ -1234,16 +1271,24 @@ export function createGameEngine(opts: EngineOptions) {
 
     // Weapon group for this player (visible on remote players)
     // Added directly to the scene (NOT as a child of the mesh) so it doesn't
-    // orbit with the ball's rotation. It stays at a fixed offset above and
-    // to the side of the ball, always upright. Position is updated in
-    // interpolateRemotePlayers().
+    // orbit with the ball's rotation. The weapon is positioned ABOVE the ball
+    // (not on its surface) and rotated to face the player's aiming direction
+    // (targetAzimuth). Updated every frame in interpolateRemotePlayers().
     const weaponGroup = new THREE.Group();
-    weaponGroup.position.set(pos.x + 0.3, pos.y + 0.3, pos.z - 0.3); // offset above and to the right/forward
+    // Initial position: above the ball center, offset forward (negative Z)
+    const weaponHeight = PLAYER_RADIUS + 0.35; // well above the ball surface
+    const weaponForward = 0.4;  // how far in front of the ball center
+    const weaponSide = 0.25;    // slight offset to the right
+    weaponGroup.position.set(
+      pos.x + weaponSide,
+      pos.y + weaponHeight,
+      pos.z - weaponForward,
+    );
     scene.add(weaponGroup);
 
     // Muzzle flash light — also scene-level, positioned relative to the weapon
     const muzzleFlash = new THREE.PointLight(0xffaa00, 0, 5);
-    muzzleFlash.position.set(pos.x + 0.3, pos.y + 0.3, pos.z - 0.8);
+    muzzleFlash.position.set(pos.x + weaponSide, pos.y + weaponHeight, pos.z - weaponForward - 0.5);
     scene.add(muzzleFlash);
 
     // Build a simple weapon mesh for remote players
@@ -1281,7 +1326,7 @@ export function createGameEngine(opts: EngineOptions) {
     } catch (e) {
       console.error('Failed to create sphere physics', e);
     }
-    players[id] = { id, mesh, rigidBody, collider, eliminated: false, color, targetPosition: pos, targetRotation: { x: 0, y: 0, z: 0, w: 1 }, nameLabel, weaponGroup, muzzleFlash };
+    players[id] = { id, mesh, rigidBody, collider, eliminated: false, color, targetPosition: pos, targetRotation: { x: 0, y: 0, z: 0, w: 1 }, targetAzimuth: 0, nameLabel, weaponGroup, muzzleFlash };
     pushHud();
   }
 
@@ -2073,6 +2118,10 @@ export function createGameEngine(opts: EngineOptions) {
           if (p && ev.data.id !== localPlayerId && !p.eliminated) {
             p.targetPosition = ev.data.position;
             p.targetRotation = ev.data.rotation;
+            // Store the remote player's facing direction for weapon orientation
+            if (ev.data.cameraAzimuth !== undefined) {
+              p.targetAzimuth = ev.data.cameraAzimuth;
+            }
           }
           break;
         }
@@ -2444,6 +2493,7 @@ export function createGameEngine(opts: EngineOptions) {
             id: localPlayerId,
             position: { x: +p.x.toFixed(2), y: +p.y.toFixed(2), z: +p.z.toFixed(2) },
             rotation: { x: +r.x.toFixed(2), y: +r.y.toFixed(2), z: +r.z.toFixed(2), w: +r.w.toFixed(2) },
+            cameraAzimuth: +cameraAzimuth.toFixed(2),
           });
           lastSendTime = t;
         } catch {
@@ -2565,14 +2615,31 @@ export function createGameEngine(opts: EngineOptions) {
           // that are not children of the mesh. Even though they're hidden in
           // first-person, the muzzle flash needs to be near the player to
           // illuminate nearby surfaces.
+          const weaponHeight = PLAYER_RADIUS + 0.35;
+          const weaponForwardDist = 0.4;
+          const weaponSideDist = 0.25;
+          const fwdX = Math.sin(cameraAzimuth);
+          const fwdZ = -Math.cos(cameraAzimuth);
+          const rgtX = Math.cos(cameraAzimuth);
+          const rgtZ = Math.sin(cameraAzimuth);
           if (lp.weaponGroup) {
-            lp.weaponGroup.position.set(p.x + 0.3, p.y + 0.3, p.z - 0.3);
+            lp.weaponGroup.position.set(
+              p.x + rgtX * weaponSideDist + fwdX * weaponForwardDist,
+              p.y + weaponHeight,
+              p.z + rgtZ * weaponSideDist + fwdZ * weaponForwardDist,
+            );
+            lp.weaponGroup.rotation.set(0, -cameraAzimuth, 0);
           }
           if (lp.nameLabel) {
             lp.nameLabel.position.set(p.x, p.y + PLAYER_RADIUS + 0.6, p.z);
           }
           if (lp.muzzleFlash) {
-            lp.muzzleFlash.position.set(p.x + 0.3, p.y + 0.3, p.z - 0.8);
+            const flashFwd = weaponForwardDist + 0.5;
+            lp.muzzleFlash.position.set(
+              p.x + rgtX * weaponSideDist + fwdX * flashFwd,
+              p.y + weaponHeight,
+              p.z + rgtZ * weaponSideDist + fwdZ * flashFwd,
+            );
           }
         }
         // Death check
@@ -2703,20 +2770,55 @@ export function createGameEngine(opts: EngineOptions) {
       p.mesh.position.lerp(tp, 0.2);
       const tq = new THREE.Quaternion(p.targetRotation.x, p.targetRotation.y, p.targetRotation.z, p.targetRotation.w);
       p.mesh.quaternion.slerp(tq, 0.2);
-      // Position the weapon group, name label, and muzzle flash in world space
-      // (they are direct children of the scene, not the mesh). This prevents
-      // them from orbiting around the ball center as the ball rolls. They stay
-      // at a fixed upright offset relative to the ball's center position.
+
+      // Position the weapon group, name label, and muzzle flash in world space.
+      // The weapon is held ABOVE the ball (not on its surface) and rotated to
+      // face the player's aiming direction (targetAzimuth).
       const ballPos = p.mesh.position;
+      const az = p.targetAzimuth;
+
+      // Weapon offset relative to the player's facing direction:
+      //   - "forward" = the direction the player is looking (azimuth)
+      //   - The weapon sits above the ball, slightly to the right and forward
+      const weaponHeight = PLAYER_RADIUS + 0.35;
+      const weaponForwardDist = 0.4;
+      const weaponSideDist = 0.25;
+
+      // Convert the local offset (side, height, forward) into world space
+      // using the azimuth angle. "Forward" is -Z at azimuth=0, so:
+      //   worldX = ballPos.x + side*cos(az) + forward*sin(az)
+      //   worldZ = ballPos.z - side*sin(az) + forward*cos(az)
+      // Wait, let me think again. The camera look target is:
+      //   lookTarget.x = pos.x + sin(az) * cos(pitch)  → forward direction is +sin(az) in X
+      //   lookTarget.z = pos.z - cos(az) * cos(pitch)  → forward direction is -cos(az) in Z
+      // So the forward vector is (sin(az), 0, -cos(az))
+      // And the right vector is (cos(az), 0, sin(az))
+      const forwardX = Math.sin(az);
+      const forwardZ = -Math.cos(az);
+      const rightX = Math.cos(az);
+      const rightZ = Math.sin(az);
+
       if (p.weaponGroup) {
-        p.weaponGroup.position.set(ballPos.x + 0.3, ballPos.y + 0.3, ballPos.z - 0.3);
-        // Weapon stays upright — no rotation needed since it's not a child of the ball
+        p.weaponGroup.position.set(
+          ballPos.x + rightX * weaponSideDist + forwardX * weaponForwardDist,
+          ballPos.y + weaponHeight,
+          ballPos.z + rightZ * weaponSideDist + forwardZ * weaponForwardDist,
+        );
+        // Rotate the weapon to face the player's aiming direction.
+        // The weapon mesh is built pointing down -Z (barrel towards -Z),
+        // so we rotate around Y by -azimuth to align with the facing direction.
+        p.weaponGroup.rotation.set(0, -az, 0);
       }
       if (p.nameLabel) {
         p.nameLabel.position.set(ballPos.x, ballPos.y + PLAYER_RADIUS + 0.6, ballPos.z);
       }
       if (p.muzzleFlash) {
-        p.muzzleFlash.position.set(ballPos.x + 0.3, ballPos.y + 0.3, ballPos.z - 0.8);
+        const flashForward = weaponForwardDist + 0.5;
+        p.muzzleFlash.position.set(
+          ballPos.x + rightX * weaponSideDist + forwardX * flashForward,
+          ballPos.y + weaponHeight,
+          ballPos.z + rightZ * weaponSideDist + forwardZ * flashForward,
+        );
       }
       if (tp.y < DEATH_Y_LEVEL && !p.eliminated) {
         // Remote player fell — host will broadcast, but as a fallback we eliminate locally too.
@@ -2858,12 +2960,9 @@ export function createGameEngine(opts: EngineOptions) {
     }
   }
   function updateSettings(s: Settings) {
-    const oldQuality = settings.graphicsQuality;
     settings = s;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, s.graphicsQuality === 'high' ? 2 : 1));
-    if (oldQuality !== s.graphicsQuality) {
-      renderer.shadowMap.enabled = s.graphicsQuality === 'high';
-    }
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+    // Shadows remain disabled for FPS optimization
   }
   function resize() {
     camera.aspect = window.innerWidth / window.innerHeight;
@@ -2918,10 +3017,11 @@ export function createGameEngine(opts: EngineOptions) {
 
     // Remove all tile meshes from the scene (no need to remove rigid bodies
     // individually — we recreate the entire physics World below).
+    // Don't dispose the shared geometries (groundTileGeo, wallTileGeo) —
+    // they're reused across rounds.
     for (const tile of tiles) {
       try { scene.remove(tile.mesh); } catch { /* ignore */ }
       try { (tile.mesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
-      try { tile.mesh.geometry.dispose(); } catch { /* ignore */ }
     }
     tiles.length = 0;
     tilesById.clear();
@@ -3087,28 +3187,25 @@ export function createGameEngine(opts: EngineOptions) {
       for (const t of islandTiles) createTile({ x: t.x, y: t.y, z: t.z }, t.id);
       spawnPowerupPickups();
       const spawn = getIslandSpawn(islandTiles);
-      createSphere(localPlayerId, spawn, true);
-      // Also recreate guest player entries on the host side so the host can
-      // see and track guests after restart. Without this, resetGameState()
-      // clears the players map and only the local sphere is recreated — the
-      // host loses all guest entries and can't see or rank them.
-      for (const peerId of peerIds) {
-        createSphere(peerId, spawn, false);
+      // Distribute players around the island center so they don't spawn
+      // on top of each other. Each player gets a unique position in a circle.
+      const allPlayerIds = [localPlayerId, ...peerIds];
+      const spawns = getDistributedSpawns(spawn, allPlayerIds.length, 3);
+      for (let i = 0; i < allPlayerIds.length; i++) {
+        const pid = allPlayerIds[i];
+        const pspawn = spawns[i];
+        createSphere(pid, pspawn, pid === localPlayerId);
       }
-      camera.position.set(spawn.x, spawn.y + PLAYER_HEIGHT * 0.4, spawn.z);
+      const hostSpawn = spawns[0];
+      camera.position.set(hostSpawn.x, hostSpawn.y + PLAYER_HEIGHT * 0.4, hostSpawn.z);
       cameraAzimuth = 0;
       cameraPitch = -0.3;
       serverStartTime = Date.now() + startTimerValue * 1000;
       pushCountdown();
       if (netClient) {
         try {
-          // ALL players (host + guests) spawn at the new island center.
-          // Using the same spawn position ensures dead players don't respawn
-          // at their old death positions from the previous round.
-          const allPlayers = [
-            { id: localPlayerId, position: spawn },
-            ...peerIds.map((id) => ({ id, position: spawn })),
-          ];
+          // Send each player their own spawn position (distributed, not overlapping)
+          const allPlayers = allPlayerIds.map((id, i) => ({ id, position: spawns[i] }));
           netClient.send({
             kind: 'init',
             gameId: 'lan',
