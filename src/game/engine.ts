@@ -334,6 +334,8 @@ export function createGameEngine(opts: EngineOptions) {
     nameLabel?: CSS2DObject;
     weaponGroup?: THREE.Group;
     muzzleFlash?: THREE.PointLight;
+    health?: number;
+    maxHealth?: number;
   };
   /**
    * A powerup pickup scattered on the map. Players collect these by moving
@@ -582,6 +584,25 @@ export function createGameEngine(opts: EngineOptions) {
     if (playerHealth <= 0) {
       const id = localPlayerId;
       if (id && !players[id]?.eliminated) eliminatePlayer(id);
+    }
+  }
+
+  /** Apply damage to a remote player (not the local player).
+   *  Tracks per-player health and eliminates them when health reaches 0. */
+  function applyDamageToRemotePlayer(playerId: string, damage: number) {
+    const p = players[playerId];
+    if (!p || p.eliminated) return;
+    // Initialize health tracking for remote players if not present
+    if (p.health === undefined) p.health = 100;
+    if (p.health === undefined) p.maxHealth = 100;
+    p.health = Math.max(0, p.health - damage);
+    // Show hit effect
+    createParticleEffect(p.mesh.position.clone().add(new THREE.Vector3(0, 0.5, 0)), 0xff4444, 4);
+    // If health depleted, eliminate the player
+    if (p.health <= 0 && !p.eliminated) {
+      if (isHost || mode === 'single') {
+        eliminatePlayer(playerId);
+      }
     }
   }
 
@@ -1519,12 +1540,26 @@ export function createGameEngine(opts: EngineOptions) {
 
     if (hitPlayer) {
       const hitId = hitPlayer.id;
-      // Deal damage to hit player via knockback impulse
+
+      // Apply health damage to the hit player
+      if (mode === 'single') {
+        // Single player: we're authoritative — apply damage directly
+        applyDamageToRemotePlayer(hitId, wdef.damage);
+      } else if (isHost) {
+        // Host is authoritative for damage — apply locally
+        applyDamageToRemotePlayer(hitId, wdef.damage);
+      }
+      // Guest: damage is applied when the host's player-hit broadcast
+      // arrives (the host re-broadcasts with damage after computing it).
+      // We include damage in our message so the host can use it.
+
+      // Deal knockback impulse to hit player
       const knockbackDir = direction.clone().multiplyScalar(wdef.knockback);
       knockbackDir.y = Math.max(knockbackDir.y, 2.0); // minimum upward impulse
 
       if (netClient && mode !== 'single') {
-        netClient.send({ kind: 'player-hit', targetId: hitId, impulse: { x: knockbackDir.x, y: knockbackDir.y, z: knockbackDir.z } });
+        // Include damage in the network message so the host/target can apply it
+        netClient.send({ kind: 'player-hit', targetId: hitId, impulse: { x: knockbackDir.x, y: knockbackDir.y, z: knockbackDir.z }, damage: wdef.damage });
       } else if (hitPlayer.rigidBody && mode === 'single') {
         try { hitPlayer.rigidBody.applyImpulse({ x: knockbackDir.x, y: knockbackDir.y, z: knockbackDir.z }, true); } catch { /* ignore */ }
       }
@@ -1628,6 +1663,15 @@ export function createGameEngine(opts: EngineOptions) {
     // Recoil recovery
     weaponRecoilOffset *= 0.85;
 
+    // Rotate weapon to match camera look direction (azimuth + pitch).
+    // The weapon "points forward" in its local -Z, so we apply the same
+    // Euler as the shooting direction but inverted so it faces the same way
+    // the camera is looking. This makes the gun barrel follow the crosshair.
+    // Pitch: tilt gun up/down with camera. Azimuth: rotate gun left/right.
+    // We apply these to the group's Y and X rotation, preserving Z for reload.
+    fpsWeaponGroup.rotation.y = -cameraAzimuth;
+    fpsWeaponGroup.rotation.x = cameraPitch;
+
     // Position weapon in front of camera
     fpsWeaponGroup.position.set(
       0.25 + bobX,
@@ -1653,31 +1697,34 @@ export function createGameEngine(opts: EngineOptions) {
       // Phase 2 (0.3-0.5): hold — mag out
       // Phase 3 (0.5-0.7): hold — new mag in
       // Phase 4 (0.7-1.0): rack slide and return to center
+      let reloadTiltX = 0;
+      let reloadTiltZ = 0;
+      let reloadDropY = 0;
+      let reloadPushZ = 0;
       if (progress < 0.3) {
         const t = progress / 0.3;
-        fpsWeaponGroup.rotation.z = t * 0.4;
-        fpsWeaponGroup.rotation.x = t * 0.3;
-        fpsWeaponGroup.position.y -= t * 0.15;
+        reloadTiltZ = t * 0.4;
+        reloadTiltX = t * 0.3;
+        reloadDropY = t * 0.15;
       } else if (progress < 0.5) {
-        fpsWeaponGroup.rotation.z = 0.4;
-        fpsWeaponGroup.rotation.x = 0.3;
-        fpsWeaponGroup.position.y -= 0.15;
+        reloadTiltZ = 0.4;
+        reloadTiltX = 0.3;
+        reloadDropY = 0.15;
       } else if (progress < 0.7) {
         const t = (progress - 0.5) / 0.2;
-        fpsWeaponGroup.rotation.z = 0.4 * (1 - t);
-        fpsWeaponGroup.rotation.x = 0.3 * (1 - t);
-        fpsWeaponGroup.position.y -= 0.15 * (1 - t);
+        reloadTiltZ = 0.4 * (1 - t);
+        reloadTiltX = 0.3 * (1 - t);
+        reloadDropY = 0.15 * (1 - t);
       } else {
         const t = (progress - 0.7) / 0.3;
         // Rack slide: quick forward push then back
-        const rackMotion = t < 0.5 ? t * 2 * 0.06 : (1 - (t - 0.5) * 2) * 0.06;
-        fpsWeaponGroup.rotation.z = 0;
-        fpsWeaponGroup.rotation.x = 0;
-        fpsWeaponGroup.position.z -= rackMotion;
+        reloadPushZ = t < 0.5 ? t * 2 * 0.06 : (1 - (t - 0.5) * 2) * 0.06;
       }
-    } else {
-      fpsWeaponGroup.rotation.x *= 0.85;
-      fpsWeaponGroup.rotation.z *= 0.85;
+      // Apply camera rotation + reload tilt on top
+      fpsWeaponGroup.rotation.x = cameraPitch + reloadTiltX;
+      fpsWeaponGroup.rotation.z = reloadTiltZ;
+      fpsWeaponGroup.position.y -= reloadDropY;
+      fpsWeaponGroup.position.z -= reloadPushZ;
     }
 
     // Muzzle flash timer
@@ -2058,9 +2105,15 @@ export function createGameEngine(opts: EngineOptions) {
           break;
         }
         case 'player-hit': {
-          // Invincibility powerup: ignore knockback impulses from other players.
-          if (ev.data.targetId === localPlayerId && ballRigidBody && !hasPowerUp('invincibility')) {
-            try { ballRigidBody.applyImpulse(ev.data.impulse, true); } catch { /* ignore */ }
+          // Invincibility powerup: ignore knockback + damage from other players.
+          if (ev.data.targetId === localPlayerId && !hasPowerUp('invincibility')) {
+            // Apply knockback
+            if (ballRigidBody) {
+              try { ballRigidBody.applyImpulse(ev.data.impulse, true); } catch { /* ignore */ }
+            }
+            // Apply health damage from the shot
+            const dmg = ev.data.damage ?? 0;
+            if (dmg > 0) updateHealth(-dmg);
           }
           break;
         }
@@ -2948,19 +3001,13 @@ export function createGameEngine(opts: EngineOptions) {
 
     console.log('[ENGINE] restart() — tearing down match state and starting a new round.');
 
-    // Capture connected peers' last-known positions BEFORE resetGameState
-    // clears the players map. We'll include them in the init broadcast so
-    // guests can recreate their own local balls (otherwise they'd be left
-    // without a ball after the restart, since the host's init normally only
-    // contains the host's ball).
-    const peerSnapshots: { id: string; position: { x: number; y: number; z: number } }[] = [];
+    // Capture connected peer IDs BEFORE resetGameState clears the players map.
+    // On restart, ALL players spawn at the same point (the island center),
+    // regardless of where they died in the previous round.
+    const peerIds: string[] = [];
     if (mode === 'lan' && isHost) {
-      for (const [id, p] of Object.entries(players)) {
-        if (id === localPlayerId) continue;
-        peerSnapshots.push({
-          id,
-          position: { x: p.targetPosition.x, y: p.targetPosition.y, z: p.targetPosition.z },
-        });
+      for (const id of Object.keys(players)) {
+        if (id !== localPlayerId) peerIds.push(id);
       }
     }
 
@@ -2984,10 +3031,6 @@ export function createGameEngine(opts: EngineOptions) {
       startTimerValue = 5;
       pushCountdown();
     } else if (mode === 'lan' && isHost) {
-      // LAN host: regenerate the island locally, recreate our own ball, and
-      // broadcast a fresh init to all connected guests. Guests will tear down
-      // their old state when they receive the init (see the init handler's
-      // isReinit branch).
       const islandTiles = generateIsland(islandSize, islandSeed);
       for (const t of islandTiles) createTile({ x: t.x, y: t.y, z: t.z }, t.id);
       spawnPowerupPickups();
@@ -3000,21 +3043,18 @@ export function createGameEngine(opts: EngineOptions) {
       pushCountdown();
       if (netClient) {
         try {
-          // Include ALL previously-connected guests in the players list, with
-          // their last-known positions. Each guest will see itself in the
-          // list and recreate its local ball. Without this, guests would be
-          // left without a ball after restart (the host's init normally only
-          // lists the host's ball; guests add themselves via a new-player
-          // round-trip that doesn't happen on restart because the data
-          // channel is already open).
+          // ALL players (host + guests) spawn at the new island center.
+          // Using the same spawn position ensures dead players don't respawn
+          // at their old death positions from the previous round.
+          const allPlayers = [
+            { id: localPlayerId, position: spawn },
+            ...peerIds.map((id) => ({ id, position: spawn })),
+          ];
           netClient.send({
             kind: 'init',
             gameId: 'lan',
             creatorId: localPlayerId,
-            players: [
-              { id: localPlayerId, position: spawn },
-              ...peerSnapshots,
-            ],
+            players: allPlayers,
             islandSeed,
             islandSize,
             startTimer: startTimerValue,

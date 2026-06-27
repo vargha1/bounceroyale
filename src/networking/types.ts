@@ -54,6 +54,7 @@ export type PlayerHitMessage = {
   kind: 'player-hit';
   targetId: string;
   impulse: { x: number; y: number; z: number };
+  damage?: number;
 };
 
 export type PlayerEliminatedMessage = {

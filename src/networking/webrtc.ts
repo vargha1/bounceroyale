@@ -1053,7 +1053,7 @@ export class WebRTCNetHost implements NetClient {
           this.emit({ type: 'damage-tile', data: { tileId: msg.tileId, damage: msg.damage } });
           break;
         case 'player-hit':
-          this.emit({ type: 'player-hit', data: { targetId: msg.targetId, impulse: msg.impulse } });
+          this.emit({ type: 'player-hit', data: { targetId: msg.targetId, impulse: msg.impulse, damage: (msg as any).damage } });
           break;
         case 'player-shot':
           this.emit({ type: 'player-shot', data: { id: playerId, weapon: msg.weapon, direction: msg.direction, origin: msg.origin } });
@@ -1528,7 +1528,7 @@ export class WebRTCNetGuest implements NetClient {
             this.emit({ type: 'damage-tile', data: { tileId: msg.tileId, damage: msg.damage } });
             break;
           case 'player-hit':
-            this.emit({ type: 'player-hit', data: { targetId: msg.targetId, impulse: msg.impulse } });
+            this.emit({ type: 'player-hit', data: { targetId: msg.targetId, impulse: msg.impulse, damage: (msg as any).damage } });
             break;
           case 'player-shot':
             this.emit({ type: 'player-shot', data: { id: msg.id, weapon: msg.weapon, direction: msg.direction, origin: msg.origin } });

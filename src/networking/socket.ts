@@ -158,7 +158,7 @@ export class SocketNetClient implements NetClient {
     this.socket.on('hexagon-collided', (data: any) => this.emit({ type: 'hexagon-collided', data: { index: data.index, playerId: data.playerId } }));
     this.socket.on('hexagon-broken', (data: any) => this.emit({ type: 'hexagon-broken', data: { index: data.index } }));
     this.socket.on('damage-tile', (data: any) => this.emit({ type: 'damage-tile', data: { tileId: data.tileId, damage: data.damage } }));
-    this.socket.on('player-hit', (data: any) => this.emit({ type: 'player-hit', data: { targetId: data.targetId, impulse: data.impulse } }));
+    this.socket.on('player-hit', (data: any) => this.emit({ type: 'player-hit', data: { targetId: data.targetId, impulse: data.impulse, damage: data.damage } }));
     this.socket.on('player-shot', (data: any) => this.emit({ type: 'player-shot', data: { id: data.id, weapon: data.weapon, direction: data.direction, origin: data.origin } }));
     this.socket.on('player-eliminated', (data: any) => this.emit({ type: 'player-eliminated', data: { id: data.id ?? data.playerId, rank: data.rank } }));
     this.socket.on('player-disconnected', (data: any) => this.emit({ type: 'player-disconnected', data: { id: data.id } }));
@@ -221,7 +221,7 @@ export class SocketNetClient implements NetClient {
         this.socket.emit('damage-tile', { gameId: gameIdStore, tileId: msg.tileId, damage: msg.damage });
         break;
       case 'player-hit':
-        this.socket.emit('player-hit', { gameId: gameIdStore, targetId: msg.targetId, impulse: msg.impulse });
+        this.socket.emit('player-hit', { gameId: gameIdStore, targetId: msg.targetId, impulse: msg.impulse, damage: (msg as any).damage });
         break;
       case 'player-shot':
         this.socket.emit('player-shot', { gameId: gameIdStore, id: msg.id, weapon: msg.weapon, direction: msg.direction, origin: msg.origin });
