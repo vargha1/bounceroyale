@@ -45,7 +45,8 @@ interface WeaponDef {
   name: string;
   damage: number;
   fireRate: number; // shots per second
-  maxAmmo: number;
+  maxAmmo: number; // magazine size
+  reserveAmmo: number; // extra rounds beyond the magazine
   reloadTime: number; // seconds
   spread: number; // radians
   range: number;
@@ -57,6 +58,7 @@ const WEAPONS: Record<WeaponType, WeaponDef> = {
     damage: 15,
     fireRate: 10,
     maxAmmo: 30,
+    reserveAmmo: 60, // 2 extra mags
     reloadTime: 2.5,
     spread: 0.04,
     range: 50,
@@ -67,6 +69,7 @@ const WEAPONS: Record<WeaponType, WeaponDef> = {
     damage: 45,
     fireRate: 2.5,
     maxAmmo: 7,
+    reserveAmmo: 21, // 3 extra mags
     reloadTime: 1.8,
     spread: 0.015,
     range: 70,
@@ -137,6 +140,7 @@ export interface EngineHudState {
   weapon: WeaponType;
   ammo: number;
   maxAmmo: number;
+  reserveAmmo: number;
   isReloading: boolean;
   reloadProgress: number; // 0..1
 }
@@ -246,9 +250,57 @@ export function createGameEngine(opts: EngineOptions) {
     }
   }
 
-  // Physics
-  const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
-  const eventQueue = new RAPIER.EventQueue(true);
+  /** Play a synthesized weapon fire sound using Web Audio API.
+   *  Different weapons get different timbres:
+   *    - AK-47: short, sharp crack (high-rate noise burst, fast decay)
+   *    - Desert Eagle: deeper boom (lower noise, slower decay, more bass)
+   *  No external audio files needed — works fully offline. */
+  function playFireSound() {
+    ensureAudio();
+    try {
+      const ctx = audioListener.context;
+      if (ctx.state === 'suspended') return;
+      const isAk = currentWeapon === 'ak47';
+      const duration = isAk ? 0.07 : 0.18;
+      const bufLen = Math.floor(ctx.sampleRate * duration);
+      const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < bufLen; i++) {
+        const t = i / ctx.sampleRate;
+        let sample: number;
+        if (isAk) {
+          // AK-47: sharp crack with fast decay
+          const env = Math.exp(-t * 55);
+          sample = (Math.random() * 2 - 1) * env * 0.5;
+          // Add a subtle low thump at the start
+          sample += Math.sin(t * 150) * Math.exp(-t * 30) * 0.3;
+        } else {
+          // Desert Eagle: deep boom with longer decay
+          const env = Math.exp(-t * 18);
+          sample = (Math.random() * 2 - 1) * env * 0.4;
+          // Stronger bass component
+          sample += Math.sin(t * 80) * Math.exp(-t * 15) * 0.5;
+          sample += Math.sin(t * 120) * Math.exp(-t * 20) * 0.2;
+        }
+        data[i] = sample;
+      }
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      const gain = ctx.createGain();
+      gain.gain.value = settings.masterVolume * (isAk ? 0.35 : 0.5);
+      src.connect(gain);
+      gain.connect(audioListener.context.destination);
+      src.start();
+    } catch {
+      /* ignore — audio context may not be ready */
+    }
+  }
+
+  // Physics — mutable so we can recreate on restart (Rapier's WASM can't
+  // safely reuse a World after bodies have been removed — it causes
+  // "recursive use of an object" aliasing errors).
+  let world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+  let eventQueue = new RAPIER.EventQueue(true);
 
   // World geometry (death floor for visualization only — actual death by Y check)
   const floorGeo = new THREE.CircleGeometry(80, 64);
@@ -313,7 +365,7 @@ export function createGameEngine(opts: EngineOptions) {
   const players: Record<string, PlayerClient> = {};
   const powerupPickups: PowerupPickup[] = [];
   const powerupPickupsById = new Map<string, PowerupPickup>();
-  const colliderHandleToPlayerId: Record<number, string> = {};
+  let colliderHandleToPlayerId: Record<number, string> = {};
   const particles: { mesh: THREE.Mesh; vel: THREE.Vector3; life: number; maxLife: number }[] = [];
   const tweenGroup = new Group();
 
@@ -362,6 +414,13 @@ export function createGameEngine(opts: EngineOptions) {
   // Weapon state
   let currentWeapon: WeaponType = 'ak47';
   let ammo: number = WEAPONS.ak47.maxAmmo;
+  let reserveAmmo: number = WEAPONS.ak47.reserveAmmo;
+  // Per-weapon ammo state — saved when switching away, restored when switching back.
+  // Without this, switching weapons resets ammo to full every time.
+  const weaponAmmoState: Record<WeaponType, { ammo: number; reserveAmmo: number }> = {
+    ak47: { ammo: WEAPONS.ak47.maxAmmo, reserveAmmo: WEAPONS.ak47.reserveAmmo },
+    desert_eagle: { ammo: WEAPONS.desert_eagle.maxAmmo, reserveAmmo: WEAPONS.desert_eagle.reserveAmmo },
+  };
   let isReloading = false;
   let reloadStartTime = 0;
   let lastFireTime = 0;
@@ -411,6 +470,7 @@ export function createGameEngine(opts: EngineOptions) {
       weapon: currentWeapon,
       ammo,
       maxAmmo: wdef.maxAmmo,
+      reserveAmmo,
       isReloading,
       reloadProgress: isReloading ? Math.min(1, (performance.now() - reloadStartTime) / (wdef.reloadTime * 1000)) : 0,
     });
@@ -483,8 +543,28 @@ export function createGameEngine(opts: EngineOptions) {
   function enablePhysics() {
     physicsEnabled = true;
     if (ballRigidBody) {
+      // Sync rigid body position from the mesh (mesh was set during createSphere)
+      const lp = players[localPlayerId];
+      if (lp) {
+        const mp = lp.mesh.position;
+        try {
+          ballRigidBody.setTranslation({ x: mp.x, y: mp.y, z: mp.z }, true);
+        } catch { /* ignore */ }
+      }
       ballRigidBody.setEnabled(true);
       ballRigidBody.wakeUp();
+      // Reset velocity so the ball doesn't carry stale momentum from a previous round
+      try {
+        ballRigidBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
+        ballRigidBody.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      } catch { /* ignore */ }
+    }
+    // Reset camera to follow the ball immediately (avoid smooth glide from old position)
+    const lp2 = players[localPlayerId];
+    if (lp2) {
+      const pos = lp2.mesh.position;
+      const eyeOffset = PLAYER_HEIGHT * 0.4;
+      camera.position.set(pos.x, pos.y + eyeOffset, pos.z);
     }
     if (netClient && mode !== 'single' && isHost) {
       netClient.send({ kind: 'game-started' });
@@ -950,29 +1030,37 @@ export function createGameEngine(opts: EngineOptions) {
 
   function createTile(pos: { x: number; y: number; z: number }, id: string) {
     if (tilesById.has(id)) return; // dedupe — stable IDs mean this can be called twice in multiplayer
-    const geo = createHexagonGeometry(TILE_RADIUS, TILE_HEIGHT);
-    // Colour by height: low = sandy beach, mid = grass, high = rock.
-    // Island heights span ~[0.3, 3.5] (see island.ts) — pick thresholds so
-    // we get a visible mix of sand (valleys & edges), grass (mid), and rock
-    // (peaks) instead of everything ending up grass.
+
+    // Wall tiles (IDs start with "w-") are taller, have a stone color,
+    // and are much harder to break than regular ground tiles.
+    const isWall = id.startsWith('w-');
+    const tileHeight = isWall ? 1.5 : TILE_HEIGHT;
+    const tileHealth = isWall ? 500 : TILE_MAX_HEALTH;
+
+    const geo = createHexagonGeometry(TILE_RADIUS, tileHeight);
+    // Colour by type and height.
     const baseColor = new THREE.Color();
-    const heightFactor = Math.min(1, pos.y / 3.5);
-    if (heightFactor < 0.25) {
-      baseColor.setHSL(0.12, 0.55, 0.62); // warm sand
-    } else if (heightFactor < 0.55) {
-      baseColor.setHSL(0.33, 0.65, 0.42); // grass green
+    if (isWall) {
+      baseColor.setHSL(0.06, 0.12, 0.38); // dark stone grey for walls
     } else {
-      baseColor.setHSL(0.08, 0.15, 0.45); // rock grey-brown
+      const heightFactor = Math.min(1, pos.y / 3.5);
+      if (heightFactor < 0.25) {
+        baseColor.setHSL(0.12, 0.55, 0.62); // warm sand
+      } else if (heightFactor < 0.55) {
+        baseColor.setHSL(0.33, 0.65, 0.42); // grass green
+      } else {
+        baseColor.setHSL(0.08, 0.15, 0.45); // rock grey-brown
+      }
     }
     const mat = new THREE.MeshStandardMaterial({
       color: baseColor.clone(),
       side: THREE.DoubleSide,
       transparent: true,
       opacity: 1,
-      roughness: 0.85,
-      metalness: 0.05,
+      roughness: isWall ? 0.95 : 0.85,
+      metalness: isWall ? 0.02 : 0.05,
       emissive: baseColor.clone(),
-      emissiveIntensity: 0.12,
+      emissiveIntensity: isWall ? 0.05 : 0.12,
     });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.position.set(pos.x, pos.y, pos.z);
@@ -984,9 +1072,8 @@ export function createGameEngine(opts: EngineOptions) {
     let collider: RAPIER.Collider | undefined;
     try {
       // Use a cuboid collider for the tile — much faster than a convex hull
-      // and close enough for a small hex. Half-extents approximate the hex's
-      // inscribed rectangle.
-      const desc = RAPIER.ColliderDesc.cuboid(TILE_RADIUS * 0.9, TILE_HEIGHT / 2, TILE_RADIUS * 0.866)
+      // and close enough for a small hex. Wall tiles use a taller collider.
+      const desc = RAPIER.ColliderDesc.cuboid(TILE_RADIUS * 0.9, tileHeight / 2, TILE_RADIUS * 0.866)
         .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
         .setCollisionGroups(ALL_INTERACTION | PLAYER_COLLISION_GROUP)
         .setSolverGroups(ALL_INTERACTION | PLAYER_COLLISION_GROUP);
@@ -1001,8 +1088,8 @@ export function createGameEngine(opts: EngineOptions) {
       mesh,
       rigidBody,
       collider,
-      health: TILE_MAX_HEALTH,
-      maxHealth: TILE_MAX_HEALTH,
+      health: tileHealth,
+      maxHealth: tileHealth,
       isBreaking: false,
       baseColor,
     };
@@ -1173,42 +1260,104 @@ export function createGameEngine(opts: EngineOptions) {
   /** Build a simple geometric weapon mesh */
   function buildWeaponMesh(type: WeaponType): THREE.Group {
     const group = new THREE.Group();
-    const gunMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.3, metalness: 0.8 });
-    const woodMat = new THREE.MeshStandardMaterial({ color: 0x8B4513, roughness: 0.7, metalness: 0.1 });
-
+    // AK-47: dark gunmetal body, wooden furniture, brass magazine
+    // Desert Eagle: silver/chrome slide, dark grip, gold accents
     if (type === 'ak47') {
+      const gunMetal = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, roughness: 0.25, metalness: 0.9 });
+      const darkMetal = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.3, metalness: 0.85 });
+      const wood = new THREE.MeshStandardMaterial({ color: 0x8B5A2B, roughness: 0.65, metalness: 0.05 });
+      const brass = new THREE.MeshStandardMaterial({ color: 0xb8860b, roughness: 0.35, metalness: 0.7 });
+      const orangeTip = new THREE.MeshStandardMaterial({ color: 0xff6600, roughness: 0.5, metalness: 0.2, emissive: new THREE.Color(0xff6600), emissiveIntensity: 0.3 });
+
       // Barrel
-      const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.04, 0.6), gunMat);
-      barrel.position.set(0, 0, -0.3);
+      const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.018, 0.55, 8), darkMetal);
+      barrel.rotation.x = Math.PI / 2;
+      barrel.position.set(0, 0.01, -0.38);
       group.add(barrel);
-      // Body
-      const body = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.08, 0.3), gunMat);
-      body.position.set(0, -0.02, 0.05);
+      // Muzzle tip
+      const muzzle = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.015, 0.05, 8), orangeTip);
+      muzzle.rotation.x = Math.PI / 2;
+      muzzle.position.set(0, 0.01, -0.66);
+      group.add(muzzle);
+      // Receiver body
+      const body = new THREE.Mesh(new THREE.BoxGeometry(0.055, 0.06, 0.28), gunMetal);
+      body.position.set(0, 0, 0.0);
       group.add(body);
+      // Dust cover (top)
+      const dustCover = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.015, 0.18), darkMetal);
+      dustCover.position.set(0, 0.037, -0.03);
+      group.add(dustCover);
+      // Wooden handguard
+      const handguard = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.04, 0.18), wood);
+      handguard.position.set(0, -0.01, -0.18);
+      group.add(handguard);
       // Stock
-      const stock = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.06, 0.2), woodMat);
-      stock.position.set(0, -0.02, 0.25);
+      const stock = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.055, 0.22), wood);
+      stock.position.set(0, -0.01, 0.24);
       group.add(stock);
-      // Magazine
-      const mag = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.12, 0.06), gunMat);
-      mag.position.set(0, -0.1, 0.05);
-      mag.rotation.x = 0.15;
+      // Butt plate
+      const butt = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.06, 0.02), darkMetal);
+      butt.position.set(0, -0.01, 0.35);
+      group.add(butt);
+      // Magazine (curved AK mag)
+      const mag = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.13, 0.055), brass);
+      mag.position.set(0, -0.09, 0.02);
+      mag.rotation.x = 0.2;
       group.add(mag);
-    } else {
-      // Desert Eagle - pistol shape
-      // Barrel
-      const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.03, 0.35), gunMat);
-      barrel.position.set(0, 0, -0.17);
-      group.add(barrel);
-      // Body/Slide
-      const slide = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.06, 0.25), gunMat);
-      slide.position.set(0, -0.01, 0.0);
-      group.add(slide);
-      // Grip
-      const grip = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.1, 0.05), woodMat);
-      grip.position.set(0, -0.08, 0.1);
+      // Pistol grip
+      const grip = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.08, 0.035), darkMetal);
+      grip.position.set(0, -0.06, 0.12);
       grip.rotation.x = 0.3;
       group.add(grip);
+    } else {
+      // Desert Eagle - big chrome pistol
+      const chrome = new THREE.MeshStandardMaterial({ color: 0xc0c0c0, roughness: 0.1, metalness: 0.95 });
+      const darkSteel = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.3, metalness: 0.85 });
+      const blackGrip = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.8, metalness: 0.1 });
+      const goldAccent = new THREE.MeshStandardMaterial({ color: 0xdaa520, roughness: 0.2, metalness: 0.9, emissive: new THREE.Color(0xdaa520), emissiveIntensity: 0.15 });
+      const orangeTip = new THREE.MeshStandardMaterial({ color: 0xff6600, roughness: 0.5, metalness: 0.2, emissive: new THREE.Color(0xff6600), emissiveIntensity: 0.3 });
+
+      // Barrel (thick, iconic DEagle)
+      const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.016, 0.32, 8), chrome);
+      barrel.rotation.x = Math.PI / 2;
+      barrel.position.set(0, 0.015, -0.22);
+      group.add(barrel);
+      // Muzzle brake
+      const muzzle = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.014, 0.06, 8), darkSteel);
+      muzzle.rotation.x = Math.PI / 2;
+      muzzle.position.set(0, 0.015, -0.40);
+      group.add(muzzle);
+      // Muzzle tip
+      const muzzleTip = new THREE.Mesh(new THREE.CylinderGeometry(0.01, 0.018, 0.02, 8), orangeTip);
+      muzzleTip.rotation.x = Math.PI / 2;
+      muzzleTip.position.set(0, 0.015, -0.43);
+      group.add(muzzleTip);
+      // Slide (top part, chrome)
+      const slide = new THREE.Mesh(new THREE.BoxGeometry(0.042, 0.04, 0.28), chrome);
+      slide.position.set(0, 0.01, -0.04);
+      group.add(slide);
+      // Gold accent line on slide
+      const accentLine = new THREE.Mesh(new THREE.BoxGeometry(0.044, 0.005, 0.04), goldAccent);
+      accentLine.position.set(0, 0.032, -0.04);
+      group.add(accentLine);
+      // Frame (lower receiver)
+      const frame = new THREE.Mesh(new THREE.BoxGeometry(0.038, 0.025, 0.16), darkSteel);
+      frame.position.set(0, -0.015, 0.02);
+      group.add(frame);
+      // Trigger guard
+      const triggerGuard = new THREE.Mesh(new THREE.BoxGeometry(0.005, 0.025, 0.05), darkSteel);
+      triggerGuard.position.set(0, -0.035, 0.05);
+      group.add(triggerGuard);
+      // Grip (black rubberized)
+      const grip = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.09, 0.04), blackGrip);
+      grip.position.set(0, -0.06, 0.09);
+      grip.rotation.x = 0.25;
+      group.add(grip);
+      // Grip gold insert
+      const gripInsert = new THREE.Mesh(new THREE.BoxGeometry(0.036, 0.03, 0.005), goldAccent);
+      gripInsert.position.set(0, -0.06, 0.07);
+      gripInsert.rotation.x = 0.25;
+      group.add(gripInsert);
     }
     return group;
   }
@@ -1250,7 +1399,13 @@ export function createGameEngine(opts: EngineOptions) {
     if (isReloading) {
       if (now - reloadStartTime >= wdef.reloadTime * 1000) {
         isReloading = false;
-        ammo = wdef.maxAmmo;
+        // Refill magazine from reserve ammo
+        const needed = wdef.maxAmmo - ammo;
+        const toLoad = Math.min(needed, reserveAmmo);
+        ammo += toLoad;
+        reserveAmmo -= toLoad;
+        // Keep per-weapon state in sync
+        weaponAmmoState[currentWeapon] = { ammo, reserveAmmo };
         pushHud();
       }
       return;
@@ -1261,9 +1416,14 @@ export function createGameEngine(opts: EngineOptions) {
       if (now - weaponSwitchStartTime >= WEAPON_SWITCH_TIME * 1000) {
         isSwitchingWeapon = false;
         if (pendingWeapon) {
+          // Save current weapon's ammo state before switching
+          weaponAmmoState[currentWeapon] = { ammo, reserveAmmo };
           currentWeapon = pendingWeapon;
           pendingWeapon = null;
-          ammo = WEAPONS[currentWeapon].maxAmmo;
+          // Restore the new weapon's saved ammo state
+          const saved = weaponAmmoState[currentWeapon];
+          ammo = saved.ammo;
+          reserveAmmo = saved.reserveAmmo;
           isReloading = false;
           setFpsWeapon(currentWeapon);
           // Update remote weapon mesh too
@@ -1280,9 +1440,11 @@ export function createGameEngine(opts: EngineOptions) {
       return;
     }
 
-    // Auto-reload when empty
+    // Auto-reload when empty (if we have reserve ammo)
     if (ammo <= 0 && isFiring) {
-      startReload();
+      if (reserveAmmo > 0) {
+        startReload();
+      }
       return;
     }
 
@@ -1301,6 +1463,20 @@ export function createGameEngine(opts: EngineOptions) {
     const wdef = WEAPONS[currentWeapon];
     ammo--;
     weaponRecoilOffset = 0.1;
+    // Keep per-weapon state in sync
+    weaponAmmoState[currentWeapon] = { ammo, reserveAmmo };
+
+    // Camera recoil — push the view up and slightly sideways
+    // AK-47: moderate kick per shot, fires fast so it stacks
+    // Desert Eagle: heavy kick per shot, fires slow
+    const isAk = currentWeapon === 'ak47';
+    const pitchRecoil = isAk ? 0.012 : 0.035; // radians upward
+    const yawRecoil = (Math.random() - 0.5) * (isAk ? 0.008 : 0.02); // random sideways
+    cameraPitch += pitchRecoil;
+    cameraAzimuth += yawRecoil;
+
+    // Play firing sound
+    playFireSound();
 
     // Muzzle flash
     muzzleFlashTimer = 50; // ms
@@ -1308,8 +1484,8 @@ export function createGameEngine(opts: EngineOptions) {
     // Calculate shot direction from camera
     const pos = ballRigidBody.translation();
     const direction = new THREE.Vector3(0, 0, -1);
-    // Apply camera azimuth and pitch
-    const euler = new THREE.Euler(cameraPitch, cameraAzimuth, 0, 'YXZ');
+    // Apply camera azimuth and pitch — negate azimuth to match camera convention
+    const euler = new THREE.Euler(cameraPitch, -cameraAzimuth, 0, 'YXZ');
     direction.applyEuler(euler);
 
     // Add spread
@@ -1364,6 +1540,38 @@ export function createGameEngine(opts: EngineOptions) {
       createParticleEffect(impactPoint, 0xffaa00, 3);
     }
 
+    // Weapon damage to tiles — raycast against tile positions to find what
+    // the bullet hit. Deals damage in a small radius at the impact point.
+    // AK-47: low per-shot damage but high rate of fire chips tiles away
+    // Desert Eagle: high per-shot damage, can crack tiles in a few hits
+    {
+      const tileDamage = wdef.damage; // weapon damage = tile damage
+      const tileDamageRadius = isAk ? 0.8 : 1.2; // desert eagle has bigger blast
+      // Find the closest tile along the ray
+      let closestTileDist = hitDistance; // don't shoot through players
+      let closestTile: TileClient | null = null;
+      for (const tile of tiles) {
+        if (tile.isBreaking) continue;
+        const tilePos = tile.mesh.position;
+        const toTile = new THREE.Vector3(tilePos.x - rayOrigin.x, tilePos.y - rayOrigin.y, tilePos.z - rayOrigin.z);
+        const projLen = toTile.dot(direction);
+        if (projLen < 0 || projLen > closestTileDist) continue;
+        const closestPoint = rayOrigin.clone().add(direction.clone().multiplyScalar(projLen));
+        const distToCenter = closestPoint.distanceTo(tilePos);
+        // Hex tile has radius ~0.6, height ~0.5 (walls 1.5). Use a generous
+        // hit radius so bullets hit tiles reliably.
+        const hitRadius = tilePos.y > 2 ? 1.2 : 0.9; // walls are taller → easier to hit
+        if (distToCenter < hitRadius && projLen < closestTileDist) {
+          closestTileDist = projLen;
+          closestTile = tile;
+        }
+      }
+      if (closestTile) {
+        const impactPos = rayOrigin.clone().add(direction.clone().multiplyScalar(closestTileDist));
+        damageTilesAt(impactPos, tileDamageRadius, tileDamage, null);
+      }
+    }
+
     // Broadcast shot
     if (netClient && mode !== 'single') {
       netClient.send({
@@ -1375,15 +1583,14 @@ export function createGameEngine(opts: EngineOptions) {
       });
     }
 
-    // Play collision sound as gunshot substitute
-    playSound(collisionSound, 0.5);
     pushHud();
   }
 
   function startReload() {
     if (isReloading || isSwitchingWeapon) return;
     const wdef = WEAPONS[currentWeapon];
-    if (ammo >= wdef.maxAmmo) return;
+    if (ammo >= wdef.maxAmmo) return; // magazine already full
+    if (reserveAmmo <= 0) return; // no reserve ammo to reload with
     isReloading = true;
     reloadStartTime = performance.now();
     pushHud();
@@ -1438,13 +1645,39 @@ export function createGameEngine(opts: EngineOptions) {
       }
     }
 
-    // Reload animation
+    // Reload animation — weapon tilts down, magazine comes out, new mag in, rack slide
     if (isReloading) {
       const wdef = WEAPONS[currentWeapon];
-      const progress = (performance.now() - reloadStartTime) / (wdef.reloadTime * 1000);
-      fpsWeaponGroup.rotation.x = Math.sin(progress * Math.PI) * 0.5;
+      const progress = Math.min(1, (performance.now() - reloadStartTime) / (wdef.reloadTime * 1000));
+      // Phase 1 (0-0.3): tilt weapon down and to the right
+      // Phase 2 (0.3-0.5): hold — mag out
+      // Phase 3 (0.5-0.7): hold — new mag in
+      // Phase 4 (0.7-1.0): rack slide and return to center
+      if (progress < 0.3) {
+        const t = progress / 0.3;
+        fpsWeaponGroup.rotation.z = t * 0.4;
+        fpsWeaponGroup.rotation.x = t * 0.3;
+        fpsWeaponGroup.position.y -= t * 0.15;
+      } else if (progress < 0.5) {
+        fpsWeaponGroup.rotation.z = 0.4;
+        fpsWeaponGroup.rotation.x = 0.3;
+        fpsWeaponGroup.position.y -= 0.15;
+      } else if (progress < 0.7) {
+        const t = (progress - 0.5) / 0.2;
+        fpsWeaponGroup.rotation.z = 0.4 * (1 - t);
+        fpsWeaponGroup.rotation.x = 0.3 * (1 - t);
+        fpsWeaponGroup.position.y -= 0.15 * (1 - t);
+      } else {
+        const t = (progress - 0.7) / 0.3;
+        // Rack slide: quick forward push then back
+        const rackMotion = t < 0.5 ? t * 2 * 0.06 : (1 - (t - 0.5) * 2) * 0.06;
+        fpsWeaponGroup.rotation.z = 0;
+        fpsWeaponGroup.rotation.x = 0;
+        fpsWeaponGroup.position.z -= rackMotion;
+      }
     } else {
-      fpsWeaponGroup.rotation.x *= 0.9;
+      fpsWeaponGroup.rotation.x *= 0.85;
+      fpsWeaponGroup.rotation.z *= 0.85;
     }
 
     // Muzzle flash timer
@@ -1533,9 +1766,12 @@ export function createGameEngine(opts: EngineOptions) {
     const stickMagY = Math.abs(joystickY) > 0.15 ? joystickY : 0;
     const stickMag = Math.min(1, Math.sqrt(stickMagX * stickMagX + stickMagY * stickMagY));
     const analogScale = (keys.w || keys.a || keys.s || keys.d) ? 1 : stickMag;
-    const adjustedAzimuth = cameraAzimuth + Math.PI / 2;
-    const ax = (moveX * Math.cos(adjustedAzimuth) - moveZ * Math.sin(adjustedAzimuth)) * moveAccel * dt * analogScale;
-    const az = (moveX * Math.sin(adjustedAzimuth) + moveZ * Math.cos(adjustedAzimuth)) * moveAccel * dt * analogScale;
+    // FPS movement: forward = (sin(az), 0, -cos(az)), right = (cos(az), 0, sin(az))
+    // direction = moveX * right + (-moveZ) * forward
+    //   X: moveX * cos(az) - moveZ * sin(az)
+    //   Z: moveX * sin(az) + moveZ * cos(az)
+    const ax = (moveX * Math.cos(cameraAzimuth) - moveZ * Math.sin(cameraAzimuth)) * moveAccel * dt * analogScale;
+    const az = (moveX * Math.sin(cameraAzimuth) + moveZ * Math.cos(cameraAzimuth)) * moveAccel * dt * analogScale;
     if (ax !== 0 || az !== 0) {
       try {
         ballRigidBody.applyImpulse({ x: ax, y: 0, z: az }, true);
@@ -1590,7 +1826,9 @@ export function createGameEngine(opts: EngineOptions) {
       addScore(50);
       isSpectating = true;
       callbacks.onSpectatingChange(true);
-      if (ballRigidBody) ballRigidBody.setEnabled(false);
+      if (ballRigidBody) {
+        try { ballRigidBody.setEnabled(false); } catch { /* ignore */ }
+      }
       // Pick the first alive player to spectate.
       const aliveForSpectate = Object.values(players).filter((pp) => !pp.eliminated);
       spectateTargetId = aliveForSpectate[0]?.id ?? null;
@@ -1600,6 +1838,16 @@ export function createGameEngine(opts: EngineOptions) {
       if (p.rigidBody) world.removeRigidBody(p.rigidBody);
     } catch { /* ignore */ }
     if (p.collider) delete colliderHandleToPlayerId[p.collider.handle];
+    // CRITICAL: After removing the rigid body from the world, null out the
+    // local ball references. The WASM object backing ballRigidBody is freed
+    // by world.removeRigidBody(), so any subsequent .linvel() / .translation()
+    // call on it will crash with "RuntimeError: unreachable". Without this,
+    // stepPhysics() continues executing after eliminatePlayer() returns and
+    // tries to read velocity on the freed body.
+    if (id === localPlayerId) {
+      ballRigidBody = null;
+      ballCollider = null;
+    }
 
     // Compute rank: the host (and single-player) is authoritative.
     // Rank = (number of players still alive AFTER this elimination) + 1.
@@ -2149,7 +2397,20 @@ export function createGameEngine(opts: EngineOptions) {
     }
 
     // Countdown check (every frame; cheap)
-    if (serverStartTime) pushCountdown();
+    if (serverStartTime) {
+      const elapsed = Date.now() - serverStartTime;
+      // Failsafe: if more than 10 seconds past the countdown end and physics
+      // still isn't enabled, force it. This handles edge cases where the
+      // countdown callback might not fire properly after a restart.
+      if (elapsed > startTimerValue * 1000 + 10000 && !physicsEnabled) {
+        console.warn('[ENGINE] Countdown failsafe triggered — forcing physics enable');
+        enablePhysics();
+        serverStartTime = null;
+        callbacks.onCountdown(null);
+      } else {
+        pushCountdown();
+      }
+    }
 
     // Camera (uses real dt so it feels identical at any FPS)
     updateCamera(realDt);
@@ -2247,15 +2508,25 @@ export function createGameEngine(opts: EngineOptions) {
         }
         // Death check
         if (p.y < DEATH_Y_LEVEL && !lp?.eliminated) eliminatePlayer(localPlayerId);
-        // Falling damage (skipped while invincibility is active — the player
-        // still falls but takes no HP loss from hard landings.)
-        if (p.y < -5 && !hasPowerUp('invincibility')) {
-          const v = ballRigidBody.linvel();
-          if (v.y < -10) updateHealth(-5);
-        }
       } catch {
-        /* ignore */
+        /* ignore — body may have been removed during eliminatePlayer */
       }
+    }
+
+    // After eliminatePlayer, ballRigidBody is nulled and gameEnded may be true.
+    // Bail out of the rest of stepPhysics to avoid accessing freed WASM objects.
+    if (gameEnded || !ballRigidBody) return;
+
+    // Falling damage (skipped while invincibility is active — the player
+    // still falls but takes no HP loss from hard landings.)
+    try {
+      const pos = ballRigidBody.translation();
+      if (pos.y < -5 && !hasPowerUp('invincibility')) {
+        const v = ballRigidBody.linvel();
+        if (v.y < -10) updateHealth(-5);
+      }
+    } catch {
+      /* ignore */
     }
 
     // Interpolate remote players (also runs when physicsEnabled=false, via
@@ -2269,35 +2540,39 @@ export function createGameEngine(opts: EngineOptions) {
 
     // Track peak downward velocity while airborne so we can convert it to
     // impact damage on landing.
-    if (ballRigidBody) {
-      const vel = ballRigidBody.linvel();
-      if (!contacted) {
-        wasAirborne = true;
-        if (vel.y < 0 && -vel.y > maxFallSpeed) {
-          maxFallSpeed = -vel.y;
-        }
-      } else {
-        // Just landed — if we were airborne with enough downward speed,
-        // deal damage to the tiles under us.
-        if (wasAirborne && maxFallSpeed > MIN_IMPACT_SPEED) {
-          const now = performance.now();
-          if (now - lastImpactTime > IMPACT_DEBOUNCE_MS) {
-            lastImpactTime = now;
-            const pos = ballRigidBody.translation();
-            // speedFactor: 1× at 10 m/s, up to 3× at 30+ m/s.
-            const speedFactor = Math.min(IMPACT_SPEED_MAX_FACTOR, maxFallSpeed / IMPACT_SPEED_REFERENCE);
-            const damage = BASE_TILE_DAMAGE * settings.islandDamageMultiplier * speedFactor;
-            const radius = IMPACT_RADIUS_BASE + speedFactor * IMPACT_RADIUS_SCALE;
-            // sourcePeer = null means "this is the local player's impact —
-            // broadcast to peers". Remote impacts pass a non-null sourcePeer
-            // so we don't re-broadcast.
-            damageTilesAt(new THREE.Vector3(pos.x, pos.y, pos.z), radius, damage, null);
-            playSound(collisionSound, 0.3 + speedFactor * 0.15);
+    try {
+      if (ballRigidBody) {
+        const vel = ballRigidBody.linvel();
+        if (!contacted) {
+          wasAirborne = true;
+          if (vel.y < 0 && -vel.y > maxFallSpeed) {
+            maxFallSpeed = -vel.y;
           }
+        } else {
+          // Just landed — if we were airborne with enough downward speed,
+          // deal damage to the tiles under us.
+          if (wasAirborne && maxFallSpeed > MIN_IMPACT_SPEED) {
+            const now = performance.now();
+            if (now - lastImpactTime > IMPACT_DEBOUNCE_MS) {
+              lastImpactTime = now;
+              const bp = ballRigidBody.translation();
+              // speedFactor: 1× at 10 m/s, up to 3× at 30+ m/s.
+              const speedFactor = Math.min(IMPACT_SPEED_MAX_FACTOR, maxFallSpeed / IMPACT_SPEED_REFERENCE);
+              const damage = BASE_TILE_DAMAGE * settings.islandDamageMultiplier * speedFactor;
+              const radius = IMPACT_RADIUS_BASE + speedFactor * IMPACT_RADIUS_SCALE;
+              // sourcePeer = null means "this is the local player's impact —
+              // broadcast to peers". Remote impacts pass a non-null sourcePeer
+              // so we don't re-broadcast.
+              damageTilesAt(new THREE.Vector3(bp.x, bp.y, bp.z), radius, damage, null);
+              playSound(collisionSound, 0.3 + speedFactor * 0.15);
+            }
+          }
+          wasAirborne = false;
+          maxFallSpeed = 0;
         }
-        wasAirborne = false;
-        maxFallSpeed = 0;
       }
+    } catch {
+      /* ignore — rigid body may have been freed */
     }
 
     // Coyote-time: when the ball is grounded, open a small window during
@@ -2406,7 +2681,13 @@ export function createGameEngine(opts: EngineOptions) {
         if (spectatedPlayer.nameLabel) spectatedPlayer.nameLabel.visible = true;
       }
     } else {
-      // First-person camera
+      // First-person camera — no positional smoothing needed because the
+      // camera IS the player. Smoothing the position to the ball causes
+      // jitter when jumping + looking down: the camera Y lags behind the
+      // ball Y, but the look direction uses the *desired* position, so the
+      // view direction flips rapidly between "above target" and "below
+      // target" each frame. Snapping the camera directly to the ball
+      // eliminates this mismatch entirely.
       const sens = settings.cameraSensitivity;
       cameraAzimuth += lookDelta * sens;
       cameraPitch += lookDeltaY * sens;
@@ -2416,22 +2697,18 @@ export function createGameEngine(opts: EngineOptions) {
       // Clamp pitch
       cameraPitch = Math.max(-Math.PI / 2.2, Math.min(Math.PI / 2.2, cameraPitch));
 
-      // Position camera at eye level
-      const eyeOffset = PLAYER_HEIGHT * 0.4; // Eyes near top of the sphere
-      const desiredX = tp.x;
-      const desiredY = tp.y + eyeOffset;
-      const desiredZ = tp.z;
-
-      const k = 1 - Math.exp(-dt * 30); // Snappier follow for FPS
-      camera.position.x += (desiredX - camera.position.x) * k;
-      camera.position.y += (desiredY - camera.position.y) * k;
-      camera.position.z += (desiredZ - camera.position.z) * k;
+      // Snap camera directly to ball eye position — no lerp/smoothing.
+      // The ball's physics already provide smooth motion; adding a lerp
+      // on top just introduces lag and jitter.
+      const eyeOffset = PLAYER_HEIGHT * 0.4;
+      camera.position.set(tp.x, tp.y + eyeOffset, tp.z);
 
       // Look direction based on azimuth + pitch
+      // Positive azimuth = look right, so look target shifts +X with sin(az)
       const lookTarget = new THREE.Vector3(
-        desiredX - Math.sin(cameraAzimuth) * Math.cos(cameraPitch),
-        desiredY + Math.sin(cameraPitch),
-        desiredZ - Math.cos(cameraAzimuth) * Math.cos(cameraPitch),
+        camera.position.x + Math.sin(cameraAzimuth) * Math.cos(cameraPitch),
+        camera.position.y + Math.sin(cameraPitch),
+        camera.position.z - Math.cos(cameraAzimuth) * Math.cos(cameraPitch),
       );
       camera.lookAt(lookTarget);
 
@@ -2554,33 +2831,37 @@ export function createGameEngine(opts: EngineOptions) {
     powerupPickups.length = 0;
     powerupPickupsById.clear();
 
-    // Remove all tiles (mesh + rigid body + disposals).
+    // Remove all tile meshes from the scene (no need to remove rigid bodies
+    // individually — we recreate the entire physics World below).
     for (const tile of tiles) {
       try { scene.remove(tile.mesh); } catch { /* ignore */ }
-      try {
-        if (tile.rigidBody) world.removeRigidBody(tile.rigidBody);
-      } catch { /* ignore */ }
       try { (tile.mesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
       try { tile.mesh.geometry.dispose(); } catch { /* ignore */ }
     }
     tiles.length = 0;
     tilesById.clear();
 
-    // Remove all players (mesh + rigid body + collider bookkeeping).
+    // Remove all player meshes from the scene.
     for (const id of Object.keys(players)) {
       const p = players[id];
       try { scene.remove(p.mesh); } catch { /* ignore */ }
-      try {
-        if (p.rigidBody) world.removeRigidBody(p.rigidBody);
-      } catch { /* ignore */ }
       try { (p.mesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
       try { p.mesh.geometry.dispose(); } catch { /* ignore */ }
-      if (p.collider) delete colliderHandleToPlayerId[p.collider.handle];
       delete players[id];
     }
 
-    // Drop the local ball references — the rigid body was removed above as
-    // part of the players loop (local player is in `players`).
+    // CRITICAL: Recreate the entire Rapier physics World instead of removing
+    // bodies individually. After removing many bodies from a Rapier World,
+    // the WASM memory gets into an inconsistent state that causes
+    // "recursive use of an object detected which would lead to unsafe aliasing
+    // in rust" errors when new bodies are created. A fresh World avoids this.
+    // The old World is dropped and its WASM memory freed by GC.
+    world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+    eventQueue = new RAPIER.EventQueue(true);
+    // Clear the collider→player mapping since all colliders are gone.
+    colliderHandleToPlayerId = {};
+
+    // Drop the local ball references — the old World is gone.
     ballRigidBody = null;
     ballCollider = null;
 
@@ -2612,19 +2893,23 @@ export function createGameEngine(opts: EngineOptions) {
     // Reset weapon state
     currentWeapon = 'ak47';
     ammo = WEAPONS.ak47.maxAmmo;
+    reserveAmmo = WEAPONS.ak47.reserveAmmo;
+    weaponAmmoState.ak47 = { ammo: WEAPONS.ak47.maxAmmo, reserveAmmo: WEAPONS.ak47.reserveAmmo };
+    weaponAmmoState.desert_eagle = { ammo: WEAPONS.desert_eagle.maxAmmo, reserveAmmo: WEAPONS.desert_eagle.reserveAmmo };
     isReloading = false;
+    isFiring = false;
+    isSwitchingWeapon = false;
     reloadStartTime = 0;
     lastFireTime = 0;
-    isSwitchingWeapon = false;
     weaponSwitchStartTime = 0;
     pendingWeapon = null;
-    isFiring = false;
     weaponRecoilOffset = 0;
     weaponBobTime = 0;
     muzzleFlashTimer = 0;
     cameraPitch = -0.3;
     lookDeltaY = 0;
     setFpsWeapon('ak47');
+    playerHealth = 100;
 
     // Notify the UI to clear its end-game / spectating / pause / countdown
     // state. The new match will re-push all of these as it starts.
@@ -2690,6 +2975,11 @@ export function createGameEngine(opts: EngineOptions) {
       spawnPowerupPickups();
       const spawn = getIslandSpawn(islandTiles);
       createSphere('local', spawn, true);
+      // Immediately position the camera at the new spawn point so the player
+      // doesn't see the old death position during the countdown.
+      camera.position.set(spawn.x, spawn.y + PLAYER_HEIGHT * 0.4, spawn.z);
+      cameraAzimuth = 0;
+      cameraPitch = -0.3;
       serverStartTime = Date.now() + 5 * 1000;
       startTimerValue = 5;
       pushCountdown();
@@ -2703,6 +2993,9 @@ export function createGameEngine(opts: EngineOptions) {
       spawnPowerupPickups();
       const spawn = getIslandSpawn(islandTiles);
       createSphere(localPlayerId, spawn, true);
+      camera.position.set(spawn.x, spawn.y + PLAYER_HEIGHT * 0.4, spawn.z);
+      cameraAzimuth = 0;
+      cameraPitch = -0.3;
       serverStartTime = Date.now() + startTimerValue * 1000;
       pushCountdown();
       if (netClient) {

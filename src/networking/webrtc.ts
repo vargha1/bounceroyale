@@ -1055,6 +1055,9 @@ export class WebRTCNetHost implements NetClient {
         case 'player-hit':
           this.emit({ type: 'player-hit', data: { targetId: msg.targetId, impulse: msg.impulse } });
           break;
+        case 'player-shot':
+          this.emit({ type: 'player-shot', data: { id: playerId, weapon: msg.weapon, direction: msg.direction, origin: msg.origin } });
+          break;
         case 'player-eliminated':
           // Guest telling host it died — re-broadcast with rank 0, host computes rank
           this.emit({ type: 'player-eliminated', data: { id: playerId, rank: 0 } });
@@ -1526,6 +1529,9 @@ export class WebRTCNetGuest implements NetClient {
             break;
           case 'player-hit':
             this.emit({ type: 'player-hit', data: { targetId: msg.targetId, impulse: msg.impulse } });
+            break;
+          case 'player-shot':
+            this.emit({ type: 'player-shot', data: { id: msg.id, weapon: msg.weapon, direction: msg.direction, origin: msg.origin } });
             break;
           case 'player-eliminated':
             this.emit({ type: 'player-eliminated', data: { id: msg.id, rank: msg.rank } });

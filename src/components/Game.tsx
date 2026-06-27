@@ -5,7 +5,6 @@ import { createGameEngine, type EngineHudState } from '../game/engine';
 import type { NetClient } from '../networking/types';
 import { SocketNetClient } from '../networking/socket';
 import Hud from './Hud';
-import MobileControls from './MobileControls';
 import PauseModal from './PauseModal';
 import EndGameModal from './EndGameModal';
 
@@ -13,9 +12,6 @@ interface Props {
   mode: 'single' | 'lan' | 'server';
   serverUrl?: string;
   gameId?: string;
-  /** For server mode: true if the user clicked "Create Game" (host), false if
-   *  "Join Game" (guest). For LAN mode, this is determined by the net client.
-   *  For single-player, it's always true. */
   isHost?: boolean;
   startTimer: number;
   onExit: () => void;
@@ -38,6 +34,7 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     weapon: 'ak47',
     ammo: 30,
     maxAmmo: 30,
+    reserveAmmo: 60,
     isReloading: false,
     reloadProgress: 0,
   });
@@ -45,9 +42,10 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
   const [spectating, setSpectating] = useState(false);
   const [paused, setPaused] = useState(false);
   const [endGame, setEndGame] = useState<{ rankings: { id: string; rank: number | null }[]; winner: string | null } | null>(null);
+  const endGameRef = useRef(endGame);
+  endGameRef.current = endGame;
   const [fps, setFps] = useState(60);
   const [localPlayerId, setLocalPlayerId] = useState<string>('local');
-  // In Game.tsx, outside useEffect (stable ref across renders)
   const mobileTouchState = useRef({
     joyId: null as number | null,
     joyStart: { x: 0, y: 0 },
@@ -61,8 +59,8 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
   });
 
   const jumpBtnRef = useRef<HTMLButtonElement | null>(null);
+  const fireBtnRef = useRef<HTMLButtonElement | null>(null);
 
-  // Centralized exit: closes the net client (if any) and notifies parent.
   const exitGame = useCallback(() => {
     const client = netClientRef.current;
     if (client) {
@@ -72,7 +70,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     onExit();
   }, [onExit]);
 
-  // NOTE: We intentionally do NOT auto-close the net client on unmount here.
   useEffect(() => {
     const onUnload = () => {
       const client = netClientRef.current;
@@ -81,9 +78,7 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
       }
     };
     window.addEventListener('beforeunload', onUnload);
-    return () => {
-      window.removeEventListener('beforeunload', onUnload);
-    };
+    return () => { window.removeEventListener('beforeunload', onUnload); };
   }, []);
 
   // Build the engine once on mount
@@ -94,7 +89,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     let engineDisposed = false;
 
     async function init() {
-      // Determine host status and create the network client if needed
       if (mode === 'lan') {
         let pending = (window as any).__bounceroyale_pendingNet as NetClient | undefined;
         if (netClientRef.current) {
@@ -140,9 +134,7 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         isHost = serverIsHost;
       }
 
-      if (cancelled) {
-        return;
-      }
+      if (cancelled) return;
 
       const engine = createGameEngine({
         mode,
@@ -172,36 +164,36 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
       setLocalPlayerId(engine.getLocalPlayerId());
       engine.start();
 
-      // Attach canvas
       const canvas = engine.getCanvas();
       if (canvasWrapRef.current) {
         canvasWrapRef.current.appendChild(canvas);
       }
 
-      // Attach CSS2D renderer element
       const css2dEl = engine.getCss2dElement();
       if (canvasWrapRef.current && css2dEl) {
         canvasWrapRef.current.appendChild(css2dEl);
       }
 
+      // ---- Touch handlers for mobile ----
       const onTouchStart = (e: TouchEvent) => {
         e.preventDefault();
         const w = window.innerWidth;
         for (let i = 0; i < e.changedTouches.length; i++) {
           const touch = e.changedTouches[i];
           const target = touch.target as HTMLElement | null;
-          if (target?.closest('.jump-btn') || target?.closest('.pause-btn') || target?.closest('.spectate-switch-btn') || target?.closest('.fire-btn')) continue;
+          // Skip button touches — they handle their own events
+          if (target?.closest('.jump-btn') || target?.closest('.fire-btn') || target?.closest('.pause-btn') || target?.closest('.spectate-switch-btn') || target?.closest('.weapon-switch-btn') || target?.closest('.reload-btn')) continue;
 
-          if (touch.clientX < w * 0.45) {
+          if (touch.clientX < w * 0.4) {
+            // Left zone = movement joystick
             mobileTouchState.joyId = touch.identifier;
             mobileTouchState.joyStart = { x: touch.clientX, y: touch.clientY };
             setMobileStick({ vis: true, x: 0, y: 0, baseX: touch.clientX, baseY: touch.clientY });
           } else {
+            // Right zone = look control (NO auto-fire here anymore)
             mobileTouchState.lookId = touch.identifier;
             mobileTouchState.lastLookX = touch.clientX;
             mobileTouchState.lastLookY = touch.clientY;
-            // Start firing on right-side touch
-            engine.setFiring(true);
           }
         }
       };
@@ -210,8 +202,8 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         e.preventDefault();
         for (let i = 0; i < e.changedTouches.length; i++) {
           const touch = e.changedTouches[i];
-          if (touch.identifier === mobileTouchState.joyId || touch.clientX < window.innerWidth * 0.45) {
-            if (touch.clientX < window.innerWidth * 0.45) mobileTouchState.joyId = touch.identifier;
+          if (touch.identifier === mobileTouchState.joyId || touch.clientX < window.innerWidth * 0.4) {
+            if (touch.clientX < window.innerWidth * 0.4) mobileTouchState.joyId = touch.identifier;
             const dx = (touch.clientX - mobileTouchState.joyStart.x) / 50;
             const dy = (touch.clientY - mobileTouchState.joyStart.y) / 50;
             const cx = Math.max(-1, Math.min(1, dx));
@@ -223,8 +215,10 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
             const dy = touch.clientY - mobileTouchState.lastLookY;
             mobileTouchState.lastLookX = touch.clientX;
             mobileTouchState.lastLookY = touch.clientY;
-            engine.addLookDelta(dx * 0.006);
-            engine.addLookDeltaY(dy * 0.006);
+            // Horizontal: swipe right = look right (positive dx = positive azimuth)
+            // Vertical: swipe DOWN = look DOWN (negative pitch), so NEGATE dy
+            engine.addLookDelta(dx * 0.005);
+            engine.addLookDeltaY(-dy * 0.005);
           }
         }
       };
@@ -239,7 +233,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
             setMobileStick({ vis: false, x: 0, y: 0, baseX: 0, baseY: 0 });
           } else if (touch.identifier === mobileTouchState.lookId) {
             mobileTouchState.lookId = null;
-            engine.setFiring(false);
           }
         }
       };
@@ -249,6 +242,8 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
       canvas.addEventListener('touchmove', onTouchMove, touchOpts);
       canvas.addEventListener('touchend', onTouchEnd, touchOpts);
       canvas.addEventListener('touchcancel', onTouchEnd, touchOpts);
+
+      // Jump button touch handler
       const jumpBtn = jumpBtnRef.current;
       const onJumpTouch = (e: TouchEvent) => {
         e.preventDefault();
@@ -260,18 +255,36 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         jumpBtn.addEventListener('touchstart', onJumpTouch, { passive: false, capture: true });
       }
 
+      // Fire button touch handler
+      const fireBtn = fireBtnRef.current;
+      const onFireTouchStart = (e: TouchEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        engine.setFiring(true);
+        engine.ensureAudio();
+      };
+      const onFireTouchEnd = (e: TouchEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        engine.setFiring(false);
+      };
+      if (fireBtn) {
+        fireBtn.addEventListener('touchstart', onFireTouchStart, { passive: false, capture: true });
+        fireBtn.addEventListener('touchend', onFireTouchEnd, { passive: false, capture: true });
+        fireBtn.addEventListener('touchcancel', onFireTouchEnd, { passive: false, capture: true });
+      }
+
       // FPS ticker
       const fpsInterval = window.setInterval(() => {
         setFps(engine.getFps());
       }, 500);
 
-      // Input handlers
+      // ---- Keyboard handlers ----
       const onKeyDown = (e: KeyboardEvent) => {
         if (e.key === 'Escape') {
           if (!paused) setPaused(true);
           return;
         }
-        // Changed from Tab to V for spectate switching (Tab does browser things)
         if ((e.key === 'v' || e.key === 'V') && spectating) {
           e.preventDefault();
           engine.switchSpectator();
@@ -290,9 +303,18 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         } else if (k === 'r') {
           engine.startReload();
         }
-        if (settings.pointerLock && !paused) {
-          const canvas2 = engine.getCanvas();
-          if (canvas2.requestPointerLock) canvas2.requestPointerLock();
+        if (settings.pointerLock && !paused && !endGameRef.current) {
+          // Delay pointer lock request to avoid SecurityError:
+          // "Pointer lock cannot be acquired immediately after the user
+          // has exited the lock." Browsers enforce a short grace period
+          // after pointer lock is released (e.g. by clicking a modal).
+          setTimeout(() => {
+            if (document.pointerLockElement || endGameRef.current) return;
+            const canvas2 = engine.getCanvas();
+            if (canvas2.requestPointerLock) {
+              canvas2.requestPointerLock().catch(() => { /* ignore SecurityError */ });
+            }
+          }, 200);
         }
       };
       const onKeyUp = (e: KeyboardEvent) => {
@@ -303,23 +325,31 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
           engine.setInput('space', false);
         }
       };
+
+      // ---- Mouse handlers ----
       const onMouseMove = (e: MouseEvent) => {
         if (paused) return;
         const dx = (e as any).movementX || 0;
         const dy = (e as any).movementY || 0;
+        // Horizontal: move right = look right (positive movementX = positive azimuth)
+        // Vertical: move mouse UP = look UP (negative movementY = positive pitch), so NEGATE dy
         engine.addLookDelta(dx * 0.002);
-        engine.addLookDeltaY(dy * 0.002);
+        engine.addLookDeltaY(-dy * 0.002);
       };
       const onMouseDown = (e: MouseEvent) => {
         if (paused || spectating) return;
-        if (e.button === 0) { // Left click = fire
+        if (e.button === 0) {
           engine.setFiring(true);
           engine.ensureAudio();
         }
-        // Request pointer lock on click
-        if (settings.pointerLock) {
-          const canvas2 = engine.getCanvas();
-          if (canvas2.requestPointerLock) canvas2.requestPointerLock();
+        if (settings.pointerLock && !endGameRef.current) {
+          setTimeout(() => {
+            if (document.pointerLockElement || endGameRef.current) return;
+            const canvas2 = engine.getCanvas();
+            if (canvas2.requestPointerLock) {
+              canvas2.requestPointerLock().catch(() => { /* ignore SecurityError */ });
+            }
+          }, 200);
         }
       };
       const onMouseUp = (e: MouseEvent) => {
@@ -329,14 +359,8 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
       };
       const onWheel = (e: WheelEvent) => {
         if (paused || spectating) return;
-        if (e.deltaY > 0) {
-          // Scroll down = switch to next weapon
-          const current = engine.getCurrentWeapon();
-          engine.switchWeapon(current === 'ak47' ? 'desert_eagle' : 'ak47');
-        } else {
-          const current = engine.getCurrentWeapon();
-          engine.switchWeapon(current === 'ak47' ? 'desert_eagle' : 'ak47');
-        }
+        const current = engine.getCurrentWeapon();
+        engine.switchWeapon(current === 'ak47' ? 'desert_eagle' : 'ak47');
       };
       const onResize = () => engine.resize();
       const onContext = (e: Event) => e.preventDefault();
@@ -370,6 +394,11 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         if (jumpBtn) {
           jumpBtn.removeEventListener('touchstart', onJumpTouch, { passive: false, capture: true } as AddEventListenerOptions);
         }
+        if (fireBtn) {
+          fireBtn.removeEventListener('touchstart', onFireTouchStart, { passive: false, capture: true } as AddEventListenerOptions);
+          fireBtn.removeEventListener('touchend', onFireTouchEnd, { passive: false, capture: true } as AddEventListenerOptions);
+          fireBtn.removeEventListener('touchcancel', onFireTouchEnd, { passive: false, capture: true } as AddEventListenerOptions);
+        }
         engineRef.current = null;
       };
     }
@@ -384,40 +413,34 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Sync settings changes to the engine
   useEffect(() => {
     if (engineRef.current) engineRef.current.updateSettings(useSettings.getState());
   }, [settings.masterVolume, settings.gameSpeed, settings.graphicsQuality, settings.cameraSensitivity, settings.pointerLock, settings.showFps]);
 
-  // Pause handling
   useEffect(() => {
     engineRef.current?.setPaused(paused);
   }, [paused]);
 
-  const handlePause = useCallback(() => {
-    setPaused(true);
-  }, []);
-  const handleSwitchSpectate = useCallback(() => {
-    engineRef.current?.switchSpectator();
-  }, []);
+  const handlePause = useCallback(() => { setPaused(true); }, []);
+  const handleSwitchSpectate = useCallback(() => { engineRef.current?.switchSpectator(); }, []);
 
   const canRestart = mode === 'single' || (mode === 'lan' && hud.isHost);
   const handleRestart = useCallback(() => {
     const engine = engineRef.current;
     if (!engine) return;
-    if (mode === 'server') {
-      onError(t('restartOnlyHost', lang));
-      return;
-    }
-    if (mode === 'lan' && !hud.isHost) {
-      onError(t('restartOnlyHost', lang));
-      return;
-    }
+    if (mode === 'server') { onError(t('restartOnlyHost', lang)); return; }
+    if (mode === 'lan' && !hud.isHost) { onError(t('restartOnlyHost', lang)); return; }
     const ok = engine.restart();
-    if (!ok) {
-      onError(t('restartOnlyHost', lang));
-    }
+    if (!ok) onError(t('restartOnlyHost', lang));
   }, [mode, hud.isHost, lang, onError]);
+
+  const handleWeaponSwitch = useCallback(() => {
+    engineRef.current?.switchWeapon(hud.weapon === 'ak47' ? 'desert_eagle' : 'ak47');
+  }, [hud.weapon]);
+
+  const handleReload = useCallback(() => {
+    engineRef.current?.startReload();
+  }, []);
 
   return (
     <div className="game-container">
@@ -432,13 +455,39 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         onSwitchSpectate={handleSwitchSpectate}
         spectating={spectating}
       />
-      <button
-        ref={jumpBtnRef}
-        className="jump-btn"
-        style={{ position: 'absolute', bottom: 30, right: 30, zIndex: 20, pointerEvents: 'auto' }}
-      >
-        {t('jump', lang)}
-      </button>
+
+      {/* Mobile controls - right side */}
+      <div className="mobile-controls-panel">
+        <button
+          ref={fireBtnRef}
+          className="fire-btn"
+          aria-label="Fire"
+        >
+          🔥
+        </button>
+        <button
+          ref={jumpBtnRef}
+          className="jump-btn"
+          aria-label="Jump"
+        >
+          {t('jump', lang)}
+        </button>
+        <button
+          className="weapon-switch-btn"
+          onTouchStart={(e) => { e.preventDefault(); e.stopPropagation(); handleWeaponSwitch(); }}
+          aria-label="Switch weapon"
+        >
+          ⇄
+        </button>
+        <button
+          className="reload-btn"
+          onTouchStart={(e) => { e.preventDefault(); e.stopPropagation(); handleReload(); }}
+          aria-label="Reload"
+        >
+          ↻
+        </button>
+      </div>
+
       {mobileStick.vis && (
         <div className="joystick floating" style={{
           position: 'absolute',
@@ -469,10 +518,7 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
       {paused && !endGame && (
         <PauseModal
           onResume={() => setPaused(false)}
-          onExit={() => {
-            setPaused(false);
-            exitGame();
-          }}
+          onExit={() => { setPaused(false); exitGame(); }}
           onRestart={handleRestart}
           canRestart={canRestart}
         />

@@ -99,6 +99,10 @@ export default function Hud({ hud, fps, showFps, localPlayerId, mode, onPause, o
           </span>
           <span className="ammo-separator">/</span>
           <span className="ammo-max">{hud.maxAmmo}</span>
+          <span className="ammo-separator" style={{ marginLeft: '0.4em', opacity: 0.5 }}>|</span>
+          <span className="ammo-reserve" style={{ marginLeft: '0.3em', opacity: 0.7, fontSize: '0.85em' }}>
+            {hud.reserveAmmo}
+          </span>
         </div>
         {hud.isReloading && (
           <div className="reload-bar">
