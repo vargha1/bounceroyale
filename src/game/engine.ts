@@ -1663,15 +1663,6 @@ export function createGameEngine(opts: EngineOptions) {
     // Recoil recovery
     weaponRecoilOffset *= 0.85;
 
-    // Rotate weapon to match camera look direction (azimuth + pitch).
-    // The weapon "points forward" in its local -Z, so we apply the same
-    // Euler as the shooting direction but inverted so it faces the same way
-    // the camera is looking. This makes the gun barrel follow the crosshair.
-    // Pitch: tilt gun up/down with camera. Azimuth: rotate gun left/right.
-    // We apply these to the group's Y and X rotation, preserving Z for reload.
-    fpsWeaponGroup.rotation.y = -cameraAzimuth;
-    fpsWeaponGroup.rotation.x = cameraPitch;
-
     // Position weapon in front of camera
     fpsWeaponGroup.position.set(
       0.25 + bobX,
@@ -1693,38 +1684,30 @@ export function createGameEngine(opts: EngineOptions) {
     if (isReloading) {
       const wdef = WEAPONS[currentWeapon];
       const progress = Math.min(1, (performance.now() - reloadStartTime) / (wdef.reloadTime * 1000));
-      // Phase 1 (0-0.3): tilt weapon down and to the right
-      // Phase 2 (0.3-0.5): hold — mag out
-      // Phase 3 (0.5-0.7): hold — new mag in
-      // Phase 4 (0.7-1.0): rack slide and return to center
-      let reloadTiltX = 0;
-      let reloadTiltZ = 0;
-      let reloadDropY = 0;
-      let reloadPushZ = 0;
       if (progress < 0.3) {
         const t = progress / 0.3;
-        reloadTiltZ = t * 0.4;
-        reloadTiltX = t * 0.3;
-        reloadDropY = t * 0.15;
+        fpsWeaponGroup.rotation.z = t * 0.4;
+        fpsWeaponGroup.rotation.x = t * 0.3;
+        fpsWeaponGroup.position.y -= t * 0.15;
       } else if (progress < 0.5) {
-        reloadTiltZ = 0.4;
-        reloadTiltX = 0.3;
-        reloadDropY = 0.15;
+        fpsWeaponGroup.rotation.z = 0.4;
+        fpsWeaponGroup.rotation.x = 0.3;
+        fpsWeaponGroup.position.y -= 0.15;
       } else if (progress < 0.7) {
         const t = (progress - 0.5) / 0.2;
-        reloadTiltZ = 0.4 * (1 - t);
-        reloadTiltX = 0.3 * (1 - t);
-        reloadDropY = 0.15 * (1 - t);
+        fpsWeaponGroup.rotation.z = 0.4 * (1 - t);
+        fpsWeaponGroup.rotation.x = 0.3 * (1 - t);
+        fpsWeaponGroup.position.y -= 0.15 * (1 - t);
       } else {
         const t = (progress - 0.7) / 0.3;
-        // Rack slide: quick forward push then back
-        reloadPushZ = t < 0.5 ? t * 2 * 0.06 : (1 - (t - 0.5) * 2) * 0.06;
+        const rackMotion = t < 0.5 ? t * 2 * 0.06 : (1 - (t - 0.5) * 2) * 0.06;
+        fpsWeaponGroup.rotation.z = 0;
+        fpsWeaponGroup.rotation.x = 0;
+        fpsWeaponGroup.position.z -= rackMotion;
       }
-      // Apply camera rotation + reload tilt on top
-      fpsWeaponGroup.rotation.x = cameraPitch + reloadTiltX;
-      fpsWeaponGroup.rotation.z = reloadTiltZ;
-      fpsWeaponGroup.position.y -= reloadDropY;
-      fpsWeaponGroup.position.z -= reloadPushZ;
+    } else {
+      fpsWeaponGroup.rotation.x *= 0.85;
+      fpsWeaponGroup.rotation.z *= 0.85;
     }
 
     // Muzzle flash timer
@@ -2687,6 +2670,18 @@ export function createGameEngine(opts: EngineOptions) {
       p.mesh.position.lerp(tp, 0.2);
       const tq = new THREE.Quaternion(p.targetRotation.x, p.targetRotation.y, p.targetRotation.z, p.targetRotation.w);
       p.mesh.quaternion.slerp(tq, 0.2);
+      // Counter-rotate the weapon group so it stays upright (doesn't roll
+      // with the ball). The weaponGroup is a child of the mesh, so it
+      // inherits the ball's quaternion. We apply the inverse to cancel it out.
+      if (p.weaponGroup) {
+        const invQ = p.mesh.quaternion.clone().invert();
+        p.weaponGroup.quaternion.copy(invQ);
+      }
+      // Counter-rotate the name label so it stays readable (not rolled)
+      if (p.nameLabel) {
+        const invQ = p.mesh.quaternion.clone().invert();
+        p.nameLabel.quaternion.copy(invQ);
+      }
       if (tp.y < DEATH_Y_LEVEL && !p.eliminated) {
         // Remote player fell — host will broadcast, but as a fallback we eliminate locally too.
         if (isHost || mode === 'single') eliminatePlayer(id);
