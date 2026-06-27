@@ -1221,23 +1221,30 @@ export function createGameEngine(opts: EngineOptions) {
     scene.add(mesh);
 
     // Player name label (Minecraft-style, above head)
+    // Added directly to the scene (NOT as a child of the mesh) so it stays
+    // upright and doesn't orbit with the ball's rotation. Position is updated
+    // in interpolateRemotePlayers().
     const nameDiv = document.createElement('div');
     nameDiv.className = 'player-name-label';
     nameDiv.textContent = id.length > 10 ? id.slice(0, 10) + '...' : id;
     nameDiv.style.cssText = 'background: rgba(0,0,0,0.6); color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-family: monospace; white-space: nowrap; text-align: center; pointer-events: none; user-select: none;';
     const nameLabel = new CSS2DObject(nameDiv);
-    nameLabel.position.set(0, PLAYER_RADIUS + 0.6, 0);
-    mesh.add(nameLabel);
+    nameLabel.position.set(pos.x, pos.y + PLAYER_RADIUS + 0.6, pos.z);
+    scene.add(nameLabel);
 
     // Weapon group for this player (visible on remote players)
+    // Added directly to the scene (NOT as a child of the mesh) so it doesn't
+    // orbit with the ball's rotation. It stays at a fixed offset above and
+    // to the side of the ball, always upright. Position is updated in
+    // interpolateRemotePlayers().
     const weaponGroup = new THREE.Group();
-    weaponGroup.position.set(0.3, 0.1, -0.5); // offset to the right and forward
-    mesh.add(weaponGroup);
+    weaponGroup.position.set(pos.x + 0.3, pos.y + 0.3, pos.z - 0.3); // offset above and to the right/forward
+    scene.add(weaponGroup);
 
-    // Muzzle flash light
+    // Muzzle flash light — also scene-level, positioned relative to the weapon
     const muzzleFlash = new THREE.PointLight(0xffaa00, 0, 5);
-    muzzleFlash.position.set(0.3, 0.1, -1.0);
-    mesh.add(muzzleFlash);
+    muzzleFlash.position.set(pos.x + 0.3, pos.y + 0.3, pos.z - 0.8);
+    scene.add(muzzleFlash);
 
     // Build a simple weapon mesh for remote players
     const remoteWeaponMesh = buildWeaponMesh('ak47');
@@ -1618,6 +1625,8 @@ export function createGameEngine(opts: EngineOptions) {
       });
     }
 
+    // Play collision sound as gunshot substitute
+    playSound(collisionSound, 0.5);
     pushHud();
   }
 
@@ -1864,6 +1873,11 @@ export function createGameEngine(opts: EngineOptions) {
       spectateTargetId = aliveForSpectate[0]?.id ?? null;
     }
     try { scene.remove(p.mesh); } catch { /* ignore */ }
+    // Also remove scene-level children (weaponGroup, nameLabel, muzzleFlash)
+    // that are NOT children of the mesh.
+    if (p.weaponGroup) { try { scene.remove(p.weaponGroup); } catch { /* ignore */ } }
+    if (p.nameLabel) { try { scene.remove(p.nameLabel); } catch { /* ignore */ } }
+    if (p.muzzleFlash) { try { scene.remove(p.muzzleFlash); } catch { /* ignore */ } }
     try {
       if (p.rigidBody) world.removeRigidBody(p.rigidBody);
     } catch { /* ignore */ }
@@ -2127,6 +2141,9 @@ export function createGameEngine(opts: EngineOptions) {
                 spectateTargetId = aliveForSpectate[0]?.id ?? null;
               }
               try { scene.remove(p.mesh); } catch { /* ignore */ }
+              if (p.weaponGroup) { try { scene.remove(p.weaponGroup); } catch { /* ignore */ } }
+              if (p.nameLabel) { try { scene.remove(p.nameLabel); } catch { /* ignore */ } }
+              if (p.muzzleFlash) { try { scene.remove(p.muzzleFlash); } catch { /* ignore */ } }
               try {
                 if (p.rigidBody) world.removeRigidBody(p.rigidBody);
               } catch { /* ignore */ }
@@ -2147,6 +2164,9 @@ export function createGameEngine(opts: EngineOptions) {
           const p = players[ev.data.id];
           if (p) {
             try { scene.remove(p.mesh); } catch { /* ignore */ }
+            if (p.weaponGroup) { try { scene.remove(p.weaponGroup); } catch { /* ignore */ } }
+            if (p.nameLabel) { try { scene.remove(p.nameLabel); } catch { /* ignore */ } }
+            if (p.muzzleFlash) { try { scene.remove(p.muzzleFlash); } catch { /* ignore */ } }
             try {
               if (p.rigidBody) world.removeRigidBody(p.rigidBody);
             } catch { /* ignore */ }
@@ -2541,6 +2561,19 @@ export function createGameEngine(opts: EngineOptions) {
         if (lp) {
           lp.mesh.position.set(p.x, p.y, p.z);
           lp.mesh.quaternion.set(r.x, r.y, r.z, r.w);
+          // Also update scene-level children (weaponGroup, nameLabel, muzzleFlash)
+          // that are not children of the mesh. Even though they're hidden in
+          // first-person, the muzzle flash needs to be near the player to
+          // illuminate nearby surfaces.
+          if (lp.weaponGroup) {
+            lp.weaponGroup.position.set(p.x + 0.3, p.y + 0.3, p.z - 0.3);
+          }
+          if (lp.nameLabel) {
+            lp.nameLabel.position.set(p.x, p.y + PLAYER_RADIUS + 0.6, p.z);
+          }
+          if (lp.muzzleFlash) {
+            lp.muzzleFlash.position.set(p.x + 0.3, p.y + 0.3, p.z - 0.8);
+          }
         }
         // Death check
         if (p.y < DEATH_Y_LEVEL && !lp?.eliminated) eliminatePlayer(localPlayerId);
@@ -2670,17 +2703,20 @@ export function createGameEngine(opts: EngineOptions) {
       p.mesh.position.lerp(tp, 0.2);
       const tq = new THREE.Quaternion(p.targetRotation.x, p.targetRotation.y, p.targetRotation.z, p.targetRotation.w);
       p.mesh.quaternion.slerp(tq, 0.2);
-      // Counter-rotate the weapon group so it stays upright (doesn't roll
-      // with the ball). The weaponGroup is a child of the mesh, so it
-      // inherits the ball's quaternion. We apply the inverse to cancel it out.
+      // Position the weapon group, name label, and muzzle flash in world space
+      // (they are direct children of the scene, not the mesh). This prevents
+      // them from orbiting around the ball center as the ball rolls. They stay
+      // at a fixed upright offset relative to the ball's center position.
+      const ballPos = p.mesh.position;
       if (p.weaponGroup) {
-        const invQ = p.mesh.quaternion.clone().invert();
-        p.weaponGroup.quaternion.copy(invQ);
+        p.weaponGroup.position.set(ballPos.x + 0.3, ballPos.y + 0.3, ballPos.z - 0.3);
+        // Weapon stays upright — no rotation needed since it's not a child of the ball
       }
-      // Counter-rotate the name label so it stays readable (not rolled)
       if (p.nameLabel) {
-        const invQ = p.mesh.quaternion.clone().invert();
-        p.nameLabel.quaternion.copy(invQ);
+        p.nameLabel.position.set(ballPos.x, ballPos.y + PLAYER_RADIUS + 0.6, ballPos.z);
+      }
+      if (p.muzzleFlash) {
+        p.muzzleFlash.position.set(ballPos.x + 0.3, ballPos.y + 0.3, ballPos.z - 0.8);
       }
       if (tp.y < DEATH_Y_LEVEL && !p.eliminated) {
         // Remote player fell — host will broadcast, but as a fallback we eliminate locally too.
@@ -2727,6 +2763,7 @@ export function createGameEngine(opts: EngineOptions) {
       if (spectatedPlayer) {
         spectatedPlayer.mesh.visible = true;
         if (spectatedPlayer.nameLabel) spectatedPlayer.nameLabel.visible = true;
+        if (spectatedPlayer.weaponGroup) spectatedPlayer.weaponGroup.visible = true;
       }
     } else {
       // First-person camera — no positional smoothing needed because the
@@ -2889,12 +2926,32 @@ export function createGameEngine(opts: EngineOptions) {
     tiles.length = 0;
     tilesById.clear();
 
-    // Remove all player meshes from the scene.
+    // Remove all player meshes, weapon groups, name labels, and muzzle flashes from the scene.
     for (const id of Object.keys(players)) {
       const p = players[id];
       try { scene.remove(p.mesh); } catch { /* ignore */ }
       try { (p.mesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
       try { p.mesh.geometry.dispose(); } catch { /* ignore */ }
+      // weaponGroup, nameLabel, and muzzleFlash are direct children of the scene
+      // (not the mesh), so we must remove them separately.
+      if (p.weaponGroup) {
+        try { scene.remove(p.weaponGroup); } catch { /* ignore */ }
+        // Dispose weapon mesh children
+        p.weaponGroup.traverse((child) => {
+          if ((child as any).geometry) try { (child as any).geometry.dispose(); } catch { /* ignore */ }
+          if ((child as any).material) {
+            const mat = (child as any).material;
+            if (Array.isArray(mat)) mat.forEach((m: THREE.Material) => { try { m.dispose(); } catch { /* ignore */ } });
+            else try { mat.dispose(); } catch { /* ignore */ }
+          }
+        });
+      }
+      if (p.nameLabel) {
+        try { scene.remove(p.nameLabel); } catch { /* ignore */ }
+      }
+      if (p.muzzleFlash) {
+        try { scene.remove(p.muzzleFlash); } catch { /* ignore */ }
+      }
       delete players[id];
     }
 
@@ -3031,6 +3088,13 @@ export function createGameEngine(opts: EngineOptions) {
       spawnPowerupPickups();
       const spawn = getIslandSpawn(islandTiles);
       createSphere(localPlayerId, spawn, true);
+      // Also recreate guest player entries on the host side so the host can
+      // see and track guests after restart. Without this, resetGameState()
+      // clears the players map and only the local sphere is recreated — the
+      // host loses all guest entries and can't see or rank them.
+      for (const peerId of peerIds) {
+        createSphere(peerId, spawn, false);
+      }
       camera.position.set(spawn.x, spawn.y + PLAYER_HEIGHT * 0.4, spawn.z);
       cameraAzimuth = 0;
       cameraPitch = -0.3;
