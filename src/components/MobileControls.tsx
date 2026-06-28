@@ -59,6 +59,7 @@ export default function MobileControls({ onButtonAction }: Props) {
             color={control.color}
             icon={control.icon}
             action={control.action}
+            hold={!!control.hold}
             onButtonAction={onButtonAction}
           />
         );
@@ -74,14 +75,28 @@ interface MobileButtonProps {
   color: string;
   icon: string;
   action: string;
+  /** If true, fires action on press and `${action}:release` on release
+   *  (for auto-fire). Otherwise fires action on release (tap-style). */
+  hold?: boolean;
   onButtonAction?: (action: string) => void;
 }
 
 /** A single mobile button. Uses native touch listeners (passive: false) so we
  *  can preventDefault and avoid the 300ms tap delay / touch→click gap. Also
- *  supports mouse for desktop testing. */
-function MobileButton({ x, y, size, color, icon, action, onButtonAction }: MobileButtonProps) {
+ *  supports mouse for desktop testing.
+ *
+ *  Two action modes:
+ *   - Tap (default): fires `action` once on release (touchend / click).
+ *     Used for jump, reload, switch weapon, pause.
+ *   - Hold (hold=true): fires `action` on press (touchstart / mousedown) and
+ *     `${action}:release` on release (touchend / mouseup). Used for the fire
+ *     button so the weapon keeps firing while the button is held. */
+function MobileButton({ x, y, size, color, icon, action, hold, onButtonAction }: MobileButtonProps) {
   const nodeRef = useRef<HTMLDivElement | null>(null);
+  // Tracks whether a "press" has been fired for hold-style buttons, so the
+  // matching "release" only fires if the press actually went out (and so we
+  // don't double-fire on stray mouseup without mousedown, etc.).
+  const pressFiredRef = useRef(false);
 
   useEffect(() => {
     const node = nodeRef.current;
@@ -97,6 +112,10 @@ function MobileButton({ x, y, size, color, icon, action, onButtonAction }: Mobil
       const touch = e.changedTouches[0];
       touchActive = true;
       touchId = touch.identifier;
+      if (hold) {
+        pressFiredRef.current = true;
+        onButtonAction(action);
+      }
     };
     const onTouchEnd = (e: TouchEvent) => {
       e.preventDefault();
@@ -106,12 +125,26 @@ function MobileButton({ x, y, size, color, icon, action, onButtonAction }: Mobil
         if (e.changedTouches[i].identifier === touchId) {
           touchActive = false;
           touchId = null;
-          onButtonAction(action);
+          if (hold) {
+            if (pressFiredRef.current) {
+              pressFiredRef.current = false;
+              onButtonAction(action + ':release');
+            }
+          } else {
+            onButtonAction(action);
+          }
           return;
         }
       }
     };
     const onTouchCancel = () => {
+      // If a press was fired, fire the matching release so the engine
+      // doesn't get stuck in "firing" state when a touch is interrupted
+      // (e.g. by an incoming phone call, notification gesture, etc.).
+      if (hold && pressFiredRef.current) {
+        pressFiredRef.current = false;
+        onButtonAction(action + ':release');
+      }
       touchActive = false;
       touchId = null;
     };
@@ -126,12 +159,35 @@ function MobileButton({ x, y, size, color, icon, action, onButtonAction }: Mobil
       node.removeEventListener('touchend', onTouchEnd, opts);
       node.removeEventListener('touchcancel', onTouchCancel, opts);
     };
-  }, [action, onButtonAction]);
+  }, [action, hold, onButtonAction]);
 
+  // Mouse handlers (desktop testing). For hold buttons, fire on mousedown
+  // and release on mouseup. For tap buttons, fire on click only (avoids the
+  // previous double-fire from having both mousedown and click handlers).
   const onMouseDown = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    onButtonAction?.(action);
+    if (hold) {
+      pressFiredRef.current = true;
+      onButtonAction?.(action);
+    }
+  };
+
+  const onMouseUp = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (hold && pressFiredRef.current) {
+      pressFiredRef.current = false;
+      onButtonAction?.(action + ':release');
+    }
+  };
+
+  const onClick = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!hold) {
+      onButtonAction?.(action);
+    }
   };
 
   return (
@@ -139,11 +195,8 @@ function MobileButton({ x, y, size, color, icon, action, onButtonAction }: Mobil
       ref={nodeRef}
       data-mobile-btn="true"
       onMouseDown={onMouseDown}
-      onClick={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        onButtonAction?.(action);
-      }}
+      onMouseUp={onMouseUp}
+      onClick={onClick}
       style={{
         position: 'absolute',
         left: `${x}%`,

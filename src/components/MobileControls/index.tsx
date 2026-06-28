@@ -14,11 +14,15 @@ export interface MobileControlConfig {
   icon: string;
   action: string;
   color: string;
+  /** If true, the button fires the action on press and a `:release`
+   *  action on release (e.g. for auto-fire while held). Otherwise the
+   *  action fires on release (tap-style — jump, reload, switch, pause). */
+  hold?: boolean;
 }
 
 /** Default controls that are always present */
 export const DEFAULT_CONTROLS: MobileControlConfig[] = [
-  { id: 'fire', label: 'Fire', size: 80, icon: '🔫', action: 'fire', color: '#ff6b35' },
+  { id: 'fire', label: 'Fire', size: 80, icon: '🔫', action: 'fire', color: '#ff6b35', hold: true },
   { id: 'jump', label: 'Jump', size: 68, icon: '⬆️', action: 'jump', color: '#c084fc' },
   { id: 'weapon', label: 'Switch', size: 48, icon: '⇄', action: 'switch("weapon")', color: '#38bdf8' },
   { id: 'reload', label: 'Reload', size: 48, icon: '↻', action: 'reload', color: '#22c55e' },

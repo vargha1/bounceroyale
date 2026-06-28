@@ -140,6 +140,14 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     let netClient: NetClient | null = null;
     let isHost = mode === 'single';
     let engineDisposed = false;
+    // Track the engine instance this run created, so the cleanup only clears
+    // engineRef.current if it still points at OUR engine. Without this guard,
+    // React StrictMode's mount → unmount → remount cycle in dev can run the
+    // FIRST effect's cleanup AFTER the SECOND effect has already installed
+    // its own engine — the old cleanup would then null out the new engine's
+    // ref, breaking all engine-backed UI handlers (restart, mobile controls,
+    // pointer lock, etc.).
+    let ownedEngine: ReturnType<typeof createGameEngine> | null = null;
 
     async function init() {
       if (mode === 'lan') {
@@ -221,6 +229,7 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         },
       });
       engineRef.current = engine;
+      ownedEngine = engine;
       setLocalPlayerId(engine.getLocalPlayerId());
       engine.start();
 
@@ -438,7 +447,14 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
           engine.dispose();
         }
         delete (window as any).__handleMobileAction;
-        engineRef.current = null;
+        // Only clear the ref if it still points to OUR engine. In React
+        // StrictMode (dev), the first effect's cleanup can run AFTER the
+        // second effect has installed its own engine. Without this guard,
+        // the old cleanup would null out the new engine's ref, breaking
+        // all engine-backed UI handlers (restart, mobile controls, etc.).
+        if (engineRef.current === ownedEngine) {
+          engineRef.current = null;
+        }
       };
     }
 
@@ -490,14 +506,20 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
 
   // Stable handler — uses a ref so the function identity never changes
   // and the callback always reads the latest engineRef.current.
+  // NOTE: We deliberately do NOT capture `hud.weapon` here — use
+  // engine.getCurrentWeapon() instead. The useRef initialiser only runs
+  // once, so a captured `hud.weapon` would be frozen at the first render
+  // and the switch-weapon button would never switch back to AK-47.
   const handleMobileButtonActionRef = useRef((action: string) => {
     const engine = engineRef.current;
     if (!engine) return;
     switch (action) {
       case 'fire':
         engine.setFiring(true);
-        setTimeout(() => engine.setFiring(false), 100);
         engine.ensureAudio();
+        break;
+      case 'fire:release':
+        engine.setFiring(false);
         break;
       case 'jump':
         engine.jump();
@@ -507,11 +529,13 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         engine.startReload();
         break;
       case 'switch("weapon")':
-        engine.switchWeapon(hud.weapon === 'ak47' ? 'desert_eagle' : 'ak47');
+        engine.switchWeapon(engine.getCurrentWeapon() === 'ak47' ? 'desert_eagle' : 'ak47');
         break;
       case 'crouch':
+        // Not implemented in the engine — reserved for future use.
         break;
       case 'sprint':
+        // Not implemented in the engine — reserved for future use.
         break;
       case 'pause':
         setPaused(true);
