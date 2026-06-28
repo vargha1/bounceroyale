@@ -420,7 +420,7 @@ export function createGameEngine(opts: EngineOptions) {
       const reloadSec = wdef.reloadTime;
 
       const masterGain = ctx.createGain();
-      masterGain.gain.value = settings.masterVolume * 0.4;
+      masterGain.gain.value = settings.masterVolume;
       masterGain.connect(ctx.destination);
 
       // Phase 1: Magazine ejection — metallic click + clack (at 15% of reload)
