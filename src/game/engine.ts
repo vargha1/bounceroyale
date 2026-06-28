@@ -123,6 +123,8 @@ export interface EngineCallbacks {
   onEndGame: (rankings: { id: string; rank: number | null }[], winner: string | null) => void;
   onError: (message: string) => void;
   onConnectionLost: () => void;
+  /** Fired when the local player takes damage (delta < 0). Used for damage indicator UI. */
+  onDamageTaken?: (damage: number) => void;
   /** Fired when the engine's match state has been reset for a restart (either
    *  locally-initiated via restart() or remotely via a re-init from the host).
    *  The UI layer uses this to clear its end-game modal, spectating banner,
@@ -239,9 +241,13 @@ export function createGameEngine(opts: EngineOptions) {
   }
 
   /** Play a synthesized weapon fire sound using Web Audio API.
-   *  Different weapons get different timbres:
-   *    - AK-47: short, sharp crack (high-rate noise burst, fast decay)
-   *    - Desert Eagle: deeper boom (lower noise, slower decay, more bass)
+   *  Closely mimics Counter-Strike: Source weapon characteristics:
+   *    - AK-47: metallic crack with sharp attack, resonant ring-off,
+   *      and a pronounced low-frequency thump. Two distinct noise layers
+   *      (sharp transient + fizz tail) emulate the gas-system report.
+   *    - Desert Eagle: enormous bass boom, long decay, window-rattling
+   *      low-end. Multi-layered noise + sub-bass + rolled-off midrange
+   *      gives that signature hand-cannon weight.
    *  No external audio files needed — works fully offline. */
   function playFireSound() {
     ensureAudio();
@@ -249,36 +255,257 @@ export function createGameEngine(opts: EngineOptions) {
       const ctx = audioListener.context;
       if (ctx.state === 'suspended') return;
       const isAk = currentWeapon === 'ak47';
-      const duration = isAk ? 0.07 : 0.18;
-      const bufLen = Math.floor(ctx.sampleRate * duration);
-      const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
-      const data = buf.getChannelData(0);
-      for (let i = 0; i < bufLen; i++) {
-        const t = i / ctx.sampleRate;
-        let sample: number;
-        if (isAk) {
-          // AK-47: sharp crack with fast decay
-          const env = Math.exp(-t * 55);
-          sample = (Math.random() * 2 - 1) * env * 0.5;
-          // Add a subtle low thump at the start
-          sample += Math.sin(t * 150) * Math.exp(-t * 30) * 0.3;
-        } else {
-          // Desert Eagle: deep boom with longer decay
-          const env = Math.exp(-t * 18);
-          sample = (Math.random() * 2 - 1) * env * 0.4;
-          // Stronger bass component
-          sample += Math.sin(t * 80) * Math.exp(-t * 15) * 0.5;
-          sample += Math.sin(t * 120) * Math.exp(-t * 20) * 0.2;
+      const now = ctx.currentTime;
+
+      // ---- Master gain for this shot ----
+      const masterGain = ctx.createGain();
+      masterGain.gain.value = settings.masterVolume * (isAk ? 0.45 : 0.6);
+      masterGain.connect(ctx.destination);
+
+      if (isAk) {
+        // === AK-47: Three layers ===
+
+        // Layer 1: Sharp transient crack (noise burst, very fast attack/decay)
+        const crackDur = 0.045;
+        const crackLen = Math.floor(ctx.sampleRate * crackDur);
+        const crackBuf = ctx.createBuffer(1, crackLen, ctx.sampleRate);
+        const crackData = crackBuf.getChannelData(0);
+        for (let i = 0; i < crackLen; i++) {
+          const t = i / ctx.sampleRate;
+          // Ultra-fast exponential decay for the initial snap
+          const env = Math.exp(-t * 120) * 0.7;
+          crackData[i] = (Math.random() * 2 - 1) * env;
         }
-        data[i] = sample;
+        const crackSrc = ctx.createBufferSource();
+        crackSrc.buffer = crackBuf;
+        const crackGain = ctx.createGain();
+        crackGain.gain.value = 0.7;
+        crackSrc.connect(crackGain);
+        crackGain.connect(masterGain);
+        crackSrc.start(now);
+
+        // Layer 2: Low-frequency thump (body of the shot)
+        const thumpOsc = ctx.createOscillator();
+        thumpOsc.type = 'sine';
+        thumpOsc.frequency.setValueAtTime(120, now);
+        thumpOsc.frequency.exponentialRampToValueAtTime(55, now + 0.08);
+        const thumpGain = ctx.createGain();
+        thumpGain.gain.setValueAtTime(0.55, now);
+        thumpGain.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
+        thumpOsc.connect(thumpGain);
+        thumpGain.connect(masterGain);
+        thumpOsc.start(now);
+        thumpOsc.stop(now + 0.12);
+
+        // Layer 3: Metallic ring-off (resonant filter on noise — mimics barrel resonance)
+        const ringDur = 0.12;
+        const ringLen = Math.floor(ctx.sampleRate * ringDur);
+        const ringBuf = ctx.createBuffer(1, ringLen, ctx.sampleRate);
+        const ringData = ringBuf.getChannelData(0);
+        for (let i = 0; i < ringLen; i++) {
+          const t = i / ctx.sampleRate;
+          // Slower decay for the ring-off tail
+          const env = Math.exp(-t * 35) * 0.25;
+          ringData[i] = (Math.random() * 2 - 1) * env;
+          // Add a pitched metallic resonance component
+          ringData[i] += Math.sin(t * 2400) * Math.exp(-t * 50) * 0.08;
+          ringData[i] += Math.sin(t * 3800) * Math.exp(-t * 60) * 0.04;
+        }
+        const ringSrc = ctx.createBufferSource();
+        ringSrc.buffer = ringBuf;
+        const ringFilter = ctx.createBiquadFilter();
+        ringFilter.type = 'bandpass';
+        ringFilter.frequency.value = 2500;
+        ringFilter.Q.value = 2.5;
+        const ringGain = ctx.createGain();
+        ringGain.gain.value = 0.5;
+        ringSrc.connect(ringFilter);
+        ringFilter.connect(ringGain);
+        ringGain.connect(masterGain);
+        ringSrc.start(now + 0.01); // slight delay after crack
+
+      } else {
+        // === Desert Eagle: Four layers for maximum impact ===
+
+        // Layer 1: Massive sub-bass hit
+        const subOsc = ctx.createOscillator();
+        subOsc.type = 'sine';
+        subOsc.frequency.setValueAtTime(65, now);
+        subOsc.frequency.exponentialRampToValueAtTime(35, now + 0.2);
+        const subGain = ctx.createGain();
+        subGain.gain.setValueAtTime(0.65, now);
+        subGain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+        subOsc.connect(subGain);
+        subGain.connect(masterGain);
+        subOsc.start(now);
+        subOsc.stop(now + 0.3);
+
+        // Layer 2: Mid-bass boom (the signature DE report)
+        const boomOsc = ctx.createOscillator();
+        boomOsc.type = 'sine';
+        boomOsc.frequency.setValueAtTime(100, now);
+        boomOsc.frequency.exponentialRampToValueAtTime(60, now + 0.15);
+        const boomGain = ctx.createGain();
+        boomGain.gain.setValueAtTime(0.5, now);
+        boomGain.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
+        boomOsc.connect(boomGain);
+        boomGain.connect(masterGain);
+        boomOsc.start(now);
+        boomOsc.stop(now + 0.25);
+
+        // Layer 3: Noise burst with slow decay (concussive blast)
+        const blastDur = 0.2;
+        const blastLen = Math.floor(ctx.sampleRate * blastDur);
+        const blastBuf = ctx.createBuffer(1, blastLen, ctx.sampleRate);
+        const blastData = blastBuf.getChannelData(0);
+        for (let i = 0; i < blastLen; i++) {
+          const t = i / ctx.sampleRate;
+          const env = Math.exp(-t * 14) * 0.45;
+          blastData[i] = (Math.random() * 2 - 1) * env;
+        }
+        const blastSrc = ctx.createBufferSource();
+        blastSrc.buffer = blastBuf;
+        const blastFilter = ctx.createBiquadFilter();
+        blastFilter.type = 'lowpass';
+        blastFilter.frequency.value = 1800;
+        blastFilter.Q.value = 0.7;
+        const blastGain = ctx.createGain();
+        blastGain.gain.value = 0.6;
+        blastSrc.connect(blastFilter);
+        blastFilter.connect(blastGain);
+        blastGain.connect(masterGain);
+        blastSrc.start(now);
+
+        // Layer 4: High-frequency crack (the snap of the large caliber)
+        const snapDur = 0.06;
+        const snapLen = Math.floor(ctx.sampleRate * snapDur);
+        const snapBuf = ctx.createBuffer(1, snapLen, ctx.sampleRate);
+        const snapData = snapBuf.getChannelData(0);
+        for (let i = 0; i < snapLen; i++) {
+          const t = i / ctx.sampleRate;
+          const env = Math.exp(-t * 80) * 0.35;
+          snapData[i] = (Math.random() * 2 - 1) * env;
+        }
+        const snapSrc = ctx.createBufferSource();
+        snapSrc.buffer = snapBuf;
+        const snapFilter = ctx.createBiquadFilter();
+        snapFilter.type = 'highpass';
+        snapFilter.frequency.value = 3000;
+        const snapGain = ctx.createGain();
+        snapGain.gain.value = 0.3;
+        snapSrc.connect(snapFilter);
+        snapFilter.connect(snapGain);
+        snapGain.connect(masterGain);
+        snapSrc.start(now);
       }
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      const gain = ctx.createGain();
-      gain.gain.value = settings.masterVolume * (isAk ? 0.35 : 0.5);
-      src.connect(gain);
-      gain.connect(audioListener.context.destination);
-      src.start();
+    } catch {
+      /* ignore — audio context may not be ready */
+    }
+  }
+
+  /** Play a synthesized reload sound using Web Audio API.
+   *  Two phases: magazine removal click + insertion thunk, then slide/bolt rack.
+   *  Timed to match the reload animation progress:
+   *    Phase 1 (0-30%): magazine ejection (metallic click-clack)
+   *    Phase 2 (50-70%): magazine insertion (hollow thud)
+   *    Phase 3 (70-100%): slide/bolt rack (sharp metallic pull & snap)
+   *  Called once at the start of reload; sounds are scheduled at future times. */
+  function playReloadSound() {
+    ensureAudio();
+    try {
+      const ctx = audioListener.context;
+      if (ctx.state === 'suspended') return;
+      const wdef = WEAPONS[currentWeapon];
+      const now = ctx.currentTime;
+      const reloadSec = wdef.reloadTime;
+
+      const masterGain = ctx.createGain();
+      masterGain.gain.value = settings.masterVolume * 0.4;
+      masterGain.connect(ctx.destination);
+
+      // Phase 1: Magazine ejection — metallic click + clack (at 15% of reload)
+      const ejectTime = now + reloadSec * 0.15;
+      const ejectDur = 0.08;
+      const ejectLen = Math.floor(ctx.sampleRate * ejectDur);
+      const ejectBuf = ctx.createBuffer(1, ejectLen, ctx.sampleRate);
+      const ejectData = ejectBuf.getChannelData(0);
+      for (let i = 0; i < ejectLen; i++) {
+        const t = i / ctx.sampleRate;
+        const env = Math.exp(-t * 80);
+        ejectData[i] = (Math.random() * 2 - 1) * env * 0.3;
+        // Metallic click component
+        ejectData[i] += Math.sin(t * 5000) * Math.exp(-t * 120) * 0.15;
+        // Clack (slightly delayed)
+        const t2 = Math.max(0, t - 0.025);
+        ejectData[i] += (Math.random() * 2 - 1) * Math.exp(-t2 * 100) * 0.2;
+      }
+      const ejectSrc = ctx.createBufferSource();
+      ejectSrc.buffer = ejectBuf;
+      ejectSrc.connect(masterGain);
+      ejectSrc.start(ejectTime);
+
+      // Phase 2: Magazine insertion — hollow thud (at 55% of reload)
+      const insertTime = now + reloadSec * 0.55;
+      const insertDur = 0.06;
+      const insertLen = Math.floor(ctx.sampleRate * insertDur);
+      const insertBuf = ctx.createBuffer(1, insertLen, ctx.sampleRate);
+      const insertData = insertBuf.getChannelData(0);
+      for (let i = 0; i < insertLen; i++) {
+        const t = i / ctx.sampleRate;
+        const env = Math.exp(-t * 60);
+        insertData[i] = (Math.random() * 2 - 1) * env * 0.35;
+        // Resonant body of the insertion
+        insertData[i] += Math.sin(t * 300) * Math.exp(-t * 50) * 0.25;
+        insertData[i] += Math.sin(t * 600) * Math.exp(-t * 70) * 0.1;
+      }
+      const insertSrc = ctx.createBufferSource();
+      insertSrc.buffer = insertBuf;
+      const insertFilter = ctx.createBiquadFilter();
+      insertFilter.type = 'lowpass';
+      insertFilter.frequency.value = 1200;
+      insertSrc.connect(insertFilter);
+      insertFilter.connect(masterGain);
+      insertSrc.start(insertTime);
+
+      // Phase 3: Slide rack / bolt pull — sharp metallic pull + snap (at 78% of reload)
+      const rackTime = now + reloadSec * 0.78;
+      // 3a: Pull sound (grinding/scraping)
+      const pullDur = 0.07;
+      const pullLen = Math.floor(ctx.sampleRate * pullDur);
+      const pullBuf = ctx.createBuffer(1, pullLen, ctx.sampleRate);
+      const pullData = pullBuf.getChannelData(0);
+      for (let i = 0; i < pullLen; i++) {
+        const t = i / ctx.sampleRate;
+        // Scraping texture
+        pullData[i] = (Math.random() * 2 - 1) * 0.15 * (1 - t / pullDur);
+        // Rising pitch slider
+        pullData[i] += Math.sin(t * 2500) * 0.06 * (1 - t / pullDur);
+      }
+      const pullSrc = ctx.createBufferSource();
+      pullSrc.buffer = pullBuf;
+      const pullFilter = ctx.createBiquadFilter();
+      pullFilter.type = 'bandpass';
+      pullFilter.frequency.value = 3000;
+      pullFilter.Q.value = 1.5;
+      pullSrc.connect(pullFilter);
+      pullFilter.connect(masterGain);
+      pullSrc.start(rackTime);
+
+      // 3b: Snap/slam at end of rack (sharp metallic impact)
+      const snapDur = 0.04;
+      const snapLen = Math.floor(ctx.sampleRate * snapDur);
+      const snapBuf2 = ctx.createBuffer(1, snapLen, ctx.sampleRate);
+      const snapData2 = snapBuf2.getChannelData(0);
+      for (let i = 0; i < snapLen; i++) {
+        const t = i / ctx.sampleRate;
+        const env = Math.exp(-t * 150);
+        snapData2[i] = (Math.random() * 2 - 1) * env * 0.4;
+        snapData2[i] += Math.sin(t * 7000) * Math.exp(-t * 200) * 0.2;
+      }
+      const snapSrc2 = ctx.createBufferSource();
+      snapSrc2.buffer = snapBuf2;
+      snapSrc2.connect(masterGain);
+      snapSrc2.start(rackTime + 0.07);
     } catch {
       /* ignore — audio context may not be ready */
     }
@@ -572,6 +799,10 @@ export function createGameEngine(opts: EngineOptions) {
   function updateHealth(delta: number) {
     playerHealth = Math.max(0, Math.min(100, playerHealth + delta));
     pushHud();
+    // Trigger damage indicator for UI when taking damage
+    if (delta < 0) {
+      callbacks.onDamageTaken?.(-delta);
+    }
     if (playerHealth <= 0) {
       const id = localPlayerId;
       if (id && !players[id]?.eliminated) eliminatePlayer(id);
@@ -1059,7 +1290,7 @@ export function createGameEngine(opts: EngineOptions) {
   // ALL tiles of that type instead of creating a new geometry per tile.
   // This is a major memory + draw-call optimization with hundreds of tiles.
   const groundTileGeo = createHexagonGeometry(TILE_RADIUS, TILE_HEIGHT);
-  const wallTileGeo = createHexagonGeometry(TILE_RADIUS, 1.5);
+  const wallTileGeo = createHexagonGeometry(TILE_RADIUS, 3.0);
 
   function createTile(pos: { x: number; y: number; z: number }, id: string) {
     if (tilesById.has(id)) return; // dedupe — stable IDs mean this can be called twice in multiplayer
@@ -1067,7 +1298,7 @@ export function createGameEngine(opts: EngineOptions) {
     // Wall tiles (IDs start with "w-") are taller, have a stone color,
     // and are much harder to break than regular ground tiles.
     const isWall = id.startsWith('w-');
-    const tileHeight = isWall ? 1.5 : TILE_HEIGHT;
+    const tileHeight = isWall ? 3.0 : TILE_HEIGHT;
     const tileHealth = isWall ? 500 : TILE_MAX_HEALTH;
 
     // Reuse shared geometry for all tiles of the same type
@@ -1184,8 +1415,12 @@ export function createGameEngine(opts: EngineOptions) {
   function breakTile(tile: TileClient) {
     if (tile.isBreaking) return;
     tile.isBreaking = true;
-    canJump = true;
-    canJumpUntil = performance.now() + 1000;
+    // NOTE: We intentionally do NOT set canJump=true here.
+    // The old code granted an airborne jump whenever ANY tile broke,
+    // which let players jump in mid-air when a tile they were standing
+    // on was destroyed by a weapon. Jump eligibility is correctly
+    // determined by getContactedTile() in the physics step — a player
+    // is only "grounded" when they are physically touching a tile.
     try {
       if (tile.collider) world.removeCollider(tile.collider, false);
     } catch {
@@ -1330,11 +1565,11 @@ export function createGameEngine(opts: EngineOptions) {
     pushHud();
   }
 
-  /** Build a simple geometric weapon mesh */
+  /** Build a detailed geometric weapon mesh with animation groups.
+   *  Parts that animate during reload (magazine, slide/bolt) are stored as
+   *  named children so updateFpsWeapon can find and animate them. */
   function buildWeaponMesh(type: WeaponType): THREE.Group {
     const group = new THREE.Group();
-    // AK-47: dark gunmetal body, wooden furniture, brass magazine
-    // Desert Eagle: silver/chrome slide, dark grip, gold accents
     if (type === 'ak47') {
       const gunMetal = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, roughness: 0.25, metalness: 0.9 });
       const darkMetal = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.3, metalness: 0.85 });
@@ -1356,9 +1591,10 @@ export function createGameEngine(opts: EngineOptions) {
       const body = new THREE.Mesh(new THREE.BoxGeometry(0.055, 0.06, 0.28), gunMetal);
       body.position.set(0, 0, 0.0);
       group.add(body);
-      // Dust cover (top)
+      // Dust cover (top) — part of the bolt carrier group, animates on rack
       const dustCover = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.015, 0.18), darkMetal);
       dustCover.position.set(0, 0.037, -0.03);
+      dustCover.name = 'slide';
       group.add(dustCover);
       // Wooden handguard
       const handguard = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.04, 0.18), wood);
@@ -1372,16 +1608,37 @@ export function createGameEngine(opts: EngineOptions) {
       const butt = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.06, 0.02), darkMetal);
       butt.position.set(0, -0.01, 0.35);
       group.add(butt);
-      // Magazine (curved AK mag)
+      // Magazine (curved AK mag) — animates during reload
+      const magGroup = new THREE.Group();
+      magGroup.name = 'magazine';
       const mag = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.13, 0.055), brass);
       mag.position.set(0, -0.09, 0.02);
       mag.rotation.x = 0.2;
-      group.add(mag);
+      magGroup.add(mag);
+      // Magazine base plate
+      const magBase = new THREE.Mesh(new THREE.BoxGeometry(0.037, 0.012, 0.02), darkMetal);
+      magBase.position.set(0, -0.155, 0.05);
+      magBase.rotation.x = 0.2;
+      magGroup.add(magBase);
+      group.add(magGroup);
       // Pistol grip
       const grip = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.08, 0.035), darkMetal);
       grip.position.set(0, -0.06, 0.12);
       grip.rotation.x = 0.3;
       group.add(grip);
+      // Gas tube (above barrel)
+      const gasTube = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.2, 6), darkMetal);
+      gasTube.rotation.x = Math.PI / 2;
+      gasTube.position.set(0, 0.025, -0.2);
+      group.add(gasTube);
+      // Front sight post
+      const frontSight = new THREE.Mesh(new THREE.BoxGeometry(0.004, 0.025, 0.004), darkMetal);
+      frontSight.position.set(0, 0.04, -0.44);
+      group.add(frontSight);
+      // Rear sight
+      const rearSight = new THREE.Mesh(new THREE.BoxGeometry(0.025, 0.02, 0.006), darkMetal);
+      rearSight.position.set(0, 0.04, -0.05);
+      group.add(rearSight);
     } else {
       // Desert Eagle - big chrome pistol
       const chrome = new THREE.MeshStandardMaterial({ color: 0xc0c0c0, roughness: 0.1, metalness: 0.95 });
@@ -1396,23 +1653,34 @@ export function createGameEngine(opts: EngineOptions) {
       barrel.position.set(0, 0.015, -0.22);
       group.add(barrel);
       // Muzzle brake
-      const muzzle = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.014, 0.06, 8), darkSteel);
-      muzzle.rotation.x = Math.PI / 2;
-      muzzle.position.set(0, 0.015, -0.40);
-      group.add(muzzle);
+      const muzzleBrake = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.014, 0.06, 8), darkSteel);
+      muzzleBrake.rotation.x = Math.PI / 2;
+      muzzleBrake.position.set(0, 0.015, -0.40);
+      group.add(muzzleBrake);
       // Muzzle tip
       const muzzleTip = new THREE.Mesh(new THREE.CylinderGeometry(0.01, 0.018, 0.02, 8), orangeTip);
       muzzleTip.rotation.x = Math.PI / 2;
       muzzleTip.position.set(0, 0.015, -0.43);
       group.add(muzzleTip);
-      // Slide (top part, chrome)
+      // Slide (top part, chrome) — animates during reload (racks back)
+      const slideGroup = new THREE.Group();
+      slideGroup.name = 'slide';
       const slide = new THREE.Mesh(new THREE.BoxGeometry(0.042, 0.04, 0.28), chrome);
       slide.position.set(0, 0.01, -0.04);
-      group.add(slide);
+      slideGroup.add(slide);
       // Gold accent line on slide
       const accentLine = new THREE.Mesh(new THREE.BoxGeometry(0.044, 0.005, 0.04), goldAccent);
       accentLine.position.set(0, 0.032, -0.04);
-      group.add(accentLine);
+      slideGroup.add(accentLine);
+      // Front sight on slide
+      const frontSight = new THREE.Mesh(new THREE.BoxGeometry(0.004, 0.018, 0.004), darkSteel);
+      frontSight.position.set(0, 0.035, -0.18);
+      slideGroup.add(frontSight);
+      // Rear sight on slide
+      const rearSight = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.015, 0.006), darkSteel);
+      rearSight.position.set(0, 0.035, 0.08);
+      slideGroup.add(rearSight);
+      group.add(slideGroup);
       // Frame (lower receiver)
       const frame = new THREE.Mesh(new THREE.BoxGeometry(0.038, 0.025, 0.16), darkSteel);
       frame.position.set(0, -0.015, 0.02);
@@ -1421,6 +1689,17 @@ export function createGameEngine(opts: EngineOptions) {
       const triggerGuard = new THREE.Mesh(new THREE.BoxGeometry(0.005, 0.025, 0.05), darkSteel);
       triggerGuard.position.set(0, -0.035, 0.05);
       group.add(triggerGuard);
+      // Magazine well + mag — animates during reload
+      const magGroup = new THREE.Group();
+      magGroup.name = 'magazine';
+      const mag = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.055, 0.038), darkSteel);
+      mag.position.set(0, -0.05, 0.02);
+      magGroup.add(mag);
+      // Magazine base plate
+      const magBase = new THREE.Mesh(new THREE.BoxGeometry(0.037, 0.008, 0.006), chrome);
+      magBase.position.set(0, -0.08, 0.02);
+      magGroup.add(magBase);
+      group.add(magGroup);
       // Grip (black rubberized)
       const grip = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.09, 0.04), blackGrip);
       grip.position.set(0, -0.06, 0.09);
@@ -1431,6 +1710,10 @@ export function createGameEngine(opts: EngineOptions) {
       gripInsert.position.set(0, -0.06, 0.07);
       gripInsert.rotation.x = 0.25;
       group.add(gripInsert);
+      // Barrel wedge (distinctive DE top rail)
+      const topRail = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.008, 0.12), chrome);
+      topRail.position.set(0, 0.038, -0.12);
+      group.add(topRail);
     }
     return group;
   }
@@ -1551,6 +1834,9 @@ export function createGameEngine(opts: EngineOptions) {
     // Play firing sound
     playFireSound();
 
+    // Eject shell casing
+    ejectShell();
+
     // Muzzle flash
     muzzleFlashTimer = 50; // ms
 
@@ -1629,11 +1915,13 @@ export function createGameEngine(opts: EngineOptions) {
 
     // Weapon damage to tiles — raycast against tile positions to find what
     // the bullet hit. Deals damage in a small radius at the impact point.
-    // AK-47: low per-shot damage but high rate of fire chips tiles away
-    // Desert Eagle: high per-shot damage, can crack tiles in a few hits
+    // Tiles take MORE damage than players (2.5× multiplier) so weapons feel
+    // destructive and the island crumbles quickly under sustained fire.
+    //   - AK-47: rapid chipping (low per-shot, high rate → many broken tiles)
+    //   - Desert Eagle: big per-shot crater (high damage, large radius)
     {
-      const tileDamage = wdef.damage; // weapon damage = tile damage
-      const tileDamageRadius = isAk ? 0.8 : 1.2; // desert eagle has bigger blast
+      const tileDamage = wdef.damage * 2.5; // tiles are softer than players
+      const tileDamageRadius = isAk ? 1.1 : 1.6; // desert eagle has bigger blast
       // Find the closest tile along the ray
       let closestTileDist = hitDistance; // don't shoot through players
       let closestTile: TileClient | null = null;
@@ -1645,9 +1933,9 @@ export function createGameEngine(opts: EngineOptions) {
         if (projLen < 0 || projLen > closestTileDist) continue;
         const closestPoint = rayOrigin.clone().add(direction.clone().multiplyScalar(projLen));
         const distToCenter = closestPoint.distanceTo(tilePos);
-        // Hex tile has radius ~0.6, height ~0.5 (walls 1.5). Use a generous
+        // Hex tile has radius ~0.6, height ~0.5 (walls 3.0). Use a generous
         // hit radius so bullets hit tiles reliably.
-        const hitRadius = tilePos.y > 2 ? 1.2 : 0.9; // walls are taller → easier to hit
+        const hitRadius = tilePos.y > 2 ? 1.4 : 1.0; // walls are taller → easier to hit
         if (distToCenter < hitRadius && projLen < closestTileDist) {
           closestTileDist = projLen;
           closestTile = tile;
@@ -1682,6 +1970,7 @@ export function createGameEngine(opts: EngineOptions) {
     if (reserveAmmo <= 0) return; // no reserve ammo to reload with
     isReloading = true;
     reloadStartTime = performance.now();
+    playReloadSound();
     pushHud();
   }
 
@@ -1691,6 +1980,33 @@ export function createGameEngine(opts: EngineOptions) {
     weaponSwitchStartTime = performance.now();
     pendingWeapon = weapon;
     pushHud();
+  }
+
+  // Shell ejection particles — brass casings that fly out of the weapon
+  const shellParticles: { mesh: THREE.Mesh; vel: THREE.Vector3; life: number; maxLife: number }[] = [];
+  const shellGeo = new THREE.CylinderGeometry(0.003, 0.003, 0.015, 4);
+  const shellMat = new THREE.MeshStandardMaterial({ color: 0xd4a017, metalness: 0.9, roughness: 0.2 });
+
+  function ejectShell() {
+    if (!currentFpsWeaponMesh || shellParticles.length >= 8) return;
+    const isAk = currentWeapon === 'ak47';
+    const shell = new THREE.Mesh(shellGeo, shellMat);
+    // Start from ejection port position (right side of receiver)
+    const ejectX = 0.25 + (isAk ? 0.02 : 0.01);
+    const ejectY = -0.15;
+    const ejectZ = -0.25;
+    shell.position.set(ejectX, ejectY, ejectZ);
+    // Random rotation for tumbling brass
+    shell.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+    // Velocity: right and slightly up + back
+    const vel = new THREE.Vector3(
+      0.8 + Math.random() * 0.5,
+      0.3 + Math.random() * 0.3,
+      -0.2 + Math.random() * 0.2
+    );
+    const life = 0.8 + Math.random() * 0.4;
+    shellParticles.push({ mesh: shell, vel, life, maxLife: life });
+    fpsWeaponScene.add(shell);
   }
 
   function updateFpsWeapon(dt: number) {
@@ -1724,6 +2040,25 @@ export function createGameEngine(opts: EngineOptions) {
       -0.4 + weaponRecoilOffset
     );
 
+    // Default rotation reset
+    fpsWeaponGroup.rotation.x = 0;
+    fpsWeaponGroup.rotation.z = 0;
+
+    // ---- Per-part weapon animations ----
+    // Find animated parts in the weapon mesh
+    let magPart: THREE.Group | null = null;
+    let slidePart: THREE.Object3D | null = null;
+    if (currentFpsWeaponMesh) {
+      // Use type assertion since traverse callback makes TS lose narrowing
+      const foundParts = { mag: null as THREE.Group | null, slide: null as THREE.Object3D | null };
+      currentFpsWeaponMesh.traverse((child) => {
+        if (child.name === 'magazine' && child instanceof THREE.Group) foundParts.mag = child;
+        if (child.name === 'slide') foundParts.slide = child;
+      });
+      magPart = foundParts.mag;
+      slidePart = foundParts.slide;
+    }
+
     // Weapon switch animation (lower weapon)
     if (isSwitchingWeapon) {
       const progress = (performance.now() - weaponSwitchStartTime) / (WEAPON_SWITCH_TIME * 1000);
@@ -1734,34 +2069,77 @@ export function createGameEngine(opts: EngineOptions) {
       }
     }
 
-    // Reload animation — weapon tilts down, magazine comes out, new mag in, rack slide
-    if (isReloading) {
+    // Fire recoil per-part animation — slide/bolt kicks back briefly
+    if (weaponRecoilOffset > 0.02 && slidePart) {
+      // Slide/bolt kicks back with recoil
+      const isAk = currentWeapon === 'ak47';
+      const slideOffset = isAk ? -weaponRecoilOffset * 0.8 : -weaponRecoilOffset * 0.6;
+      slidePart!.position.z = slideOffset * 2.5; // scale with FPS weapon scale
+    } else if (slidePart) {
+      // Return slide to original position
+      slidePart!.position.z *= 0.85;
+    }
+
+    // Reload animation — magazine drops out, new mag in, slide/bolt racks
+    if (isReloading && magPart) {
       const wdef = WEAPONS[currentWeapon];
       const progress = Math.min(1, (performance.now() - reloadStartTime) / (wdef.reloadTime * 1000));
+      const isAk = currentWeapon === 'ak47';
+
       if (progress < 0.3) {
+        // Phase 1: Tilt weapon slightly, magazine starts to drop
         const t = progress / 0.3;
         fpsWeaponGroup.rotation.z = t * 0.4;
         fpsWeaponGroup.rotation.x = t * 0.3;
         fpsWeaponGroup.position.y -= t * 0.15;
+        // Magazine drops down
+        if (magPart) {
+          magPart.position.y = -t * 0.15;
+        }
       } else if (progress < 0.5) {
+        // Phase 2: Magazine fully out, pause
         fpsWeaponGroup.rotation.z = 0.4;
         fpsWeaponGroup.rotation.x = 0.3;
         fpsWeaponGroup.position.y -= 0.15;
+        if (magPart) {
+          magPart.position.y = -0.15;
+        }
       } else if (progress < 0.7) {
+        // Phase 3: New magazine slides in, weapon straightens
         const t = (progress - 0.5) / 0.2;
         fpsWeaponGroup.rotation.z = 0.4 * (1 - t);
         fpsWeaponGroup.rotation.x = 0.3 * (1 - t);
         fpsWeaponGroup.position.y -= 0.15 * (1 - t);
+        // Magazine rises back up
+        if (magPart) {
+          magPart.position.y = -0.15 * (1 - t);
+        }
       } else {
-        const t = (progress - 0.7) / 0.3;
-        const rackMotion = t < 0.5 ? t * 2 * 0.06 : (1 - (t - 0.5) * 2) * 0.06;
+        // Phase 4: Slide/bolt rack — pull back then release
         fpsWeaponGroup.rotation.z = 0;
         fpsWeaponGroup.rotation.x = 0;
-        fpsWeaponGroup.position.z -= rackMotion;
+        const t = (progress - 0.7) / 0.3;
+        if (slidePart) {
+          const isAkGun = currentWeapon === 'ak47';
+          const rackDist = isAkGun ? 0.08 : 0.06;
+          if (t < 0.5) {
+            // Pull slide/bolt back
+            slidePart.position.z = t * 2 * rackDist;
+          } else {
+            // Release slide/bolt forward (spring snap)
+            slidePart.position.z = rackDist * (1 - (t - 0.5) * 2);
+          }
+        }
       }
-    } else {
+    } else if (!isReloading) {
+      // Smoothly restore any residual rotation
       fpsWeaponGroup.rotation.x *= 0.85;
       fpsWeaponGroup.rotation.z *= 0.85;
+      // Reset magazine position
+      if (magPart) {
+        magPart.position.y *= 0.85;
+        magPart.position.x *= 0.85;
+      }
     }
 
     // Muzzle flash timer
@@ -1771,6 +2149,26 @@ export function createGameEngine(opts: EngineOptions) {
       if (lp?.muzzleFlash) {
         lp.muzzleFlash.intensity = muzzleFlashTimer > 0 ? 3 : 0;
       }
+    }
+
+    // Update shell ejection particles
+    for (let i = shellParticles.length - 1; i >= 0; i--) {
+      const sp = shellParticles[i];
+      sp.life -= dt;
+      if (sp.life <= 0) {
+        fpsWeaponScene.remove(sp.mesh);
+        shellParticles.splice(i, 1);
+        continue;
+      }
+      sp.mesh.position.addScaledVector(sp.vel, dt);
+      sp.vel.y -= 9.81 * dt * 0.3; // gravity for brass
+      // Tumble the shell
+      sp.mesh.rotation.x += dt * 15;
+      sp.mesh.rotation.z += dt * 10;
+      // Fade out
+      const opacity = sp.life / sp.maxLife;
+      (sp.mesh.material as THREE.MeshStandardMaterial).transparent = true;
+      (sp.mesh.material as THREE.MeshStandardMaterial).opacity = opacity;
     }
 
     // Hide local player mesh from own camera (first-person)

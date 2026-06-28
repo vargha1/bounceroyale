@@ -1,5 +1,7 @@
+import { useState } from 'react';
 import { useSettings } from '../store/settings';
 import { t } from '../i18n/translations';
+import MobileLayoutEditor from './MobileLayoutEditor';
 
 interface Props {
   onStart: () => void;
@@ -10,6 +12,7 @@ interface Props {
 export default function MainMenu({ onStart, onSettings, onAbout }: Props) {
   const { language, set } = useSettings();
   const lang = language;
+  const [showLayoutEditor, setShowLayoutEditor] = useState(false);
 
   return (
     <div className="menu">
@@ -39,6 +42,10 @@ export default function MainMenu({ onStart, onSettings, onAbout }: Props) {
           <span className="icon">⚙️</span>
           <span>{t('settings', lang)}</span>
         </div>
+        <div className="nav-item" onClick={() => setShowLayoutEditor(true)}>
+          <span className="icon">🎮</span>
+          <span>Mobile Layout</span>
+        </div>
         <div className="nav-item" onClick={onAbout}>
           <span className="icon">❓</span>
           <span>{t('about', lang)}</span>
@@ -64,6 +71,8 @@ export default function MainMenu({ onStart, onSettings, onAbout }: Props) {
           <p className="hint">{t('controlsHint', lang)}</p>
         </div>
       </main>
+
+      {showLayoutEditor && <MobileLayoutEditor onClose={() => setShowLayoutEditor(false)} />}
     </div>
   );
 }

@@ -1,5 +1,7 @@
+import { useState } from 'react';
 import { useSettings } from '../store/settings';
 import { t } from '../i18n/translations';
+import MobileLayoutEditor from './MobileLayoutEditor';
 
 interface Props {
   onResume: () => void;
@@ -16,6 +18,12 @@ interface Props {
 export default function PauseModal({ onResume, onExit, onRestart, canRestart = false }: Props) {
   const { language } = useSettings();
   const lang = language;
+  const [showLayoutEditor, setShowLayoutEditor] = useState(false);
+
+  if (showLayoutEditor) {
+    return <MobileLayoutEditor onClose={() => setShowLayoutEditor(false)} />;
+  }
+
   return (
     <div className="modal-overlay">
       <div className="modal">
@@ -25,6 +33,7 @@ export default function PauseModal({ onResume, onExit, onRestart, canRestart = f
           {canRestart && onRestart && (
             <button className="ghost" onClick={onRestart}>🔄 {t('restart', lang)}</button>
           )}
+          <button className="ghost" onClick={() => setShowLayoutEditor(true)}>🎮 Mobile Layout</button>
           <button className="danger" onClick={onExit}>🚪 {t('exitToMenu', lang)}</button>
         </div>
       </div>

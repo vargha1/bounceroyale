@@ -204,14 +204,15 @@ export function generateIsland(size: IslandSize = 'medium', seed: number = Date.
     }
   }
 
-  // ---- Perimeter walls ----
-  // Short walls around the island edge to give a sense of boundary and
-  // prevent the player from easily rolling off. We find tiles near the
-  // outer rim and place wall tiles on top of them at a fixed height.
-  const wallHeight = 1.5;  // how tall the wall stands above the tile
+// ---- Perimeter walls ----
+  // Full perimeter walls around the island edge to give a strong sense of
+  // boundary and prevent the player from easily rolling off.
+  // We place wall tiles at EVERY position on the outer rim of the hex grid,
+  // creating a complete enclosing wall.
+  const wallHeight = 3.0;  // how tall the wall stands above the tile (was 1.5)
   const wallTop = 0.6;     // thickness of the wall cap
   const rimInner = worldRadius * 0.72;
-  const rimOuter = worldRadius * 0.98;
+  const rimOuter = worldRadius * 1.02;  // extended outward for full coverage
 
   // Collect existing tile positions for overlap checking
   const tilePosSet = new Set<string>();
@@ -219,20 +220,19 @@ export function generateIsland(size: IslandSize = 'medium', seed: number = Date.
     tilePosSet.add(`${t.x.toFixed(2)},${t.z.toFixed(2)}`);
   }
 
-  for (let col = -gridRadius - 1; col <= gridRadius + 1; col++) {
-    for (let row = -gridRadius - 1; row <= gridRadius + 1; row++) {
+  // Find the maximum column/row bounds to ensure we cover the full rim
+  const maxCol = gridRadius;
+  const maxRow = gridRadius;
+
+  for (let col = -maxCol - 2; col <= maxCol + 2; col++) {
+    for (let row = -maxRow - 2; row <= maxRow + 2; row++) {
       const x = col * colSpacing;
       const zOffset = (Math.abs(col) % 2) * (rowSpacing / 2);
       const z = row * rowSpacing + zOffset;
 
       const dist = Math.sqrt(x * x + z * z);
-      // Only place walls in the rim band
+      // Only place walls in the rim band (outer 20% of the island radius)
       if (dist < rimInner || dist > rimOuter) continue;
-
-      // Check if there's a ground tile nearby (within ~1 tile radius)
-      // Walls should only appear where the island actually has ground
-      const key = `${x.toFixed(2)},${z.toFixed(2)}`;
-      if (tilePosSet.has(key)) continue; // Skip if a ground tile already here
 
       // Find nearest ground tile height to match wall base height
       let nearestGroundHeight = -1;
@@ -247,12 +247,6 @@ export function generateIsland(size: IslandSize = 'medium', seed: number = Date.
         }
       }
       if (nearestGroundHeight < 0) continue; // No nearby ground — skip
-
-      // Coastline check — only add wall if the island actually exists nearby
-      const coastline = fbm((x + noiseOffsetX) * noiseScale, (z + noiseOffsetZ) * noiseScale, seed, 4);
-      const falloff = 1 - smoothstep(worldRadius * 0.25, worldRadius * 0.95, dist);
-      const islandness = coastline * 0.55 + falloff * 0.45;
-      if (islandness < threshold - 0.05) continue; // Slightly lower threshold for walls
 
       // Wall base sits at ground level, cap at ground + wallHeight
       const baseY = Math.max(HEIGHT_MIN, nearestGroundHeight);

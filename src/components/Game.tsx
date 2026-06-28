@@ -7,6 +7,7 @@ import { SocketNetClient } from '../networking/socket';
 import Hud from './Hud';
 import PauseModal from './PauseModal';
 import EndGameModal from './EndGameModal';
+import MobileControls from './MobileControls';
 
 interface Props {
   mode: 'single' | 'lan' | 'server';
@@ -58,8 +59,18 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     vis: false, x: 0, y: 0, baseX: 0, baseY: 0
   });
 
-  const jumpBtnRef = useRef<HTMLButtonElement | null>(null);
-  const fireBtnRef = useRef<HTMLButtonElement | null>(null);
+  // ---- Refs to mirror state for stale-closure-free event handlers ----
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
+  const spectatingRef = useRef(spectating);
+  spectatingRef.current = spectating;
+  const countdownRef = useRef(countdown);
+  countdownRef.current = countdown;
+  const hudWeaponRef = useRef(hud.weapon);
+  hudWeaponRef.current = hud.weapon;
+
+  // ---- Pointer lock refs (must be declared at top level, not inside effects) ----
+  const hasPointerLockRef = useRef(false);
 
   const exitGame = useCallback(() => {
     const client = netClientRef.current;
@@ -80,6 +91,48 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     window.addEventListener('beforeunload', onUnload);
     return () => { window.removeEventListener('beforeunload', onUnload); };
   }, []);
+
+  // ---- Pointer lock helpers ----
+  const isTouchDevice = typeof window !== 'undefined' && ('ontouchstart' in window || (navigator as any).maxTouchPoints > 0);
+  const pointerLockEnabled = settings.pointerLock && !isTouchDevice;
+
+  const requestPointerLock = useCallback(() => {
+    if (!pointerLockEnabled) return;
+    if (document.pointerLockElement) return;
+    if (pausedRef.current || spectatingRef.current || endGameRef.current || countdownRef.current !== null) return;
+    const canvas = engineRef.current?.getCanvas();
+    if (canvas?.requestPointerLock) {
+      canvas.requestPointerLock().catch(() => { /* ignore SecurityError */ });
+    }
+  }, [pointerLockEnabled]);
+
+  const releasePointerLock = useCallback(() => {
+    try {
+      if (document.pointerLockElement) {
+        document.exitPointerLock();
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  // Track pointer lock state changes
+  useEffect(() => {
+    const onPointerLockChange = () => {
+      hasPointerLockRef.current = !!document.pointerLockElement;
+    };
+    document.addEventListener('pointerlockchange', onPointerLockChange);
+    return () => document.removeEventListener('pointerlockchange', onPointerLockChange);
+  }, []);
+
+  // Release pointer lock when game state changes to a "menu" state. We
+  // intentionally do NOT auto-request pointer lock here — that should only
+  // happen in direct response to a user click on the canvas (handled in
+  // onMouseDown below), so we don't grab the cursor unexpectedly and trap
+  // the user out of clicking on mobile buttons / HUD elements.
+  useEffect(() => {
+    if (paused || spectating || countdown !== null || endGame) {
+      releasePointerLock();
+    }
+  }, [paused, spectating, countdown, endGame, releasePointerLock]);
 
   // Build the engine once on mount
   useEffect(() => {
@@ -158,6 +211,13 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
             setPaused(false);
             setCountdown(null);
           },
+          onDamageTaken: (_damage) => {
+            const indicator = document.getElementById('damage-indicator');
+            if (indicator) {
+              indicator.classList.add('active');
+              setTimeout(() => indicator.classList.remove('active'), 150);
+            }
+          },
         },
       });
       engineRef.current = engine;
@@ -181,16 +241,13 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         for (let i = 0; i < e.changedTouches.length; i++) {
           const touch = e.changedTouches[i];
           const target = touch.target as HTMLElement | null;
-          // Skip button touches — they handle their own events
-          if (target?.closest('.jump-btn') || target?.closest('.fire-btn') || target?.closest('.pause-btn') || target?.closest('.spectate-switch-btn') || target?.closest('.weapon-switch-btn') || target?.closest('.reload-btn')) continue;
+          if (target?.closest('[data-mobile-btn]') || target?.closest('.pause-btn') || target?.closest('.spectate-switch-btn')) continue;
 
           if (touch.clientX < w * 0.4) {
-            // Left zone = movement joystick
             mobileTouchState.joyId = touch.identifier;
             mobileTouchState.joyStart = { x: touch.clientX, y: touch.clientY };
             setMobileStick({ vis: true, x: 0, y: 0, baseX: touch.clientX, baseY: touch.clientY });
           } else {
-            // Right zone = look control (NO auto-fire here anymore)
             mobileTouchState.lookId = touch.identifier;
             mobileTouchState.lastLookX = touch.clientX;
             mobileTouchState.lastLookY = touch.clientY;
@@ -215,8 +272,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
             const dy = touch.clientY - mobileTouchState.lastLookY;
             mobileTouchState.lastLookX = touch.clientX;
             mobileTouchState.lastLookY = touch.clientY;
-            // Horizontal: swipe right = look right (positive dx = positive azimuth)
-            // Vertical: swipe DOWN = look DOWN (negative pitch), so NEGATE dy
             engine.addLookDelta(dx * 0.005);
             engine.addLookDeltaY(-dy * 0.005);
           }
@@ -243,49 +298,43 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
       canvas.addEventListener('touchend', onTouchEnd, touchOpts);
       canvas.addEventListener('touchcancel', onTouchEnd, touchOpts);
 
-      // Jump button touch handler
-      const jumpBtn = jumpBtnRef.current;
-      const onJumpTouch = (e: TouchEvent) => {
-        e.preventDefault();
-        e.stopPropagation();
-        engine.jump();
-        engine.ensureAudio();
-      };
-      if (jumpBtn) {
-        jumpBtn.addEventListener('touchstart', onJumpTouch, { passive: false, capture: true });
-      }
-
-      // Fire button touch handler
-      const fireBtn = fireBtnRef.current;
-      const onFireTouchStart = (e: TouchEvent) => {
-        e.preventDefault();
-        e.stopPropagation();
-        engine.setFiring(true);
-        engine.ensureAudio();
-      };
-      const onFireTouchEnd = (e: TouchEvent) => {
-        e.preventDefault();
-        e.stopPropagation();
-        engine.setFiring(false);
-      };
-      if (fireBtn) {
-        fireBtn.addEventListener('touchstart', onFireTouchStart, { passive: false, capture: true });
-        fireBtn.addEventListener('touchend', onFireTouchEnd, { passive: false, capture: true });
-        fireBtn.addEventListener('touchcancel', onFireTouchEnd, { passive: false, capture: true });
-      }
-
-      // FPS ticker
+      // FPS ticker — single declaration
       const fpsInterval = window.setInterval(() => {
         setFps(engine.getFps());
       }, 500);
 
+      // Store mobile controls action handler on window for access
+      (window as any).__handleMobileAction = (action: string) => {
+        switch (action) {
+          case 'fire':
+            engine.setFiring(true);
+            setTimeout(() => engine.setFiring(false), 100);
+            engine.ensureAudio();
+            break;
+          case 'jump':
+            engine.jump();
+            engine.ensureAudio();
+            break;
+          case 'reload':
+            engine.startReload();
+            break;
+          case 'switch':
+            engine.switchWeapon(hudWeaponRef.current === 'ak47' ? 'desert_eagle' : 'ak47');
+            break;
+          case 'pause':
+            setPaused(true);
+            break;
+        }
+      };
+
       // ---- Keyboard handlers ----
+      // Use refs so handlers always see current paused/spectating/countdown without re-registering
       const onKeyDown = (e: KeyboardEvent) => {
         if (e.key === 'Escape') {
-          if (!paused) setPaused(true);
+          if (!pausedRef.current) setPaused(true);
           return;
         }
-        if ((e.key === 'v' || e.key === 'V') && spectating) {
+        if ((e.key === 'v' || e.key === 'V') && spectatingRef.current) {
           e.preventDefault();
           engine.switchSpectator();
           return;
@@ -303,20 +352,8 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         } else if (k === 'r') {
           engine.startReload();
         }
-        if (settings.pointerLock && !paused && !endGameRef.current) {
-          // Delay pointer lock request to avoid SecurityError:
-          // "Pointer lock cannot be acquired immediately after the user
-          // has exited the lock." Browsers enforce a short grace period
-          // after pointer lock is released (e.g. by clicking a modal).
-          setTimeout(() => {
-            if (document.pointerLockElement || endGameRef.current) return;
-            const canvas2 = engine.getCanvas();
-            if (canvas2.requestPointerLock) {
-              canvas2.requestPointerLock().catch(() => { /* ignore SecurityError */ });
-            }
-          }, 200);
-        }
       };
+
       const onKeyUp = (e: KeyboardEvent) => {
         const k = e.key.toLowerCase();
         if (k === 'w' || k === 'a' || k === 's' || k === 'd') {
@@ -328,21 +365,28 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
 
       // ---- Mouse handlers ----
       const onMouseMove = (e: MouseEvent) => {
-        if (paused) return;
+        if (pausedRef.current || spectatingRef.current || endGameRef.current) return;
         const dx = (e as any).movementX || 0;
         const dy = (e as any).movementY || 0;
-        // Horizontal: move right = look right (positive movementX = positive azimuth)
-        // Vertical: move mouse UP = look UP (negative movementY = positive pitch), so NEGATE dy
         engine.addLookDelta(dx * 0.002);
         engine.addLookDeltaY(-dy * 0.002);
       };
+
       const onMouseDown = (e: MouseEvent) => {
-        if (paused || spectating) return;
+        if (pausedRef.current || spectatingRef.current || endGameRef.current) return;
+        // Skip clicks on UI (HUD, modal, mobile controls) — never start firing
+        // or grab pointer lock when the user is interacting with the UI.
+        const target = e.target as HTMLElement | null;
+        const isCanvasClick = target === engine.getCanvas();
+        if (target && !isCanvasClick && target.closest('.modal-overlay, .hud, [data-mobile-btn], button')) return;
         if (e.button === 0) {
           engine.setFiring(true);
           engine.ensureAudio();
         }
-        if (settings.pointerLock && !endGameRef.current) {
+        // Only grab pointer lock on a direct canvas click (and only on
+        // non-touch desktop). This prevents the cursor from being trapped
+        // and blocking UI clicks.
+        if (isCanvasClick && settings.pointerLock && !isTouchDevice && !pausedRef.current && !spectatingRef.current && countdownRef.current === null && !endGameRef.current) {
           setTimeout(() => {
             if (document.pointerLockElement || endGameRef.current) return;
             const canvas2 = engine.getCanvas();
@@ -352,16 +396,19 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
           }, 200);
         }
       };
+
       const onMouseUp = (e: MouseEvent) => {
         if (e.button === 0) {
           engine.setFiring(false);
         }
       };
+
       const onWheel = (e: WheelEvent) => {
-        if (paused || spectating) return;
+        if (pausedRef.current || spectatingRef.current) return;
         const current = engine.getCurrentWeapon();
         engine.switchWeapon(current === 'ak47' ? 'desert_eagle' : 'ak47');
       };
+
       const onResize = () => engine.resize();
       const onContext = (e: Event) => e.preventDefault();
 
@@ -375,7 +422,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
       const canvas3 = engine.getCanvas();
       canvas3.addEventListener('contextmenu', onContext);
 
-      // Cleanup
       return () => {
         window.removeEventListener('keydown', onKeyDown);
         window.removeEventListener('keyup', onKeyUp);
@@ -391,14 +437,7 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
           engineDisposed = true;
           engine.dispose();
         }
-        if (jumpBtn) {
-          jumpBtn.removeEventListener('touchstart', onJumpTouch, { passive: false, capture: true } as AddEventListenerOptions);
-        }
-        if (fireBtn) {
-          fireBtn.removeEventListener('touchstart', onFireTouchStart, { passive: false, capture: true } as AddEventListenerOptions);
-          fireBtn.removeEventListener('touchend', onFireTouchEnd, { passive: false, capture: true } as AddEventListenerOptions);
-          fireBtn.removeEventListener('touchcancel', onFireTouchEnd, { passive: false, capture: true } as AddEventListenerOptions);
-        }
+        delete (window as any).__handleMobileAction;
         engineRef.current = null;
       };
     }
@@ -431,7 +470,14 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
     if (mode === 'server') { onError(t('restartOnlyHost', lang)); return; }
     if (mode === 'lan' && !hud.isHost) { onError(t('restartOnlyHost', lang)); return; }
     const ok = engine.restart();
-    if (!ok) onError(t('restartOnlyHost', lang));
+    if (!ok) { onError(t('restartOnlyHost', lang)); return; }
+    // Defensive: also clear UI state here in case the engine's onReset
+    // callback hasn't fired yet (the engine fires it synchronously inside
+    // restart(), but clearing again is harmless and guarantees the modal
+    // closes even if a future engine change re-orders things).
+    setEndGame(null);
+    setSpectating(false);
+    setPaused(false);
   }, [mode, hud.isHost, lang, onError]);
 
   const handleWeaponSwitch = useCallback(() => {
@@ -441,6 +487,39 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
   const handleReload = useCallback(() => {
     engineRef.current?.startReload();
   }, []);
+
+  // Stable handler — uses a ref so the function identity never changes
+  // and the callback always reads the latest engineRef.current.
+  const handleMobileButtonActionRef = useRef((action: string) => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    switch (action) {
+      case 'fire':
+        engine.setFiring(true);
+        setTimeout(() => engine.setFiring(false), 100);
+        engine.ensureAudio();
+        break;
+      case 'jump':
+        engine.jump();
+        engine.ensureAudio();
+        break;
+      case 'reload':
+        engine.startReload();
+        break;
+      case 'switch("weapon")':
+        engine.switchWeapon(hud.weapon === 'ak47' ? 'desert_eagle' : 'ak47');
+        break;
+      case 'crouch':
+        break;
+      case 'sprint':
+        break;
+      case 'pause':
+        setPaused(true);
+        break;
+    }
+  });
+
+  const handleMobileButtonAction = handleMobileButtonActionRef.current;
 
   return (
     <div className="game-container">
@@ -456,37 +535,9 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         spectating={spectating}
       />
 
-      {/* Mobile controls - right side */}
-      <div className="mobile-controls-panel">
-        <button
-          ref={fireBtnRef}
-          className="fire-btn"
-          aria-label="Fire"
-        >
-          🔥
-        </button>
-        <button
-          ref={jumpBtnRef}
-          className="jump-btn"
-          aria-label="Jump"
-        >
-          {t('jump', lang)}
-        </button>
-        <button
-          className="weapon-switch-btn"
-          onTouchStart={(e) => { e.preventDefault(); e.stopPropagation(); handleWeaponSwitch(); }}
-          aria-label="Switch weapon"
-        >
-          ⇄
-        </button>
-        <button
-          className="reload-btn"
-          onTouchStart={(e) => { e.preventDefault(); e.stopPropagation(); handleReload(); }}
-          aria-label="Reload"
-        >
-          ↻
-        </button>
-      </div>
+      <MobileControls
+        onButtonAction={handleMobileButtonAction}
+      />
 
       {mobileStick.vis && (
         <div className="joystick floating" style={{
@@ -505,7 +556,6 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
       {countdown !== null && <div className="countdown">{countdown}</div>}
       {spectating && !endGame && <div className="spectator-banner">👁 {t('spectating', lang)}</div>}
       <div className="controls-hint">{t('controlsHint', lang)}</div>
-      {/* Crosshair */}
       {!spectating && !paused && !endGame && (
         <div className="crosshair">
           <div className="crosshair-dot" />
