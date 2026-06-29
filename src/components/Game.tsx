@@ -129,7 +129,7 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
   // onMouseDown below), so we don't grab the cursor unexpectedly and trap
   // the user out of clicking on mobile buttons / HUD elements.
   useEffect(() => {
-    if (paused || spectating || countdown !== null || endGame) {
+    if (paused || spectating || endGame) {
       releasePointerLock();
     }
   }, [paused, spectating, countdown, endGame, releasePointerLock]);
@@ -395,7 +395,7 @@ export default function Game({ mode, serverUrl, gameId, isHost: isHostProp, star
         // Only grab pointer lock on a direct canvas click (and only on
         // non-touch desktop). This prevents the cursor from being trapped
         // and blocking UI clicks.
-        if (isCanvasClick && settings.pointerLock && !isTouchDevice && !pausedRef.current && !spectatingRef.current && countdownRef.current === null && !endGameRef.current) {
+        if (isCanvasClick && settings.pointerLock && !isTouchDevice && !pausedRef.current && !spectatingRef.current && !endGameRef.current) {
           setTimeout(() => {
             if (document.pointerLockElement || endGameRef.current) return;
             const canvas2 = engine.getCanvas();
