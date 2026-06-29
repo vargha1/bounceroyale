@@ -221,6 +221,7 @@ function MobileButton({ x, y, size, color, icon, action, hold, onButtonAction }:
         border: '1px solid rgba(255,255,255,0.2)',
         cursor: 'pointer',
       }}
+      className='mobile-btn'
     >
       {icon}
     </div>

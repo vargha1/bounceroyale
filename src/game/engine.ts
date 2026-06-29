@@ -164,7 +164,11 @@ export function createGameEngine(opts: EngineOptions) {
 
   // Three.js core
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0a0a14);
+  const texture = new THREE.TextureLoader().load(
+    '/images/eso0932a.jpg'
+  );
+  texture.mapping = THREE.EquirectangularReflectionMapping;
+  scene.background = texture;
   scene.fog = new THREE.Fog(0x0a0a14, 25, 60);
 
   const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 100);
@@ -518,12 +522,12 @@ export function createGameEngine(opts: EngineOptions) {
   let eventQueue = new RAPIER.EventQueue(true);
 
   // World geometry (death floor for visualization only — actual death by Y check)
-  const floorGeo = new THREE.CircleGeometry(80, 64);
-  const floorMat = new THREE.MeshBasicMaterial({ color: 0x12122a, transparent: true, opacity: 0.4, side: THREE.DoubleSide });
-  const floorMesh = new THREE.Mesh(floorGeo, floorMat);
-  floorMesh.rotation.x = -Math.PI / 2;
-  floorMesh.position.y = DEATH_Y_LEVEL;
-  scene.add(floorMesh);
+  // const floorGeo = new THREE.CircleGeometry(80, 64);
+  // const floorMat = new THREE.MeshBasicMaterial({ color: 0x12122a, transparent: true, opacity: 0.4, side: THREE.DoubleSide });
+  // const floorMesh = new THREE.Mesh(floorGeo, floorMat);
+  // floorMesh.rotation.x = -Math.PI / 2;
+  // floorMesh.position.y = DEATH_Y_LEVEL;
+  // scene.add(floorMesh);
 
   // State
   type TileClient = {
@@ -1571,11 +1575,11 @@ export function createGameEngine(opts: EngineOptions) {
   function buildWeaponMesh(type: WeaponType): THREE.Group {
     const group = new THREE.Group();
     if (type === 'ak47') {
-      const gunMetal = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, roughness: 0.25, metalness: 0.9 });
-      const darkMetal = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.3, metalness: 0.85 });
-      const wood = new THREE.MeshStandardMaterial({ color: 0x8B5A2B, roughness: 0.65, metalness: 0.05 });
-      const brass = new THREE.MeshStandardMaterial({ color: 0xb8860b, roughness: 0.35, metalness: 0.7 });
-      const orangeTip = new THREE.MeshStandardMaterial({ color: 0xff6600, roughness: 0.5, metalness: 0.2, emissive: new THREE.Color(0xff6600), emissiveIntensity: 0.3 });
+      const gunMetal = new THREE.MeshStandardMaterial({ color: 0x4a4a4a, roughness: 0.4, metalness: 0.5 });
+      const darkMetal = new THREE.MeshStandardMaterial({ color: 0x3a3a3a, roughness: 0.45, metalness: 0.45 });
+      const wood = new THREE.MeshStandardMaterial({ color: 0x8B5A2B, roughness: 0.65, metalness: 0.0 });
+      const brass = new THREE.MeshStandardMaterial({ color: 0xb8860b, roughness: 0.35, metalness: 0.5 });
+      const orangeTip = new THREE.MeshStandardMaterial({ color: 0xff6600, roughness: 0.5, metalness: 0.1, emissive: new THREE.Color(0xff6600), emissiveIntensity: 0.5 });
 
       // Barrel
       const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.018, 0.55, 8), darkMetal);
@@ -1641,11 +1645,11 @@ export function createGameEngine(opts: EngineOptions) {
       group.add(rearSight);
     } else {
       // Desert Eagle - big chrome pistol
-      const chrome = new THREE.MeshStandardMaterial({ color: 0xc0c0c0, roughness: 0.1, metalness: 0.95 });
-      const darkSteel = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.3, metalness: 0.85 });
-      const blackGrip = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.8, metalness: 0.1 });
-      const goldAccent = new THREE.MeshStandardMaterial({ color: 0xdaa520, roughness: 0.2, metalness: 0.9, emissive: new THREE.Color(0xdaa520), emissiveIntensity: 0.15 });
-      const orangeTip = new THREE.MeshStandardMaterial({ color: 0xff6600, roughness: 0.5, metalness: 0.2, emissive: new THREE.Color(0xff6600), emissiveIntensity: 0.3 });
+      const chrome = new THREE.MeshStandardMaterial({ color: 0xd0d0d0, roughness: 0.2, metalness: 0.5 });
+      const darkSteel = new THREE.MeshStandardMaterial({ color: 0x555555, roughness: 0.4, metalness: 0.45 });
+      const blackGrip = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, roughness: 0.8, metalness: 0.0 });
+      const goldAccent = new THREE.MeshStandardMaterial({ color: 0xdaa520, roughness: 0.25, metalness: 0.5, emissive: new THREE.Color(0xdaa520), emissiveIntensity: 0.3 });
+      const orangeTip = new THREE.MeshStandardMaterial({ color: 0xff6600, roughness: 0.5, metalness: 0.1, emissive: new THREE.Color(0xff6600), emissiveIntensity: 0.5 });
 
       // Barrel (thick, iconic DEagle)
       const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.016, 0.32, 8), chrome);
@@ -1723,11 +1727,14 @@ export function createGameEngine(opts: EngineOptions) {
   const fpsWeaponScene = new THREE.Scene();
   const fpsWeaponCamera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 10);
   fpsWeaponCamera.position.set(0, 0, 0);
-  const fpsAmbient = new THREE.AmbientLight(0xffffff, 0.5);
+  const fpsAmbient = new THREE.AmbientLight(0xffffff, 1.8);
   fpsWeaponScene.add(fpsAmbient);
-  const fpsDirLight = new THREE.DirectionalLight(0xffe4b5, 1.0);
+  const fpsDirLight = new THREE.DirectionalLight(0xffe4b5, 2.0);
   fpsDirLight.position.set(1, 2, 1);
   fpsWeaponScene.add(fpsDirLight);
+  const fpsFillLight = new THREE.DirectionalLight(0xaabbff, 0.8);
+  fpsFillLight.position.set(-2, 0, 1);
+  fpsWeaponScene.add(fpsFillLight);
 
   let fpsWeaponGroup = new THREE.Group();
   fpsWeaponScene.add(fpsWeaponGroup);

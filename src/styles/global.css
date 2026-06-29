@@ -799,7 +799,8 @@ body.rtl .controls-hint {
   position: absolute;
   bottom: 20px;
   right: 16px;
-  display: none; /* hidden on desktop */
+  display: none;
+  /* hidden on desktop */
   flex-direction: column;
   gap: 10px;
   z-index: 20;
@@ -1449,6 +1450,7 @@ body.rtl .toast {
 .center {
   text-align: center;
 }
+
 /* ===== Crosshair ===== */
 .crosshair {
   position: absolute;
@@ -1584,8 +1586,13 @@ body.rtl .toast {
 }
 
 @keyframes pulse-red {
-  from { opacity: 1; }
-  to { opacity: 0.5; }
+  from {
+    opacity: 1;
+  }
+
+  to {
+    opacity: 0.5;
+  }
 }
 
 /* ===== Player name labels ===== */
@@ -1684,6 +1691,7 @@ body.rtl .kill-feed {
     opacity: 0;
     transform: translateX(20px);
   }
+
   to {
     opacity: 1;
     transform: translateX(0);
@@ -1724,8 +1732,13 @@ body.rtl .kill-feed {
 }
 
 @keyframes ammoLowPulse {
-  from { opacity: 1; }
-  to { opacity: 0.4; }
+  from {
+    opacity: 1;
+  }
+
+  to {
+    opacity: 0.4;
+  }
 }
 
 /* ===== Damage Indicator (Red Vignette Flash) ===== */
@@ -1778,9 +1791,20 @@ body.rtl .kill-feed {
 }
 
 @keyframes hitMarker {
-  0% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
-  50% { transform: translate(-50%, -50%) scale(1.5); opacity: 1; }
-  100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+  0% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 1;
+  }
+
+  50% {
+    transform: translate(-50%, -50%) scale(1.5);
+    opacity: 1;
+  }
+
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 1;
+  }
 }
 
 .crosshair-line {
@@ -1823,10 +1847,21 @@ body.rtl .kill-feed {
 }
 
 /* Crosshair spread indication (expands when moving/firing) */
-.crosshair.spread .crosshair-top { top: -24px; }
-.crosshair.spread .crosshair-bottom { bottom: -24px; }
-.crosshair.spread .crosshair-left { left: -24px; }
-.crosshair.spread .crosshair-right { right: -24px; }
+.crosshair.spread .crosshair-top {
+  top: -24px;
+}
+
+.crosshair.spread .crosshair-bottom {
+  bottom: -24px;
+}
+
+.crosshair.spread .crosshair-left {
+  left: -24px;
+}
+
+.crosshair.spread .crosshair-right {
+  right: -24px;
+}
 
 /* ===== Enhanced Pause Modal ===== */
 .modal-overlay {
@@ -1872,7 +1907,7 @@ body.rtl .kill-feed {
   margin-top: 1rem;
 }
 
-.modal .actions > button {
+.modal .actions>button {
   width: 100%;
   padding: 1rem 1.5rem;
   font-size: 1rem;
@@ -1883,6 +1918,7 @@ body.rtl .kill-feed {
     opacity: 0;
     transform: translateY(20px);
   }
+
   to {
     opacity: 1;
     transform: translateY(0);
@@ -1904,8 +1940,13 @@ body.rtl .kill-feed {
 }
 
 @keyframes titleGlow {
-  from { filter: drop-shadow(0 0 20px rgba(192, 132, 252, 0.3)); }
-  to { filter: drop-shadow(0 0 40px rgba(244, 114, 182, 0.5)); }
+  from {
+    filter: drop-shadow(0 0 20px rgba(192, 132, 252, 0.3));
+  }
+
+  to {
+    filter: drop-shadow(0 0 40px rgba(244, 114, 182, 0.5));
+  }
 }
 
 .welcome .cta button {
@@ -2119,8 +2160,15 @@ body.rtl .spectator-banner {
 }
 
 @keyframes pulse {
-  0%, 100% { transform: translate(-50%, -50%) scale(1); }
-  50% { transform: translate(-50%, -50%) scale(1.1); }
+
+  0%,
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+  }
+
+  50% {
+    transform: translate(-50%, -50%) scale(1.1);
+  }
 }
 
 /* ===== End Game Modal ===== */
@@ -2266,11 +2314,25 @@ body.rtl .toast {
   font-family: 'JetBrains Mono', 'Courier New', monospace;
 }
 
-.mt-1 { margin-top: 0.5rem; }
-.mt-2 { margin-top: 1rem; }
-.mb-1 { margin-bottom: 0.5rem; }
-.mb-2 { margin-bottom: 1rem; }
-.center { text-align: center; }
+.mt-1 {
+  margin-top: 0.5rem;
+}
+
+.mt-2 {
+  margin-top: 1rem;
+}
+
+.mb-1 {
+  margin-bottom: 0.5rem;
+}
+
+.mb-2 {
+  margin-bottom: 1rem;
+}
+
+.center {
+  text-align: center;
+}
 
 /* ===== HUD Card variants ===== */
 .hud-card.score-card {
@@ -2311,38 +2373,46 @@ body.rtl .toast {
 }
 
 /* ===== Mobile responsive for new elements ===== */
-@media (max-width: 880px), (pointer: coarse) {
+@media (max-width: 880px),
+(pointer: coarse) {
   .kill-feed {
     top: 80px;
     right: 10px;
     left: 10px;
     max-width: none;
   }
-  
+
   body.rtl .kill-feed {
     right: 10px;
     left: 10px;
   }
-  
+
   .kill-feed-entry {
     font-size: 0.65rem;
     padding: 3px 8px;
   }
-  
+
   .ammo-bar {
     width: 140px;
   }
-  
+
   .hud-card {
     padding: 0.35rem 0.55rem;
     font-size: 0.7rem;
   }
-  
+
   .hud-card .value {
     font-size: 0.85rem;
   }
-  
+
   .hud-card .label {
     font-size: 0.55rem;
+  }
+}
+
+
+@media (min-width: 880px) {
+  .mobile-btn {
+    display: none !important;
   }
 }
