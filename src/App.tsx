@@ -9,6 +9,7 @@ import AboutModal from './components/AboutModal';
 import CreateGameModal from './components/CreateGameModal';
 import JoinServerModal from './components/JoinServerModal';
 import LanModal from './components/LanModal';
+import LanCodeModal from './components/LanCodeModal';
 import Game from './components/Game';
 import Toast from './components/Toast';
 
@@ -20,6 +21,7 @@ type Screen =
   | { kind: 'create-server' }
   | { kind: 'join-server' }
   | { kind: 'lan' }
+  | { kind: 'lan-manual' }
   | { kind: 'game'; mode: 'single' | 'lan' | 'server'; serverUrl?: string; gameId?: string; isHost?: boolean; startTimer: number };
 
 export default function App() {
@@ -80,8 +82,16 @@ export default function App() {
       )}
 
       {screen.kind === 'lan' && (
-        <LanModal
+        <LanCodeModal
           onCancel={() => setScreen({ kind: 'mode' })}
+          onStart={(_client, timer) => setScreen({ kind: 'game', mode: 'lan', startTimer: timer })}
+          onOffline={() => setScreen({ kind: 'lan-manual' })}
+        />
+      )}
+
+      {screen.kind === 'lan-manual' && (
+        <LanModal
+          onCancel={() => setScreen({ kind: 'lan' })}
           onStart={(_client, timer) => setScreen({ kind: 'game', mode: 'lan', startTimer: timer })}
         />
       )}

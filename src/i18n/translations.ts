@@ -129,7 +129,18 @@ export type TranslationKey =
   | 'addPlayer'
   | 'playAgain'
   | 'restart'
-  | 'restartOnlyHost';
+  | 'restartOnlyHost'
+  | 'lanRoomCode'
+  | 'lanShareCode'
+  | 'lanEnterCode'
+  | 'lanCreatingRoom'
+  | 'lanJoinRoom'
+  | 'lanJoining'
+  | 'lanBadCode'
+  | 'lanRoomNotFound'
+  | 'lanBrokerError'
+  | 'lanOfflineMode'
+  | 'lanOfflineBack';
 
 type Dict = Record<TranslationKey, string>;
 
@@ -262,6 +273,17 @@ const en: Dict = {
   playAgain: 'Play Again',
   restart: 'Restart',
   restartOnlyHost: 'Only the host can restart the match',
+  lanRoomCode: 'Room code',
+  lanShareCode: 'Share this code with friends on the same network.',
+  lanEnterCode: 'Enter room code',
+  lanCreatingRoom: 'Creating room…',
+  lanJoinRoom: 'Join',
+  lanJoining: 'Joining…',
+  lanBadCode: 'Room codes are 5 letters/numbers.',
+  lanRoomNotFound: 'No game found with that code. Check it and try again.',
+  lanBrokerError: 'Could not reach the matchmaking service. Check your internet, or use offline mode.',
+  lanOfflineMode: 'No internet? Offline / hotspot mode (advanced)',
+  lanOfflineBack: 'Back to code mode',
 };
 
 const fa: Dict = {
@@ -393,6 +415,17 @@ const fa: Dict = {
   playAgain: 'بازی دوباره',
   restart: 'شروع دوباره',
   restartOnlyHost: 'فقط میزبان می‌تواند مسابقه را دوباره شروع کند',
+  lanRoomCode: 'کد اتاق',
+  lanShareCode: 'این کد را با دوستانتان در همین شبکه به اشتراک بگذارید.',
+  lanEnterCode: 'کد اتاق را وارد کنید',
+  lanCreatingRoom: 'در حال ساخت اتاق…',
+  lanJoinRoom: 'ورود',
+  lanJoining: 'در حال ورود…',
+  lanBadCode: 'کد اتاق ۵ حرف/عدد است.',
+  lanRoomNotFound: 'بازی‌ای با این کد پیدا نشد. کد را بررسی کنید و دوباره تلاش کنید.',
+  lanBrokerError: 'اتصال به سرویس بازی برقرار نشد. اینترنت را بررسی کنید یا از حالت آفلاین استفاده کنید.',
+  lanOfflineMode: 'اینترنت ندارید؟ حالت آفلاین / هات‌اسپات (پیشرفته)',
+  lanOfflineBack: 'بازگشت به حالت کد',
 };
 
 const dicts: Record<Language, Dict> = { en, fa };
