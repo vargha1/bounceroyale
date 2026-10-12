@@ -664,6 +664,7 @@ export function createGameEngine(opts: EngineOptions) {
     /** Remote player's camera azimuth (facing direction), sent via 'move' messages.
      *  Used to orient their weapon model so other players can see where they aim. */
     targetAzimuth: number;
+    targetPitch: number;
     nameLabel?: CSS2DObject;
     weaponGroup?: THREE.Group;
     health?: number;
@@ -1964,7 +1965,7 @@ export function createGameEngine(opts: EngineOptions) {
     // Added directly to the scene (NOT as a child of the mesh) so it doesn't
     // orbit with the ball's rotation. The weapon is positioned ABOVE the ball
     // (not on its surface) and rotated to face the player's aiming direction
-    // (targetAzimuth). Updated every frame in interpolateRemotePlayers().
+    // (targetAzimuth and targetPitch). Updated every frame in interpolateRemotePlayers().
     const weaponGroup = new THREE.Group();
     // Initial position: above the ball center, offset forward (negative Z)
     const weaponHeight = PLAYER_RADIUS + 0.35; // well above the ball surface
@@ -2026,6 +2027,7 @@ export function createGameEngine(opts: EngineOptions) {
       targetPosition: pos,
       targetRotation: { x: 0, y: 0, z: 0, w: 1 },
       targetAzimuth: 0,
+      targetPitch: 0,
       nameLabel,
       weaponGroup,
     };
@@ -3338,6 +3340,9 @@ export function createGameEngine(opts: EngineOptions) {
             if (ev.data.cameraAzimuth !== undefined) {
               p.targetAzimuth = ev.data.cameraAzimuth;
             }
+            if (ev.data.cameraPitch !== undefined) {
+              p.targetPitch = ev.data.cameraPitch;
+            }
           }
           break;
         }
@@ -3852,6 +3857,7 @@ export function createGameEngine(opts: EngineOptions) {
               w: +r.w.toFixed(2),
             },
             cameraAzimuth: +cameraAzimuth.toFixed(2),
+            cameraPitch: +cameraPitch.toFixed(2),
           });
           lastSendTime = t;
         } catch {
@@ -3996,7 +4002,7 @@ export function createGameEngine(opts: EngineOptions) {
               p.y + weaponHeight,
               p.z + rgtZ * weaponSideDist + fwdZ * weaponForwardDist,
             );
-            lp.weaponGroup.rotation.set(0, -cameraAzimuth, 0);
+            lp.weaponGroup.rotation.set(cameraPitch, -cameraAzimuth, 0, "YXZ");
           }
           if (lp.nameLabel) {
             lp.nameLabel.position.set(p.x, p.y + PLAYER_RADIUS + 0.6, p.z);
@@ -4175,7 +4181,7 @@ export function createGameEngine(opts: EngineOptions) {
 
       // Position the weapon group, name label, and muzzle flash in world space.
       // The weapon is held ABOVE the ball (not on its surface) and rotated to
-      // face the player's aiming direction (targetAzimuth).
+      // face the player's aiming direction (targetAzimuth and targetPitch).
       const ballPos = p.mesh.position;
       const az = p.targetAzimuth;
 
@@ -4208,8 +4214,8 @@ export function createGameEngine(opts: EngineOptions) {
         );
         // Rotate the weapon to face the player's aiming direction.
         // The weapon mesh is built pointing down -Z (barrel towards -Z),
-        // so we rotate around Y by -azimuth to align with the facing direction.
-        p.weaponGroup.rotation.set(0, -az, 0);
+        // Apply yaw then pitch, matching the camera and shot direction.
+        p.weaponGroup.rotation.set(p.targetPitch, -az, 0, "YXZ");
       }
       if (p.nameLabel) {
         p.nameLabel.position.set(

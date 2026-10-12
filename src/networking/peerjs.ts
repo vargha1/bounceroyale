@@ -242,7 +242,7 @@ export class PeerNetHost implements NetClient {
     const playerId = typeof (msg as any).id === 'string' ? ((msg as any).id as string) : fromPeer;
     switch (msg.kind) {
       case 'move':
-        this.hub.emit({ type: 'move', data: { id: playerId, position: msg.position, rotation: msg.rotation, cameraAzimuth: msg.cameraAzimuth } });
+        this.hub.emit({ type: 'move', data: { id: playerId, position: msg.position, rotation: msg.rotation, cameraAzimuth: msg.cameraAzimuth, cameraPitch: msg.cameraPitch } });
         break;
       case 'jump':
         this.hub.emit({ type: 'jump', data: { id: playerId } });
@@ -458,7 +458,7 @@ export class PeerNetGuest implements NetClient {
         this.hub.emit({ type: 'new-player', data: { id: msg.id, position: msg.position } });
         break;
       case 'move':
-        this.hub.emit({ type: 'move', data: { id: msg.id, position: msg.position, rotation: msg.rotation, cameraAzimuth: msg.cameraAzimuth } });
+        this.hub.emit({ type: 'move', data: { id: msg.id, position: msg.position, rotation: msg.rotation, cameraAzimuth: msg.cameraAzimuth, cameraPitch: msg.cameraPitch } });
         break;
       case 'jump':
         this.hub.emit({ type: 'jump', data: { id: msg.id } });
