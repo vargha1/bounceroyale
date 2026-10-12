@@ -1,65 +1,66 @@
-import { useRef, useEffect, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import {
+  CONTROLS_LAYER_STYLE,
+  ControlIcon,
   DEFAULT_CONTROLS,
-  MOBILE_LAYOUT_PRESETS,
-  loadCustomLayout,
+  getControlScale,
+  getLayoutPositions,
+  isTouchPrimary,
   loadSelectedLayout,
-  type MobileLayoutType,
   type MobileLayoutPosition,
+  type MobileLayoutType,
 } from './MobileControls/';
 
 interface Props {
   onButtonAction?: (action: string) => void;
 }
 
-function getPositionsForType(type: MobileLayoutType): Record<string, MobileLayoutPosition> {
-  if (type === 'custom') return loadCustomLayout();
-  return { ...MOBILE_LAYOUT_PRESETS[type].positions };
-}
-
-export default function MobileControls({ onButtonAction }: Props) {
-  const [layoutType, setLayoutType] = useState<MobileLayoutType>(() => loadSelectedLayout());
+/** In-game touch buttons. Only mounted on touch-first devices; positions come
+ *  from the selected preset / custom layout and update live when the layout
+ *  editor changes them. */
+function MobileControls({ onButtonAction }: Props) {
+  const [touch] = useState(() => isTouchPrimary());
   const [positions, setPositions] = useState<Record<string, MobileLayoutPosition>>(() =>
-    getPositionsForType(loadSelectedLayout())
+    getLayoutPositions(loadSelectedLayout()),
   );
+  const [scale, setScale] = useState(() => getControlScale());
 
-  // Re-read layout when the storage changes (e.g. user edits via the menu)
+  // Re-read the layout when it is edited (menu / pause editor).
   useEffect(() => {
-    const onStorage = () => {
-      const next = loadSelectedLayout();
-      setLayoutType(next);
-      setPositions(getPositionsForType(next));
-    };
-    window.addEventListener('storage', onStorage);
-    window.addEventListener('mobile-layout-changed', onStorage);
+    const onLayoutChanged = () => setPositions(getLayoutPositions(loadSelectedLayout()));
+    window.addEventListener('storage', onLayoutChanged);
+    window.addEventListener('mobile-layout-changed', onLayoutChanged);
     return () => {
-      window.removeEventListener('storage', onStorage);
-      window.removeEventListener('mobile-layout-changed', onStorage);
+      window.removeEventListener('storage', onLayoutChanged);
+      window.removeEventListener('mobile-layout-changed', onLayoutChanged);
     };
   }, []);
 
+  // Orientation change / resize → re-scale the buttons.
+  useEffect(() => {
+    const onResize = () => setScale(getControlScale());
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  if (!touch) return null;
+
   return (
-    <div
-      style={{
-        position: 'fixed',
-        inset: 0,
-        zIndex: 45,
-        pointerEvents: 'none',
-        overflow: 'hidden',
-      }}
-    >
+    <div style={{ ...CONTROLS_LAYER_STYLE, zIndex: 45, pointerEvents: 'none', overflow: 'hidden' }}>
       {DEFAULT_CONTROLS.map((control) => {
         const pos = positions[control.id] ?? { x: 50, y: 50 };
         return (
           <MobileButton
-            key={control.id + ':' + layoutType}
+            key={control.id}
+            id={control.id}
+            label={control.label}
             x={pos.x}
             y={pos.y}
-            size={control.size}
+            size={Math.round(control.size * scale)}
             color={control.color}
-            icon={control.icon}
             action={control.action}
             hold={!!control.hold}
+            fireOnRelease={!!control.fireOnRelease}
             onButtonAction={onButtonAction}
           />
         );
@@ -68,162 +69,127 @@ export default function MobileControls({ onButtonAction }: Props) {
   );
 }
 
+export default memo(MobileControls);
+
 interface MobileButtonProps {
+  id: string;
+  label: string;
   x: number;
   y: number;
   size: number;
   color: string;
-  icon: string;
   action: string;
-  /** If true, fires action on press and `${action}:release` on release
-   *  (for auto-fire). Otherwise fires action on release (tap-style). */
-  hold?: boolean;
+  /** Fire `action` on press and `${action}:release` on release (auto-fire). */
+  hold: boolean;
+  /** Fire `action` when the finger lifts instead of on press. */
+  fireOnRelease: boolean;
   onButtonAction?: (action: string) => void;
 }
 
-/** A single mobile button. Uses native touch listeners (passive: false) so we
- *  can preventDefault and avoid the 300ms tap delay / touch→click gap. Also
- *  supports mouse for desktop testing.
+/** A single touch button, driven by Pointer Events: one code path for finger,
+ *  stylus and mouse, with pointer capture so the release is always delivered
+ *  even if the finger slides off the button while firing.
  *
- *  Two action modes:
- *   - Tap (default): fires `action` once on release (touchend / click).
- *     Used for jump, reload, switch weapon, pause.
- *   - Hold (hold=true): fires `action` on press (touchstart / mousedown) and
- *     `${action}:release` on release (touchend / mouseup). Used for the fire
- *     button so the weapon keeps firing while the button is held. */
-function MobileButton({ x, y, size, color, icon, action, hold, onButtonAction }: MobileButtonProps) {
+ *  The pressed look is applied through a data attribute on the DOM node (not
+ *  React state) so holding fire never re-renders anything. */
+function MobileButton({ id, label, x, y, size, color, action, hold, fireOnRelease, onButtonAction }: MobileButtonProps) {
   const nodeRef = useRef<HTMLDivElement | null>(null);
-  // Tracks whether a "press" has been fired for hold-style buttons, so the
-  // matching "release" only fires if the press actually went out (and so we
-  // don't double-fire on stray mouseup without mousedown, etc.).
-  const pressFiredRef = useRef(false);
+  const activePointer = useRef<number | null>(null);
+  const callbackRef = useRef(onButtonAction);
+  callbackRef.current = onButtonAction;
 
+  const release = useCallback(
+    (fireTap: boolean) => {
+      if (activePointer.current === null) return;
+      activePointer.current = null;
+      const node = nodeRef.current;
+      if (node) node.removeAttribute('data-pressed');
+      if (hold) callbackRef.current?.(action + ':release');
+      else if (fireOnRelease && fireTap) callbackRef.current?.(action);
+    },
+    [action, hold, fireOnRelease],
+  );
+
+  // Never leave the weapon stuck in "firing" if the button disappears or the
+  // page loses focus mid-press (incoming call, notification shade, ...).
   useEffect(() => {
-    const node = nodeRef.current;
-    if (!node || !onButtonAction) return;
-
-    let touchActive = false;
-    let touchId: number | null = null;
-
-    const onTouchStart = (e: TouchEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-      if (e.changedTouches.length === 0) return;
-      const touch = e.changedTouches[0];
-      touchActive = true;
-      touchId = touch.identifier;
-      if (hold) {
-        pressFiredRef.current = true;
-        onButtonAction(action);
-      }
-    };
-    const onTouchEnd = (e: TouchEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-      if (!touchActive) return;
-      for (let i = 0; i < e.changedTouches.length; i++) {
-        if (e.changedTouches[i].identifier === touchId) {
-          touchActive = false;
-          touchId = null;
-          if (hold) {
-            if (pressFiredRef.current) {
-              pressFiredRef.current = false;
-              onButtonAction(action + ':release');
-            }
-          } else {
-            onButtonAction(action);
-          }
-          return;
-        }
-      }
-    };
-    const onTouchCancel = () => {
-      // If a press was fired, fire the matching release so the engine
-      // doesn't get stuck in "firing" state when a touch is interrupted
-      // (e.g. by an incoming phone call, notification gesture, etc.).
-      if (hold && pressFiredRef.current) {
-        pressFiredRef.current = false;
-        onButtonAction(action + ':release');
-      }
-      touchActive = false;
-      touchId = null;
-    };
-
-    const opts: AddEventListenerOptions = { passive: false };
-    node.addEventListener('touchstart', onTouchStart, opts);
-    node.addEventListener('touchend', onTouchEnd, opts);
-    node.addEventListener('touchcancel', onTouchCancel, opts);
-
+    const onBlur = () => release(false);
+    window.addEventListener('blur', onBlur);
     return () => {
-      node.removeEventListener('touchstart', onTouchStart, opts);
-      node.removeEventListener('touchend', onTouchEnd, opts);
-      node.removeEventListener('touchcancel', onTouchCancel, opts);
+      window.removeEventListener('blur', onBlur);
+      release(false);
     };
-  }, [action, hold, onButtonAction]);
+  }, [release]);
 
-  // Mouse handlers (desktop testing). For hold buttons, fire on mousedown
-  // and release on mouseup. For tap buttons, fire on click only (avoids the
-  // previous double-fire from having both mousedown and click handlers).
-  const onMouseDown = (e: React.MouseEvent) => {
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.stopPropagation();
-    if (hold) {
-      pressFiredRef.current = true;
-      onButtonAction?.(action);
+    if (activePointer.current !== null) return;
+    activePointer.current = e.pointerId;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore — capture is a nicety */
+    }
+    e.currentTarget.setAttribute('data-pressed', '1');
+    if (hold || !fireOnRelease) {
+      callbackRef.current?.(action);
+      if (!hold && typeof navigator.vibrate === 'function') navigator.vibrate(8);
     }
   };
 
-  const onMouseUp = (e: React.MouseEvent) => {
+  const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (activePointer.current !== e.pointerId) return;
     e.preventDefault();
     e.stopPropagation();
-    if (hold && pressFiredRef.current) {
-      pressFiredRef.current = false;
-      onButtonAction?.(action + ':release');
-    }
+    release(true);
   };
 
-  const onClick = (e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (!hold) {
-      onButtonAction?.(action);
-    }
+  const onPointerCancel = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (activePointer.current !== e.pointerId) return;
+    release(false);
   };
+
+  const isFire = id === 'fire';
+  const half = size / 2;
 
   return (
     <div
       ref={nodeRef}
       data-mobile-btn="true"
-      onMouseDown={onMouseDown}
-      onMouseUp={onMouseUp}
-      onClick={onClick}
+      className="mobile-btn"
+      role="button"
+      aria-label={label}
+      onPointerDown={onPointerDown}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerCancel}
+      onContextMenu={(e) => e.preventDefault()}
       style={{
         position: 'absolute',
         left: `${x}%`,
         top: `${y}%`,
-        transform: 'translate(-50%, -50%)',
-        zIndex: 46,
+        marginLeft: -half,
+        marginTop: -half,
+        width: size,
+        height: size,
+        borderRadius: '50%',
+        color: '#fff',
+        // Translucent so the controls never hide the action underneath.
+        background: `radial-gradient(circle at 35% 30%, ${color}d9, ${color}8c)`,
+        border: `${isFire ? 3 : 2}px solid rgba(255,255,255,${isFire ? 0.4 : 0.3})`,
+        boxShadow: '0 3px 10px rgba(0,0,0,0.35)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
         pointerEvents: 'auto',
         touchAction: 'none',
         userSelect: 'none',
         WebkitUserSelect: 'none',
-        width: size,
-        height: size,
-        borderRadius: '50%',
-        background: color,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        fontSize: size * 0.4,
-        color: 'white',
-        fontWeight: 700,
-        boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
-        border: '1px solid rgba(255,255,255,0.2)',
+        WebkitTouchCallout: 'none',
         cursor: 'pointer',
       }}
-      className='mobile-btn'
     >
-      {icon}
+      <ControlIcon id={id} size={Math.round(size * 0.46)} />
     </div>
   );
 }

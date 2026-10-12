@@ -1,24 +1,21 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useCallback } from 'react';
 import {
+  CONTROLS_LAYER_STYLE,
+  ControlIcon,
   DEFAULT_CONTROLS,
   MOBILE_LAYOUT_PRESETS,
+  getControlScale,
+  getLayoutPositions,
   loadCustomLayout,
-  saveCustomLayout,
   loadSelectedLayout,
+  saveCustomLayout,
   saveSelectedLayout,
-  type MobileLayoutType,
   type MobileLayoutPosition,
+  type MobileLayoutType,
 } from './MobileControls/';
 
 interface Props {
   onClose: () => void;
-}
-
-const DRAG_THRESHOLD_PX = 5;
-
-function getPositionsForType(type: MobileLayoutType): Record<string, MobileLayoutPosition> {
-  if (type === 'custom') return loadCustomLayout();
-  return { ...MOBILE_LAYOUT_PRESETS[type].positions };
 }
 
 /** Notifies any mounted MobileControls component that the saved layout changed
@@ -31,28 +28,28 @@ function broadcastLayoutChange() {
   }
 }
 
+const EDGE_MARGIN_PCT = 4;
+
 /** Fullscreen editor that lets the user pick a preset or drag buttons around to
  *  create a custom layout. Opened from MainMenu / PauseModal. */
 export default function MobileLayoutEditor({ onClose }: Props) {
   const [currentType, setCurrentType] = useState<MobileLayoutType>(() => loadSelectedLayout());
   const [positions, setPositions] = useState<Record<string, MobileLayoutPosition>>(() =>
-    getPositionsForType(loadSelectedLayout())
+    getLayoutPositions(loadSelectedLayout()),
   );
+  const [scale] = useState(() => getControlScale());
 
-  const containerRef = useRef<HTMLDivElement>(null);
+  // The box the percentages are relative to — identical to the in-game layer.
+  const layerRef = useRef<HTMLDivElement>(null);
   const positionsRef = useRef(positions);
   positionsRef.current = positions;
   const currentTypeRef = useRef(currentType);
   currentTypeRef.current = currentType;
-
-  // When user picks a preset, load its positions. If they then drag, we
-  // promote to 'custom' and save the result.
-  useEffect(() => {
-    setPositions(getPositionsForType(currentType));
-  }, [currentType]);
+  const dragRef = useRef<{ id: string; pointerId: number; offX: number; offY: number } | null>(null);
 
   const switchLayoutType = useCallback((type: MobileLayoutType) => {
     setCurrentType(type);
+    setPositions(getLayoutPositions(type));
     saveSelectedLayout(type);
     broadcastLayoutChange();
   }, []);
@@ -66,142 +63,6 @@ export default function MobileLayoutEditor({ onClose }: Props) {
     broadcastLayoutChange();
   }, []);
 
-  const buttonNodesRef = useRef<Record<string, HTMLDivElement | null>>({});
-  const dragStateRef = useRef<Record<string, {
-    startX: number;
-    startY: number;
-    touchId: number | null;
-    isDragging: boolean;
-    isMouse: boolean;
-  }>>({});
-
-  useEffect(() => {
-    const cleanups: (() => void)[] = [];
-
-    for (const control of DEFAULT_CONTROLS) {
-      const node = buttonNodesRef.current[control.id];
-      if (!node) continue;
-      const id = control.id;
-
-      const startDrag = (clientX: number, clientY: number, touchId: number | null, isMouse: boolean) => {
-        dragStateRef.current[id] = { startX: clientX, startY: clientY, touchId, isDragging: false, isMouse };
-      };
-
-      const moveDrag = (clientX: number, clientY: number, touchId: number | null) => {
-        const state = dragStateRef.current[id];
-        if (!state) return;
-        if (touchId !== null && state.touchId !== touchId) return;
-        const dist = Math.hypot(clientX - state.startX, clientY - state.startY);
-        if (dist > DRAG_THRESHOLD_PX) state.isDragging = true;
-        if (!state.isDragging) return;
-        if (!containerRef.current) return;
-        const rect = containerRef.current.getBoundingClientRect();
-        const x = Math.max(5, Math.min(95, ((clientX - rect.left) / rect.width) * 100));
-        const y = Math.max(5, Math.min(95, ((clientY - rect.top) / rect.height) * 100));
-        const next = { ...positionsRef.current, [id]: { x, y } };
-        positionsRef.current = next;
-        node.style.left = `${x}%`;
-        node.style.top = `${y}%`;
-      };
-
-      const endDrag = (touchId: number | null) => {
-        const state = dragStateRef.current[id];
-        if (!state) return;
-        if (touchId !== null && state.touchId !== touchId) return;
-        if (state.isDragging) {
-          setPositions({ ...positionsRef.current });
-          commitCustomPositions(positionsRef.current);
-        }
-        delete dragStateRef.current[id];
-      };
-
-      const onTouchStart = (e: TouchEvent) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const touch = e.changedTouches[0];
-        if (!touch) return;
-        startDrag(touch.clientX, touch.clientY, touch.identifier, false);
-      };
-      const onTouchMove = (e: TouchEvent) => {
-        e.preventDefault();
-        e.stopPropagation();
-        for (let i = 0; i < e.changedTouches.length; i++) {
-          const t = e.changedTouches[i];
-          moveDrag(t.clientX, t.clientY, t.identifier);
-        }
-      };
-      const onTouchEnd = (e: TouchEvent) => {
-        e.preventDefault();
-        e.stopPropagation();
-        for (let i = 0; i < e.changedTouches.length; i++) {
-          endDrag(e.changedTouches[i].identifier);
-        }
-      };
-
-      const onMouseDown = (e: MouseEvent) => {
-        e.preventDefault();
-        e.stopPropagation();
-        startDrag(e.clientX, e.clientY, null, true);
-      };
-
-      const opts: AddEventListenerOptions = { passive: false };
-      node.addEventListener('touchstart', onTouchStart, opts);
-      node.addEventListener('touchmove', onTouchMove, opts);
-      node.addEventListener('touchend', onTouchEnd, opts);
-      node.addEventListener('touchcancel', onTouchEnd, opts);
-      node.addEventListener('mousedown', onMouseDown);
-
-      cleanups.push(() => {
-        node.removeEventListener('touchstart', onTouchStart, opts);
-        node.removeEventListener('touchmove', onTouchMove, opts);
-        node.removeEventListener('touchend', onTouchEnd, opts);
-        node.removeEventListener('touchcancel', onTouchEnd, opts);
-        node.removeEventListener('mousedown', onMouseDown);
-      });
-    }
-
-    // Window-level mousemove/mouseup so dragging continues even if the cursor
-    // leaves the button.
-    const onWindowMouseMove = (e: MouseEvent) => {
-      for (const id of Object.keys(dragStateRef.current)) {
-        const state = dragStateRef.current[id];
-        if (!state.isMouse) continue;
-        const dist = Math.hypot(e.clientX - state.startX, e.clientY - state.startY);
-        if (dist > DRAG_THRESHOLD_PX) state.isDragging = true;
-        if (!state.isDragging || !containerRef.current) continue;
-        const node = buttonNodesRef.current[id];
-        if (!node) continue;
-        const rect = containerRef.current.getBoundingClientRect();
-        const x = Math.max(5, Math.min(95, ((e.clientX - rect.left) / rect.width) * 100));
-        const y = Math.max(5, Math.min(95, ((e.clientY - rect.top) / rect.height) * 100));
-        const next = { ...positionsRef.current, [id]: { x, y } };
-        positionsRef.current = next;
-        node.style.left = `${x}%`;
-        node.style.top = `${y}%`;
-      }
-    };
-    const onWindowMouseUp = () => {
-      let anyDragged = false;
-      for (const id of Object.keys(dragStateRef.current)) {
-        if (!dragStateRef.current[id].isMouse) continue;
-        if (dragStateRef.current[id].isDragging) anyDragged = true;
-        delete dragStateRef.current[id];
-      }
-      if (anyDragged) {
-        setPositions({ ...positionsRef.current });
-        commitCustomPositions(positionsRef.current);
-      }
-    };
-    window.addEventListener('mousemove', onWindowMouseMove);
-    window.addEventListener('mouseup', onWindowMouseUp);
-    cleanups.push(() => {
-      window.removeEventListener('mousemove', onWindowMouseMove);
-      window.removeEventListener('mouseup', onWindowMouseUp);
-    });
-
-    return () => cleanups.forEach((c) => c());
-  }, [commitCustomPositions]);
-
   const resetCustom = useCallback(() => {
     const fresh = { ...MOBILE_LAYOUT_PRESETS.default.positions };
     setPositions(fresh);
@@ -211,85 +72,105 @@ export default function MobileLayoutEditor({ onClose }: Props) {
     broadcastLayoutChange();
   }, []);
 
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>, id: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const layer = layerRef.current;
+    if (!layer) return;
+    const rect = layer.getBoundingClientRect();
+    const pos = positionsRef.current[id] ?? { x: 50, y: 50 };
+    // Remember where inside the button the finger landed so it doesn't jump.
+    const cx = rect.left + (pos.x / 100) * rect.width;
+    const cy = rect.top + (pos.y / 100) * rect.height;
+    dragRef.current = { id, pointerId: e.pointerId, offX: e.clientX - cx, offY: e.clientY - cy };
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    const layer = layerRef.current;
+    if (!drag || drag.pointerId !== e.pointerId || !layer) return;
+    const rect = layer.getBoundingClientRect();
+    const clamp = (v: number) => Math.max(EDGE_MARGIN_PCT, Math.min(100 - EDGE_MARGIN_PCT, v));
+    const x = clamp(((e.clientX - drag.offX - rect.left) / rect.width) * 100);
+    const y = clamp(((e.clientY - drag.offY - rect.top) / rect.height) * 100);
+    // Move the node directly while dragging; state is committed on release.
+    const node = e.currentTarget;
+    node.style.left = `${x}%`;
+    node.style.top = `${y}%`;
+    positionsRef.current = { ...positionsRef.current, [drag.id]: { x, y } };
+  };
+
+  const endDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    dragRef.current = null;
+    const next = { ...positionsRef.current };
+    setPositions(next);
+    // Only promote to "custom" if something actually moved.
+    const before = currentTypeRef.current === 'custom' ? loadCustomLayout() : MOBILE_LAYOUT_PRESETS[currentTypeRef.current].positions;
+    const p = next[drag.id];
+    const b = before[drag.id];
+    if (!b || Math.abs(p.x - b.x) > 0.05 || Math.abs(p.y - b.y) > 0.05) commitCustomPositions(next);
+  };
+
+  const chipStyle = (active: boolean): React.CSSProperties => ({
+    padding: '6px 12px',
+    fontSize: '0.8rem',
+    minHeight: '32px',
+    background: active ? 'linear-gradient(135deg, #c084fc, #f472b6)' : 'rgba(255,255,255,0.1)',
+    border: '1px solid rgba(255,255,255,0.2)',
+    borderRadius: '8px',
+    color: 'white',
+    cursor: 'pointer',
+  });
+
   return (
-    <div className="modal-overlay" style={{ zIndex: 100 }}>
-      <div
-        ref={containerRef}
-        style={{
-          position: 'fixed',
-          inset: 0,
-          background: 'rgba(0,0,0,0.92)',
-          overflow: 'hidden',
-        }}
-      >
+    <div className="modal-overlay" style={{ zIndex: 100, padding: 0, background: 'rgba(0,0,0,0.92)' }}>
+      {/* Same box as the in-game controls layer, so what you see is what you get. */}
+      <div ref={layerRef} style={{ ...CONTROLS_LAYER_STYLE, touchAction: 'none' }}>
         {/* Top bar */}
         <div
           style={{
             position: 'absolute',
             top: 10,
-            left: 10,
-            right: 10,
-            background: 'rgba(0,0,0,0.85)',
-            backdropFilter: 'blur(10px)',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            width: 'min(560px, calc(100% - 20px))',
+            background: 'rgba(20,16,36,0.95)',
             borderRadius: '12px',
-            padding: '12px',
+            padding: '10px 12px',
             zIndex: 40,
             color: 'white',
             textAlign: 'center',
           }}
         >
-          <div style={{ fontSize: '0.95rem', fontWeight: 700, marginBottom: '10px' }}>
-            🎮 Mobile Layout — Drag buttons to reposition
+          <div style={{ fontSize: '0.9rem', fontWeight: 700, marginBottom: '8px' }}>
+            🎮 Mobile Layout — drag buttons to reposition
           </div>
           <div style={{ display: 'flex', gap: '6px', justifyContent: 'center', flexWrap: 'wrap', marginBottom: '8px' }}>
             {(Object.keys(MOBILE_LAYOUT_PRESETS) as MobileLayoutType[]).map((type) => (
-              <button
-                key={type}
-                onClick={() => switchLayoutType(type)}
-                style={{
-                  padding: '6px 12px',
-                  fontSize: '0.8rem',
-                  minHeight: '30px',
-                  background:
-                    currentType === type
-                      ? 'linear-gradient(135deg, #c084fc, #f472b6)'
-                      : 'rgba(255,255,255,0.1)',
-                  border: '1px solid rgba(255,255,255,0.2)',
-                  borderRadius: '8px',
-                  color: 'white',
-                  cursor: 'pointer',
-                }}
-              >
+              <button key={type} onClick={() => switchLayoutType(type)} style={chipStyle(currentType === type)}>
                 {MOBILE_LAYOUT_PRESETS[type].name}
               </button>
             ))}
           </div>
           <div style={{ display: 'flex', gap: '8px', justifyContent: 'center' }}>
-            <button
-              onClick={resetCustom}
-              style={{
-                padding: '6px 14px',
-                fontSize: '0.8rem',
-                background: 'rgba(255,255,255,0.1)',
-                border: '1px solid rgba(255,255,255,0.2)',
-                borderRadius: '8px',
-                color: 'white',
-                cursor: 'pointer',
-              }}
-            >
+            <button onClick={resetCustom} style={chipStyle(false)}>
               ↻ Reset
             </button>
             <button
               onClick={onClose}
               style={{
+                ...chipStyle(true),
                 padding: '6px 18px',
                 fontSize: '0.85rem',
-                background: 'linear-gradient(135deg, #c084fc, #f472b6)',
-                border: 'none',
-                borderRadius: '8px',
-                color: 'white',
                 fontWeight: 700,
-                cursor: 'pointer',
+                border: 'none',
               }}
             >
               ✓ Done
@@ -297,38 +178,62 @@ export default function MobileLayoutEditor({ onClose }: Props) {
           </div>
         </div>
 
+        {/* Guide: the left side is reserved for the move joystick */}
+        <div
+          style={{
+            position: 'absolute',
+            left: 0,
+            top: 0,
+            bottom: 0,
+            width: '40%',
+            borderRight: '1px dashed rgba(255,255,255,0.15)',
+            display: 'flex',
+            alignItems: 'flex-end',
+            justifyContent: 'center',
+            paddingBottom: 18,
+            color: 'rgba(255,255,255,0.35)',
+            fontSize: '0.75rem',
+            pointerEvents: 'none',
+          }}
+        >
+          Move joystick zone
+        </div>
+
         {/* Draggable preview buttons */}
         {DEFAULT_CONTROLS.map((control) => {
           const pos = positions[control.id] ?? { x: 50, y: 50 };
+          const size = Math.round(control.size * scale);
           return (
             <div
               key={control.id}
-              ref={(node) => { buttonNodesRef.current[control.id] = node; }}
+              onPointerDown={(e) => onPointerDown(e, control.id)}
+              onPointerMove={onPointerMove}
+              onPointerUp={endDrag}
+              onPointerCancel={endDrag}
               style={{
                 position: 'absolute',
                 left: `${pos.x}%`,
                 top: `${pos.y}%`,
-                transform: 'translate(-50%, -50%)',
+                marginLeft: -size / 2,
+                marginTop: -size / 2,
+                width: size,
+                height: size,
                 zIndex: 30,
                 touchAction: 'none',
                 userSelect: 'none',
                 WebkitUserSelect: 'none',
-                width: control.size,
-                height: control.size,
                 borderRadius: '50%',
-                background: `${control.color}aa`,
+                background: `${control.color}b3`,
+                border: `2px dashed ${control.color}`,
+                boxShadow: `0 0 0 3px ${control.color}55`,
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                fontSize: control.size * 0.4,
                 color: 'white',
-                fontWeight: 700,
-                boxShadow: `0 0 0 3px ${control.color}, 0 4px 16px rgba(0,0,0,0.3)`,
-                border: `2px dashed ${control.color}`,
                 cursor: 'move',
               }}
             >
-              {control.icon}
+              <ControlIcon id={control.id} size={Math.round(size * 0.46)} />
               <div
                 style={{
                   position: 'absolute',

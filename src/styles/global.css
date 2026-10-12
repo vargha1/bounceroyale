@@ -51,7 +51,6 @@ button {
   align-items: center;
   justify-content: center;
   gap: 0.5rem;
-  backdrop-filter: blur(8px);
   border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
@@ -143,6 +142,11 @@ label {
   overflow: hidden;
 }
 
+.app.in-game::before {
+  animation: none;
+  display: none;
+}
+
 .app::before {
   content: '';
   position: absolute;
@@ -204,7 +208,6 @@ label {
   justify-content: space-between;
   padding: 0.75rem 1.5rem;
   background: linear-gradient(180deg, rgba(192, 132, 252, 0.15), transparent);
-  backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--panel-border);
   position: relative;
   z-index: 2;
@@ -268,7 +271,6 @@ label {
   flex-direction: column;
   gap: 0.5rem;
   background: rgba(10, 10, 20, 0.4);
-  backdrop-filter: blur(10px);
   border-right: 1px solid var(--panel-border);
 }
 
@@ -366,7 +368,6 @@ body.rtl .nav-item:hover {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);
-  backdrop-filter: blur(8px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -377,7 +378,6 @@ body.rtl .nav-item:hover {
 
 .modal {
   background: var(--panel);
-  backdrop-filter: blur(20px);
   border: 1px solid var(--panel-border);
   border-radius: var(--radius);
   padding: 2rem;
@@ -476,12 +476,11 @@ body.rtl .hud-top-right {
 }
 
 .hud-card {
-  background: rgba(10, 10, 20, 0.7);
-  backdrop-filter: blur(12px);
+  background: rgba(10, 10, 20, 0.78);
   border: 1px solid rgba(255, 255, 255, 0.1);
   padding: 0.6rem 0.9rem;
   border-radius: 12px;
-  pointer-events: auto;
+  pointer-events: none;
   font-size: 0.85rem;
   font-weight: 600;
   min-width: 100px;
@@ -572,7 +571,6 @@ body.rtl .spectator-banner {
   left: 50%;
   transform: translateX(-50%);
   background: rgba(10, 10, 20, 0.6);
-  backdrop-filter: blur(10px);
   padding: 0.5rem 1rem;
   border-radius: 999px;
   font-size: 0.75rem;
@@ -589,24 +587,10 @@ body.rtl .controls-hint {
 }
 
 /* ===== Mobile controls ===== */
-.mobile-controls {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  z-index: 7;
-  display: none;
-  touch-action: none;
-}
 
 @media (max-width: 880px),
 (pointer: coarse) {
-  .mobile-controls {
-    display: block;
-  }
 
-  .mobile-controls-panel {
-    display: flex !important;
-  }
 
   .controls-hint {
     display: none;
@@ -662,30 +646,10 @@ body.rtl .controls-hint {
 /* Landscape-specific mobile adjustments */
 @media (max-width: 880px) and (orientation: landscape),
 (pointer: coarse) and (orientation: landscape) {
-  .mobile-controls-panel {
-    bottom: 10px;
-    right: 10px;
-    gap: 6px;
-  }
 
-  .fire-btn {
-    width: 64px;
-    height: 64px;
-    font-size: 1.4rem;
-  }
 
-  .jump-btn {
-    width: 54px;
-    height: 54px;
-    font-size: 0.7rem;
-  }
 
   .weapon-switch-btn,
-  .reload-btn {
-    width: 36px;
-    height: 36px;
-    font-size: 1rem;
-  }
 
   .hud-top-left,
   .hud-top-right {
@@ -774,111 +738,18 @@ body.rtl .controls-hint {
   pointer-events: none;
 }
 
-.jump-btn {
-  width: 68px;
-  height: 68px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  color: white;
-  font-weight: 700;
-  font-size: 0.8rem;
-  pointer-events: auto;
-  touch-action: none;
-  box-shadow: 0 4px 16px rgba(192, 132, 252, 0.4);
-  border: none;
-  min-height: 0;
-  padding: 0;
-}
 
-.jump-btn:active {
-  transform: scale(0.9);
-}
 
 /* Mobile controls panel — right side vertical strip */
-.mobile-controls-panel {
-  position: absolute;
-  bottom: 20px;
-  right: 16px;
-  display: none;
-  /* hidden on desktop */
-  flex-direction: column;
-  gap: 10px;
-  z-index: 20;
-  pointer-events: auto;
-  touch-action: none;
-  align-items: center;
-}
 
 /* Fire button — large, prominent */
-.fire-btn {
-  width: 80px;
-  height: 80px;
-  border-radius: 50%;
-  background: radial-gradient(circle at 35% 35%, #ff6b35, #d32f2f);
-  color: white;
-  font-size: 1.8rem;
-  font-weight: 900;
-  pointer-events: auto;
-  touch-action: none;
-  box-shadow: 0 0 20px rgba(255, 107, 53, 0.5), inset 0 -3px 6px rgba(0, 0, 0, 0.3);
-  border: 3px solid rgba(255, 255, 255, 0.3);
-  min-height: 0;
-  padding: 0;
-  user-select: none;
-  -webkit-user-select: none;
-  line-height: 1;
-}
 
-.fire-btn:active {
-  transform: scale(0.88);
-  box-shadow: 0 0 30px rgba(255, 107, 53, 0.8), inset 0 -1px 3px rgba(0, 0, 0, 0.3);
-}
 
 /* Weapon switch button */
-.weapon-switch-btn {
-  width: 44px;
-  height: 44px;
-  border-radius: 50%;
-  background: rgba(56, 189, 248, 0.25);
-  color: var(--accent-3);
-  font-size: 1.3rem;
-  font-weight: 700;
-  pointer-events: auto;
-  touch-action: none;
-  border: 2px solid rgba(56, 189, 248, 0.4);
-  min-height: 0;
-  padding: 0;
-  user-select: none;
-  -webkit-user-select: none;
-}
 
-.weapon-switch-btn:active {
-  background: rgba(56, 189, 248, 0.5);
-  transform: scale(0.9);
-}
 
 /* Reload button */
-.reload-btn {
-  width: 44px;
-  height: 44px;
-  border-radius: 50%;
-  background: rgba(34, 197, 94, 0.2);
-  color: var(--success);
-  font-size: 1.4rem;
-  font-weight: 700;
-  pointer-events: auto;
-  touch-action: none;
-  border: 2px solid rgba(34, 197, 94, 0.4);
-  min-height: 0;
-  padding: 0;
-  user-select: none;
-  -webkit-user-select: none;
-}
 
-.reload-btn:active {
-  background: rgba(34, 197, 94, 0.4);
-  transform: scale(0.9);
-}
 
 /* Pause button — top right of the HUD, always visible during gameplay.
    Critical for mobile devices which have no Escape key. */
@@ -887,7 +758,6 @@ body.rtl .controls-hint {
   height: 44px;
   border-radius: 12px;
   background: rgba(10, 10, 20, 0.7);
-  backdrop-filter: blur(12px);
   border: 1px solid rgba(255, 255, 255, 0.15);
   color: white;
   font-size: 1.2rem;
@@ -1341,7 +1211,6 @@ body.rtl .lan-step-list li {
   left: 50%;
   transform: translateX(-50%);
   background: rgba(10, 10, 20, 0.95);
-  backdrop-filter: blur(12px);
   color: white;
   padding: 0.75rem 1.5rem;
   border-radius: 999px;
@@ -1646,7 +1515,6 @@ body.rtl .kill-feed {
   gap: 6px;
   padding: 4px 10px;
   background: rgba(10, 10, 20, 0.85);
-  backdrop-filter: blur(8px);
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 6px;
   font-size: 0.75rem;
@@ -1868,7 +1736,6 @@ body.rtl .kill-feed {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.75);
-  backdrop-filter: blur(6px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1879,7 +1746,6 @@ body.rtl .kill-feed {
 
 .modal {
   background: var(--panel);
-  backdrop-filter: blur(20px);
   border: 1px solid var(--panel-border);
   border-radius: var(--radius);
   padding: 2rem;
@@ -1936,7 +1802,8 @@ body.rtl .kill-feed {
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
-  animation: fadeIn 0.8s ease-out, titleGlow 3s ease-in-out infinite alternate;
+  animation: fadeIn 0.8s ease-out;
+  filter: drop-shadow(0 0 28px rgba(192, 132, 252, 0.4));
 }
 
 @keyframes titleGlow {
@@ -2083,37 +1950,8 @@ body.rtl .toggle.on::after {
 }
 
 /* ===== Mobile Controls Improvements ===== */
-.fire-btn {
-  width: 80px;
-  height: 80px;
-  border-radius: 50%;
-  background: radial-gradient(circle at 35% 35%, #ff6b35, #d32f2f);
-  color: white;
-  font-size: 1.8rem;
-  font-weight: 900;
-  pointer-events: auto;
-  touch-action: none;
-  box-shadow: 0 0 20px rgba(255, 107, 53, 0.5), inset 0 -3px 6px rgba(0, 0, 0, 0.3);
-  border: 3px solid rgba(255, 255, 255, 0.3);
-  min-height: 0;
-  padding: 0;
-  user-select: none;
-  -webkit-user-select: none;
-  line-height: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
 
-.fire-btn:active {
-  transform: scale(0.88);
-  box-shadow: 0 0 30px rgba(255, 107, 53, 0.8), inset 0 -1px 3px rgba(0, 0, 0, 0.3);
-}
 
-.fire-btn svg {
-  width: 36px;
-  height: 36px;
-}
 
 /* ===== Spectator UI ===== */
 .spectator-banner {
@@ -2234,7 +2072,6 @@ body.rtl .spectator-banner {
   left: 50%;
   transform: translateX(-50%);
   background: rgba(10, 10, 20, 0.95);
-  backdrop-filter: blur(12px);
   color: white;
   padding: 0.75rem 1.5rem;
   border-radius: 999px;
@@ -2411,8 +2248,23 @@ body.rtl .toast {
 }
 
 
-@media (min-width: 880px) {
-  .mobile-btn {
-    display: none !important;
+
+/* ===== Touch controls (v2) ===== */
+[data-mobile-btn] {
+  transition: transform 0.06s ease-out, filter 0.06s ease-out;
+  -webkit-tap-highlight-color: transparent;
+}
+
+[data-mobile-btn][data-pressed] {
+  transform: scale(0.9);
+  filter: brightness(1.3);
+}
+
+/* The mobile layer provides its own pause button on touch devices, and the
+   mode/player-id card only crowds the top-right corner. */
+@media (pointer: coarse) {
+  .pause-btn,
+  .mode-card {
+    display: none;
   }
 }

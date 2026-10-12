@@ -22,14 +22,23 @@
  *  4. Animations (tweens, particles, score-per-second) use the real frame delta
  *     scaled by gameSpeed, so they look smooth at any FPS.
  */
-import * as THREE from 'three';
-import RAPIER from '@dimforge/rapier3d';
-import { Tween, Group, Easing } from '@tweenjs/tween.js';
-import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+import * as THREE from "three";
+import RAPIER from "@dimforge/rapier3d";
+import { Tween, Group, Easing } from "@tweenjs/tween.js";
+import {
+  CSS2DRenderer,
+  CSS2DObject,
+} from "three/addons/renderers/CSS2DRenderer.js";
+import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 
-import type { NetClient, NetMessage, NetEvent } from '../networking/types';
-import type { Settings } from '../store/settings';
-import { generateIsland, getIslandSpawn, type IslandTile, type IslandSize } from './island';
+import type { NetClient, NetMessage, NetEvent } from "../networking/types";
+import type { Settings } from "../store/settings";
+import {
+  generateIsland,
+  getIslandSpawn,
+  type IslandTile,
+  type IslandSize,
+} from "./island";
 
 // ---------- Constants ----------
 const DEATH_Y_LEVEL = -10;
@@ -40,7 +49,7 @@ const PLAYER_RADIUS = 0.5;
 const PLAYER_HEIGHT = 1.8; // First-person eye height
 
 // ---------- Weapon Definitions ----------
-type WeaponType = 'ak47' | 'desert_eagle';
+type WeaponType = "ak47" | "desert_eagle";
 interface WeaponDef {
   name: string;
   damage: number;
@@ -54,7 +63,7 @@ interface WeaponDef {
 }
 const WEAPONS: Record<WeaponType, WeaponDef> = {
   ak47: {
-    name: 'AK-47',
+    name: "AK-47",
     damage: 15,
     fireRate: 10,
     maxAmmo: 30,
@@ -65,7 +74,7 @@ const WEAPONS: Record<WeaponType, WeaponDef> = {
     knockback: 3,
   },
   desert_eagle: {
-    name: 'Desert Eagle',
+    name: "Desert Eagle",
     damage: 45,
     fireRate: 2.5,
     maxAmmo: 7,
@@ -84,17 +93,22 @@ const TILE_HEIGHT = 0.5;
 const TILE_MAX_HEALTH = 100;
 
 // Powerup pickup tuning.
-const POWERUP_PICKUP_COUNT = 6;        // how many pickups spawn on the map
-const POWERUP_PICKUP_RADIUS = 0.45;    // visual size of the pickup
-const POWERUP_COLLECT_DISTANCE = 1.1;  // player-to-pickup distance to collect
-const POWERUP_RESPAWN_MS = 12000;      // a collected pickup reappears after this long
-const POWERUP_DURATION_MS = 12000;     // how long the collected effect lasts on the player
-const POWERUP_TYPES = ['speed_boost', 'high_jump', 'invincibility', 'health_regen'] as const;
+const POWERUP_PICKUP_COUNT = 6; // how many pickups spawn on the map
+const POWERUP_PICKUP_RADIUS = 0.45; // visual size of the pickup
+const POWERUP_COLLECT_DISTANCE = 1.1; // player-to-pickup distance to collect
+const POWERUP_RESPAWN_MS = 12000; // a collected pickup reappears after this long
+const POWERUP_DURATION_MS = 12000; // how long the collected effect lasts on the player
+const POWERUP_TYPES = [
+  "speed_boost",
+  "high_jump",
+  "invincibility",
+  "health_regen",
+] as const;
 const POWERUP_COLORS: Record<string, number> = {
-  speed_boost: 0xffd700,    // gold
-  high_jump: 0x00e676,      // green
-  invincibility: 0x40c4ff,  // blue
-  health_regen: 0xff5252,   // red
+  speed_boost: 0xffd700, // gold
+  high_jump: 0x00e676, // green
+  invincibility: 0x40c4ff, // blue
+  health_regen: 0xff5252, // red
 };
 
 // Impact damage tuning. The "base" damage is applied at a reference fall speed
@@ -110,8 +124,67 @@ const IMPACT_DEBOUNCE_MS = 150; // prevent double-triggering on the same landing
 const ALL_INTERACTION = 0x00010001;
 const PLAYER_COLLISION_GROUP = 0x00020002;
 
+// Instanced tile batches are allocated once with a fixed capacity. These are
+// upper bounds for the 'large' island: a 37x37 ground grid and the wider
+// (-20..20)^2 grid scanned for perimeter walls.
+const MAX_GROUND_TILES = 1400;
+const MAX_WALL_TILES = 1700;
+
+// ---------- Device / quality profile ----------
+const IS_MOBILE =
+  typeof navigator !== "undefined" &&
+  (/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) ||
+    (navigator.maxTouchPoints > 1 &&
+      typeof matchMedia === "function" &&
+      matchMedia("(pointer: coarse)").matches));
+
+interface QualityProfile {
+  name: Settings["graphicsQuality"];
+  antialias: boolean;
+  /** Upper bound for renderer pixel ratio. */
+  maxDpr: number;
+  /** Adaptive resolution never drops below this. */
+  minDpr: number;
+  /** Real-time point lights for muzzle flashes (each one costs every pixel). */
+  flashLights: boolean;
+  maxParticles: number;
+}
+
+function getQualityProfile(q: Settings["graphicsQuality"]): QualityProfile {
+  switch (q) {
+    case "low":
+      return {
+        name: q,
+        antialias: false,
+        maxDpr: 1,
+        minDpr: 0.55,
+        flashLights: false,
+        maxParticles: 24,
+      };
+    case "medium":
+      return {
+        name: q,
+        antialias: false,
+        maxDpr: IS_MOBILE ? 1.25 : 1.5,
+        minDpr: 0.6,
+        flashLights: true,
+        maxParticles: 40,
+      };
+    default:
+      return {
+        name: q,
+        antialias: !IS_MOBILE,
+        maxDpr: 1.5,
+        minDpr: 0.7,
+        flashLights: true,
+        maxParticles: 60,
+      };
+  }
+}
+
 const PLAYER_COLORS = [
-  0xff5252, 0x5b8cff, 0xffc400, 0x00e676, 0xff4081, 0x18ffff, 0xb388ff, 0xffab40,
+  0xff5252, 0x5b8cff, 0xffc400, 0x00e676, 0xff4081, 0x18ffff, 0xb388ff,
+  0xffab40,
 ];
 
 export type EngineHandle = ReturnType<typeof createGameEngine>;
@@ -120,7 +193,10 @@ export interface EngineCallbacks {
   onState: (s: EngineHudState) => void;
   onCountdown: (remainingSeconds: number | null) => void;
   onSpectatingChange: (spectating: boolean) => void;
-  onEndGame: (rankings: { id: string; rank: number | null }[], winner: string | null) => void;
+  onEndGame: (
+    rankings: { id: string; rank: number | null }[],
+    winner: string | null,
+  ) => void;
   onError: (message: string) => void;
   onConnectionLost: () => void;
   /** Fired when the local player takes damage (delta < 0). Used for damage indicator UI. */
@@ -148,7 +224,7 @@ export interface EngineHudState {
 }
 
 export interface EngineOptions {
-  mode: 'single' | 'lan' | 'server';
+  mode: "single" | "lan" | "server";
   netClient?: NetClient | null;
   isHost: boolean;
   settings: Settings;
@@ -161,30 +237,42 @@ export interface EngineOptions {
 export function createGameEngine(opts: EngineOptions) {
   const { mode, netClient, isHost, callbacks } = opts;
   let settings = opts.settings;
+  let profile = getQualityProfile(settings.graphicsQuality);
 
   // Three.js core
   const scene = new THREE.Scene();
-  const texture = new THREE.TextureLoader().load(
-    '/images/eso0932a.jpg'
-  );
+  const texture = new THREE.TextureLoader().load("/images/eso0932a.jpg");
   texture.mapping = THREE.EquirectangularReflectionMapping;
+  // The sky is only ever sampled magnified, so mipmaps are wasted GPU memory
+  // and upload time (very noticeable on low-end phones).
+  texture.generateMipmaps = false;
+  texture.minFilter = THREE.LinearFilter;
   scene.background = texture;
   scene.fog = new THREE.Fog(0x0a0a14, 25, 60);
 
-  const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 100);
+  const camera = new THREE.PerspectiveCamera(
+    70,
+    window.innerWidth / window.innerHeight,
+    0.1,
+    100,
+  );
   camera.position.set(0, 8, 14);
 
   const renderer = new THREE.WebGLRenderer({
-    antialias: settings.graphicsQuality !== 'low',
-    powerPreference: 'high-performance',
+    antialias: profile.antialias,
+    powerPreference: "high-performance",
     alpha: false,
+    stencil: false,
   });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+  // Adaptive resolution: starts at the quality cap and is lowered / raised at
+  // runtime from the measured frame rate (see adaptResolution()).
+  let currentDpr = Math.min(window.devicePixelRatio || 1, profile.maxDpr);
+  renderer.setPixelRatio(currentDpr);
   renderer.setSize(window.innerWidth, window.innerHeight);
   // Critical for mobile: prevent the canvas from triggering browser gestures
   // (pan, zoom, pull-to-refresh) that would otherwise eat our touch events.
-  renderer.domElement.style.touchAction = 'none';
-  renderer.domElement.style.display = 'block';
+  renderer.domElement.style.touchAction = "none";
+  renderer.domElement.style.display = "block";
   renderer.shadowMap.enabled = false; // Shadows disabled for FPS — re-enable only on high-end
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -193,11 +281,11 @@ export function createGameEngine(opts: EngineOptions) {
   // CSS2D renderer for player name labels
   const css2dRenderer = new CSS2DRenderer();
   css2dRenderer.setSize(window.innerWidth, window.innerHeight);
-  css2dRenderer.domElement.style.position = 'absolute';
-  css2dRenderer.domElement.style.top = '0';
-  css2dRenderer.domElement.style.left = '0';
-  css2dRenderer.domElement.style.pointerEvents = 'none';
-  renderer.domElement.style.position = 'relative';
+  css2dRenderer.domElement.style.position = "absolute";
+  css2dRenderer.domElement.style.top = "0";
+  css2dRenderer.domElement.style.left = "0";
+  css2dRenderer.domElement.style.pointerEvents = "none";
+  renderer.domElement.style.position = "relative";
 
   // Lighting
   // Use hemisphere light for cheaper ambient + directional in one pass
@@ -216,9 +304,14 @@ export function createGameEngine(opts: EngineOptions) {
   const collisionSound = new THREE.Audio(audioListener);
   const breakSound = new THREE.Audio(audioListener);
   let audioReady = false;
-  audioLoader.load('/sounds/jump.mp3', (buf) => { jumpSound.setBuffer(buf); audioReady = true; });
-  audioLoader.load('/sounds/collision.mp3', (buf) => collisionSound.setBuffer(buf));
-  audioLoader.load('/sounds/break.mp3', (buf) => breakSound.setBuffer(buf));
+  audioLoader.load("/sounds/jump.mp3", (buf) => {
+    jumpSound.setBuffer(buf);
+    audioReady = true;
+  });
+  audioLoader.load("/sounds/collision.mp3", (buf) =>
+    collisionSound.setBuffer(buf),
+  );
+  audioLoader.load("/sounds/break.mp3", (buf) => breakSound.setBuffer(buf));
 
   function ensureAudio() {
     // Always try to resume the AudioContext. On mobile browsers, the context
@@ -226,8 +319,11 @@ export function createGameEngine(opts: EngineOptions) {
     // (touch/click). We call this from every touch handler so the first
     // interaction unlocks audio.
     try {
-      if (audioListener.context.state === 'suspended') audioListener.context.resume();
-    } catch { /* ignore */ }
+      if (audioListener.context.state === "suspended")
+        audioListener.context.resume();
+    } catch {
+      /* ignore */
+    }
   }
 
   function playSound(s: THREE.Audio, vol: number) {
@@ -253,12 +349,63 @@ export function createGameEngine(opts: EngineOptions) {
    *      low-end. Multi-layered noise + sub-bass + rolled-off midrange
    *      gives that signature hand-cannon weight.
    *  No external audio files needed — works fully offline. */
+  // The noise bursts used by the synthesized shot are generated ONCE per
+  // AudioContext (a few variants each so shots don't sound identical) instead
+  // of running ~7k Math.exp/Math.random calls and allocating several
+  // AudioBuffers on every trigger pull — at 10 shots/s that was a steady
+  // source of GC stutter on weak phones.
+  const BUFFER_VARIANTS = 3;
+  let fireBuffers: {
+    ctx: BaseAudioContext;
+    crack: AudioBuffer[];
+    ring: AudioBuffer[];
+    blast: AudioBuffer[];
+    snap: AudioBuffer[];
+  } | null = null;
+
+  function pickBuffer(list: AudioBuffer[]): AudioBuffer {
+    return list[(Math.random() * list.length) | 0];
+  }
+
+  function getFireBuffers(ctx: BaseAudioContext) {
+    if (fireBuffers && fireBuffers.ctx === ctx) return fireBuffers;
+    const make = (dur: number, fill: (t: number) => number): AudioBuffer[] => {
+      const out: AudioBuffer[] = [];
+      for (let v = 0; v < BUFFER_VARIANTS; v++) {
+        const len = Math.floor(ctx.sampleRate * dur);
+        const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+        const data = buf.getChannelData(0);
+        for (let i = 0; i < len; i++) data[i] = fill(i / ctx.sampleRate);
+        out.push(buf);
+      }
+      return out;
+    };
+    const noise = () => Math.random() * 2 - 1;
+    fireBuffers = {
+      ctx,
+      // Ultra-fast exponential decay for the initial snap
+      crack: make(0.045, (t) => noise() * Math.exp(-t * 120) * 0.7),
+      // Slower decay ring-off tail with a pitched metallic resonance
+      ring: make(
+        0.12,
+        (t) =>
+          noise() * Math.exp(-t * 35) * 0.25 +
+          Math.sin(t * 2400) * Math.exp(-t * 50) * 0.08 +
+          Math.sin(t * 3800) * Math.exp(-t * 60) * 0.04,
+      ),
+      blast: make(0.2, (t) => noise() * Math.exp(-t * 14) * 0.45),
+      snap: make(0.06, (t) => noise() * Math.exp(-t * 80) * 0.35),
+    };
+    return fireBuffers;
+  }
+
   function playFireSound() {
     ensureAudio();
     try {
       const ctx = audioListener.context;
-      if (ctx.state === 'suspended') return;
-      const isAk = currentWeapon === 'ak47';
+      if (ctx.state === "suspended") return;
+      const bufs = getFireBuffers(ctx);
+      const isAk = currentWeapon === "ak47";
       const now = ctx.currentTime;
 
       // ---- Master gain for this shot ----
@@ -270,18 +417,8 @@ export function createGameEngine(opts: EngineOptions) {
         // === AK-47: Three layers ===
 
         // Layer 1: Sharp transient crack (noise burst, very fast attack/decay)
-        const crackDur = 0.045;
-        const crackLen = Math.floor(ctx.sampleRate * crackDur);
-        const crackBuf = ctx.createBuffer(1, crackLen, ctx.sampleRate);
-        const crackData = crackBuf.getChannelData(0);
-        for (let i = 0; i < crackLen; i++) {
-          const t = i / ctx.sampleRate;
-          // Ultra-fast exponential decay for the initial snap
-          const env = Math.exp(-t * 120) * 0.7;
-          crackData[i] = (Math.random() * 2 - 1) * env;
-        }
         const crackSrc = ctx.createBufferSource();
-        crackSrc.buffer = crackBuf;
+        crackSrc.buffer = pickBuffer(bufs.crack);
         const crackGain = ctx.createGain();
         crackGain.gain.value = 0.7;
         crackSrc.connect(crackGain);
@@ -290,7 +427,7 @@ export function createGameEngine(opts: EngineOptions) {
 
         // Layer 2: Low-frequency thump (body of the shot)
         const thumpOsc = ctx.createOscillator();
-        thumpOsc.type = 'sine';
+        thumpOsc.type = "sine";
         thumpOsc.frequency.setValueAtTime(120, now);
         thumpOsc.frequency.exponentialRampToValueAtTime(55, now + 0.08);
         const thumpGain = ctx.createGain();
@@ -302,23 +439,10 @@ export function createGameEngine(opts: EngineOptions) {
         thumpOsc.stop(now + 0.12);
 
         // Layer 3: Metallic ring-off (resonant filter on noise — mimics barrel resonance)
-        const ringDur = 0.12;
-        const ringLen = Math.floor(ctx.sampleRate * ringDur);
-        const ringBuf = ctx.createBuffer(1, ringLen, ctx.sampleRate);
-        const ringData = ringBuf.getChannelData(0);
-        for (let i = 0; i < ringLen; i++) {
-          const t = i / ctx.sampleRate;
-          // Slower decay for the ring-off tail
-          const env = Math.exp(-t * 35) * 0.25;
-          ringData[i] = (Math.random() * 2 - 1) * env;
-          // Add a pitched metallic resonance component
-          ringData[i] += Math.sin(t * 2400) * Math.exp(-t * 50) * 0.08;
-          ringData[i] += Math.sin(t * 3800) * Math.exp(-t * 60) * 0.04;
-        }
         const ringSrc = ctx.createBufferSource();
-        ringSrc.buffer = ringBuf;
+        ringSrc.buffer = pickBuffer(bufs.ring);
         const ringFilter = ctx.createBiquadFilter();
-        ringFilter.type = 'bandpass';
+        ringFilter.type = "bandpass";
         ringFilter.frequency.value = 2500;
         ringFilter.Q.value = 2.5;
         const ringGain = ctx.createGain();
@@ -327,13 +451,12 @@ export function createGameEngine(opts: EngineOptions) {
         ringFilter.connect(ringGain);
         ringGain.connect(masterGain);
         ringSrc.start(now + 0.01); // slight delay after crack
-
       } else {
         // === Desert Eagle: Four layers for maximum impact ===
 
         // Layer 1: Massive sub-bass hit
         const subOsc = ctx.createOscillator();
-        subOsc.type = 'sine';
+        subOsc.type = "sine";
         subOsc.frequency.setValueAtTime(65, now);
         subOsc.frequency.exponentialRampToValueAtTime(35, now + 0.2);
         const subGain = ctx.createGain();
@@ -346,7 +469,7 @@ export function createGameEngine(opts: EngineOptions) {
 
         // Layer 2: Mid-bass boom (the signature DE report)
         const boomOsc = ctx.createOscillator();
-        boomOsc.type = 'sine';
+        boomOsc.type = "sine";
         boomOsc.frequency.setValueAtTime(100, now);
         boomOsc.frequency.exponentialRampToValueAtTime(60, now + 0.15);
         const boomGain = ctx.createGain();
@@ -358,19 +481,10 @@ export function createGameEngine(opts: EngineOptions) {
         boomOsc.stop(now + 0.25);
 
         // Layer 3: Noise burst with slow decay (concussive blast)
-        const blastDur = 0.2;
-        const blastLen = Math.floor(ctx.sampleRate * blastDur);
-        const blastBuf = ctx.createBuffer(1, blastLen, ctx.sampleRate);
-        const blastData = blastBuf.getChannelData(0);
-        for (let i = 0; i < blastLen; i++) {
-          const t = i / ctx.sampleRate;
-          const env = Math.exp(-t * 14) * 0.45;
-          blastData[i] = (Math.random() * 2 - 1) * env;
-        }
         const blastSrc = ctx.createBufferSource();
-        blastSrc.buffer = blastBuf;
+        blastSrc.buffer = pickBuffer(bufs.blast);
         const blastFilter = ctx.createBiquadFilter();
-        blastFilter.type = 'lowpass';
+        blastFilter.type = "lowpass";
         blastFilter.frequency.value = 1800;
         blastFilter.Q.value = 0.7;
         const blastGain = ctx.createGain();
@@ -381,19 +495,10 @@ export function createGameEngine(opts: EngineOptions) {
         blastSrc.start(now);
 
         // Layer 4: High-frequency crack (the snap of the large caliber)
-        const snapDur = 0.06;
-        const snapLen = Math.floor(ctx.sampleRate * snapDur);
-        const snapBuf = ctx.createBuffer(1, snapLen, ctx.sampleRate);
-        const snapData = snapBuf.getChannelData(0);
-        for (let i = 0; i < snapLen; i++) {
-          const t = i / ctx.sampleRate;
-          const env = Math.exp(-t * 80) * 0.35;
-          snapData[i] = (Math.random() * 2 - 1) * env;
-        }
         const snapSrc = ctx.createBufferSource();
-        snapSrc.buffer = snapBuf;
+        snapSrc.buffer = pickBuffer(bufs.snap);
         const snapFilter = ctx.createBiquadFilter();
-        snapFilter.type = 'highpass';
+        snapFilter.type = "highpass";
         snapFilter.frequency.value = 3000;
         const snapGain = ctx.createGain();
         snapGain.gain.value = 0.3;
@@ -418,7 +523,7 @@ export function createGameEngine(opts: EngineOptions) {
     ensureAudio();
     try {
       const ctx = audioListener.context;
-      if (ctx.state === 'suspended') return;
+      if (ctx.state === "suspended") return;
       const wdef = WEAPONS[currentWeapon];
       const now = ctx.currentTime;
       const reloadSec = wdef.reloadTime;
@@ -465,7 +570,7 @@ export function createGameEngine(opts: EngineOptions) {
       const insertSrc = ctx.createBufferSource();
       insertSrc.buffer = insertBuf;
       const insertFilter = ctx.createBiquadFilter();
-      insertFilter.type = 'lowpass';
+      insertFilter.type = "lowpass";
       insertFilter.frequency.value = 1200;
       insertSrc.connect(insertFilter);
       insertFilter.connect(masterGain);
@@ -488,7 +593,7 @@ export function createGameEngine(opts: EngineOptions) {
       const pullSrc = ctx.createBufferSource();
       pullSrc.buffer = pullBuf;
       const pullFilter = ctx.createBiquadFilter();
-      pullFilter.type = 'bandpass';
+      pullFilter.type = "bandpass";
       pullFilter.frequency.value = 3000;
       pullFilter.Q.value = 1.5;
       pullSrc.connect(pullFilter);
@@ -532,7 +637,13 @@ export function createGameEngine(opts: EngineOptions) {
   // State
   type TileClient = {
     id: string;
-    mesh: THREE.Mesh;
+    /** Position carrier only — never added to the scene. Intact tiles are
+     *  drawn by a shared InstancedMesh (one draw call for the whole island);
+     *  a standalone mesh is only created for the short break animation. */
+    mesh: THREE.Object3D;
+    isWall: boolean;
+    /** Slot in the owning batch's instance buffers; -1 once removed. */
+    instanceIndex: number;
     rigidBody?: RAPIER.RigidBody;
     collider?: RAPIER.Collider;
     health: number;
@@ -555,7 +666,6 @@ export function createGameEngine(opts: EngineOptions) {
     targetAzimuth: number;
     nameLabel?: CSS2DObject;
     weaponGroup?: THREE.Group;
-    muzzleFlash?: THREE.PointLight;
     health?: number;
     maxHealth?: number;
   };
@@ -573,12 +683,12 @@ export function createGameEngine(opts: EngineOptions) {
   type PowerupPickup = {
     id: string;
     type: string;
-    tileId: string;          // which tile this pickup currently sits above
+    tileId: string; // which tile this pickup currently sits above
     basePosition: THREE.Vector3; // current anchor position (used for hover offset)
     mesh: THREE.Mesh;
     haloMesh: THREE.Mesh;
     collected: boolean;
-    respawnAt: number;       // timestamp (ms) when the pickup reappears; 0 = available
+    respawnAt: number; // timestamp (ms) when the pickup reappears; 0 = available
     /** How many times this pickup has respawned. Used to seed the
      *  respawn-position PRNG so each respawn lands on a different tile. */
     respawnCount: number;
@@ -590,17 +700,55 @@ export function createGameEngine(opts: EngineOptions) {
   const powerupPickups: PowerupPickup[] = [];
   const powerupPickupsById = new Map<string, PowerupPickup>();
   let colliderHandleToPlayerId: Record<number, string> = {};
-  const particles: { mesh: THREE.Mesh; vel: THREE.Vector3; life: number; maxLife: number }[] = [];
+  type Particle = {
+    mesh: THREE.Mesh;
+    mat: THREE.MeshBasicMaterial;
+    vel: THREE.Vector3;
+    life: number;
+    maxLife: number;
+  };
+  /** Live particles. Meshes + materials are pooled (see createParticleEffect)
+   *  so bursts never allocate GPU resources mid-fight. */
+  const particles: Particle[] = [];
+  const particlePool: Particle[] = [];
   const tweenGroup = new Group();
+
+  // Shared muzzle-flash lights. A PointLight in the scene is evaluated for
+  // EVERY lit pixel and changing the light count recompiles all shaders, so
+  // instead of one light per player we keep a small constant set and move
+  // them to whoever is shooting. Slot 0 = local player, slot 1 = remote.
+  const flashLights: THREE.PointLight[] = [];
+  const flashUntil = [0, 0];
+  if (profile.flashLights) {
+    for (let i = 0; i < 2; i++) {
+      const l = new THREE.PointLight(0xffaa00, 0, 5);
+      scene.add(l);
+      flashLights.push(l);
+    }
+  }
+
+  // Scratch objects reused in hot paths to avoid per-frame garbage.
+  const _tmpVec = new THREE.Vector3();
+  const _tmpQuat = new THREE.Quaternion();
+  const _lookTarget = new THREE.Vector3();
+  const _shotDir = new THREE.Vector3();
+  const _shotEuler = new THREE.Euler();
+  const _instMatrix = new THREE.Matrix4();
+  const _instColor = new THREE.Color();
 
   let ballRigidBody: RAPIER.RigidBody | null = null;
   let ballCollider: RAPIER.Collider | null = null;
-  let localPlayerId: string = isHost ? 'local-host' : (netClient?.id ?? 'local');
-  if (mode === 'single') localPlayerId = 'local';
+  let localPlayerId: string = isHost
+    ? "local-host"
+    : (netClient?.id ?? "local");
+  if (mode === "single") localPlayerId = "local";
 
   let playerScore = 0;
   let playerHealth = 100;
-  const powerUps: Record<string, { type: string; duration: number; startTime: number; active: boolean }> = {};
+  const powerUps: Record<
+    string,
+    { type: string; duration: number; startTime: number; active: boolean }
+  > = {};
 
   let physicsEnabled = false;
   let isPaused = false;
@@ -636,14 +784,20 @@ export function createGameEngine(opts: EngineOptions) {
   let lookDeltaY = 0; // vertical look delta for FPS camera
 
   // Weapon state
-  let currentWeapon: WeaponType = 'ak47';
+  let currentWeapon: WeaponType = "ak47";
   let ammo: number = WEAPONS.ak47.maxAmmo;
   let reserveAmmo: number = WEAPONS.ak47.reserveAmmo;
   // Per-weapon ammo state — saved when switching away, restored when switching back.
   // Without this, switching weapons resets ammo to full every time.
-  const weaponAmmoState: Record<WeaponType, { ammo: number; reserveAmmo: number }> = {
+  const weaponAmmoState: Record<
+    WeaponType,
+    { ammo: number; reserveAmmo: number }
+  > = {
     ak47: { ammo: WEAPONS.ak47.maxAmmo, reserveAmmo: WEAPONS.ak47.reserveAmmo },
-    desert_eagle: { ammo: WEAPONS.desert_eagle.maxAmmo, reserveAmmo: WEAPONS.desert_eagle.reserveAmmo },
+    desert_eagle: {
+      ammo: WEAPONS.desert_eagle.maxAmmo,
+      reserveAmmo: WEAPONS.desert_eagle.reserveAmmo,
+    },
   };
   let isReloading = false;
   let reloadStartTime = 0;
@@ -666,7 +820,8 @@ export function createGameEngine(opts: EngineOptions) {
   // Island seed + size — the host generates these and sends them to guests
   // in the init message so everyone has the exact same island.
   let islandSeed: number = Math.floor(Math.random() * 1e9);
-  let islandSize: IslandSize = (opts.settings.islandSize as IslandSize) || 'medium';
+  let islandSize: IslandSize =
+    (opts.settings.islandSize as IslandSize) || "medium";
 
   // Fixed timestep accumulator
   let physicsAccumulator = 0;
@@ -680,14 +835,22 @@ export function createGameEngine(opts: EngineOptions) {
   let disconnected = false;
 
   // ---------- Helpers ----------
+  let lastHudHealth = 100;
   function pushHud() {
     const wdef = WEAPONS[currentWeapon];
+    lastHudHealth = Math.round(playerHealth);
     callbacks.onState({
       score: playerScore,
-      health: Math.round(playerHealth),
+      health: lastHudHealth,
       powerUps: Object.values(powerUps)
         .filter((p) => p.active)
-        .map((p) => ({ type: p.type, remaining: Math.max(0, p.duration - (performance.now() - p.startTime)) })),
+        .map((p) => ({
+          type: p.type,
+          remaining: Math.max(
+            0,
+            p.duration - (performance.now() - p.startTime),
+          ),
+        })),
       aliveCount: Object.values(players).filter((p) => !p.eliminated).length,
       totalPlayers: Object.keys(players).length,
       isHost,
@@ -696,7 +859,12 @@ export function createGameEngine(opts: EngineOptions) {
       maxAmmo: wdef.maxAmmo,
       reserveAmmo,
       isReloading,
-      reloadProgress: isReloading ? Math.min(1, (performance.now() - reloadStartTime) / (wdef.reloadTime * 1000)) : 0,
+      reloadProgress: isReloading
+        ? Math.min(
+            1,
+            (performance.now() - reloadStartTime) / (wdef.reloadTime * 1000),
+          )
+        : 0,
     });
   }
 
@@ -705,7 +873,10 @@ export function createGameEngine(opts: EngineOptions) {
       callbacks.onCountdown(null);
       return;
     }
-    const remaining = Math.max(0, Math.ceil((serverStartTime - Date.now()) / 1000));
+    const remaining = Math.max(
+      0,
+      Math.ceil((serverStartTime - Date.now()) / 1000),
+    );
     if (remaining <= 0) {
       // Timer has expired. BEHAVIOR DIFFERS BY ROLE:
       //
@@ -738,7 +909,7 @@ export function createGameEngine(opts: EngineOptions) {
       //   - The 3-second grace accounts for clock skew + the network round
       //     trip of the `game-started` message. If it still hasn't arrived
       //     after 3 seconds, it was almost certainly lost.
-      if (isHost || mode === 'single') {
+      if (isHost || mode === "single") {
         if (!physicsEnabled) {
           enablePhysics();
         }
@@ -750,7 +921,9 @@ export function createGameEngine(opts: EngineOptions) {
         if (!physicsEnabled && !gameStartedFallbackTimer) {
           gameStartedFallbackTimer = window.setTimeout(() => {
             if (!physicsEnabled && serverStartTime) {
-              console.warn('[ENGINE] game-started not received within 3s of countdown expiry — enabling physics as fallback (message may have been lost on the unreliable data channel).');
+              console.warn(
+                "[ENGINE] game-started not received within 3s of countdown expiry — enabling physics as fallback (message may have been lost on the unreliable data channel).",
+              );
               enablePhysics();
               serverStartTime = null;
               callbacks.onCountdown(null);
@@ -773,7 +946,9 @@ export function createGameEngine(opts: EngineOptions) {
         const mp = lp.mesh.position;
         try {
           ballRigidBody.setTranslation({ x: mp.x, y: mp.y, z: mp.z }, true);
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       }
       ballRigidBody.setEnabled(true);
       ballRigidBody.wakeUp();
@@ -781,7 +956,9 @@ export function createGameEngine(opts: EngineOptions) {
       try {
         ballRigidBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
         ballRigidBody.setAngvel({ x: 0, y: 0, z: 0 }, true);
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
     // Reset camera to follow the ball immediately (avoid smooth glide from old position)
     const lp2 = players[localPlayerId];
@@ -790,8 +967,8 @@ export function createGameEngine(opts: EngineOptions) {
       const eyeOffset = PLAYER_HEIGHT * 0.4;
       camera.position.set(pos.x, pos.y + eyeOffset, pos.z);
     }
-    if (netClient && mode !== 'single' && isHost) {
-      netClient.send({ kind: 'game-started' });
+    if (netClient && mode !== "single" && isHost) {
+      netClient.send({ kind: "game-started" });
     }
   }
 
@@ -823,10 +1000,16 @@ export function createGameEngine(opts: EngineOptions) {
     if (p.health === undefined) p.maxHealth = 100;
     p.health = Math.max(0, p.health - damage);
     // Show hit effect
-    createParticleEffect(p.mesh.position.clone().add(new THREE.Vector3(0, 0.5, 0)), 0xff4444, 4);
+    spawnParticles(
+      p.mesh.position.x,
+      p.mesh.position.y + 0.5,
+      p.mesh.position.z,
+      0xff4444,
+      4,
+    );
     // If health depleted, eliminate the player
     if (p.health <= 0 && !p.eliminated) {
-      if (isHost || mode === 'single') {
+      if (isHost || mode === "single") {
         eliminatePlayer(playerId);
       }
     }
@@ -844,7 +1027,12 @@ export function createGameEngine(opts: EngineOptions) {
         return;
       }
     }
-    powerUps[`${type}_${Date.now()}`] = { type, duration, startTime: performance.now(), active: true };
+    powerUps[`${type}_${Date.now()}`] = {
+      type,
+      duration,
+      startTime: performance.now(),
+      active: true,
+    };
     pushHud();
   }
 
@@ -869,7 +1057,7 @@ export function createGameEngine(opts: EngineOptions) {
   function mulberry32(seed: number) {
     let a = seed >>> 0;
     return function () {
-      a = (a + 0x6D2B79F5) >>> 0;
+      a = (a + 0x6d2b79f5) >>> 0;
       let t = a;
       t = Math.imul(t ^ (t >>> 15), t | 1);
       t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
@@ -922,7 +1110,7 @@ export function createGameEngine(opts: EngineOptions) {
       const id = `pu-${i}-${tile.id}`;
       createPowerupPickup(id, type, tile);
     });
-    console.log('[ENGINE] Spawned', powerupPickups.length, 'powerup pickups');
+    console.log("[ENGINE] Spawned", powerupPickups.length, "powerup pickups");
   }
 
   function createPowerupPickup(id: string, type: string, tile: TileClient) {
@@ -944,12 +1132,16 @@ export function createGameEngine(opts: EngineOptions) {
     });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.position.set(pos.x, hover, pos.z);
-    mesh.castShadow = settings.graphicsQuality === 'high';
+    mesh.castShadow = settings.graphicsQuality === "high";
     scene.add(mesh);
 
     // Halo — a flat translucent ring on the tile surface so the pickup is
     // visible from above even when the player is right on top of it.
-    const haloGeo = new THREE.RingGeometry(POWERUP_PICKUP_RADIUS * 0.9, POWERUP_PICKUP_RADIUS * 1.6, 24);
+    const haloGeo = new THREE.RingGeometry(
+      POWERUP_PICKUP_RADIUS * 0.9,
+      POWERUP_PICKUP_RADIUS * 1.6,
+      24,
+    );
     const haloMat = new THREE.MeshBasicMaterial({
       color,
       transparent: true,
@@ -990,7 +1182,7 @@ export function createGameEngine(opts: EngineOptions) {
    */
   function updatePowerupPickups(dt: number, now: number) {
     // First: handle respawns (host drives the timer + new-tile selection for everyone).
-    if (isHost || mode === 'single') {
+    if (isHost || mode === "single") {
       for (const p of powerupPickups) {
         if (p.collected && p.respawnAt > 0 && now >= p.respawnAt) {
           // Pick a NEW random available tile. We exclude the pickup's
@@ -998,7 +1190,11 @@ export function createGameEngine(opts: EngineOptions) {
           // players have to keep moving to collect, which keeps the game
           // dynamic. We also exclude tiles that are currently breaking or
           // already occupied by another visible pickup.
-          const newTile = pickRandomAvailableTile(p.tileId, p.id, p.respawnCount + 1);
+          const newTile = pickRandomAvailableTile(
+            p.tileId,
+            p.id,
+            p.respawnCount + 1,
+          );
           if (!newTile) {
             // No available tile (island mostly destroyed) — try again later.
             p.respawnAt = now + 2000;
@@ -1011,12 +1207,16 @@ export function createGameEngine(opts: EngineOptions) {
           p.mesh.visible = true;
           p.haloMesh.visible = true;
           // Broadcast respawn (with the new tileId + position) to peers.
-          if (netClient && mode !== 'single') {
+          if (netClient && mode !== "single") {
             netClient.send({
-              kind: 'powerup-respawned',
+              kind: "powerup-respawned",
               powerupId: p.id,
               newTileId: newTile.id,
-              position: { x: newTile.mesh.position.x, y: newTile.mesh.position.y + 1.2, z: newTile.mesh.position.z },
+              position: {
+                x: newTile.mesh.position.x,
+                y: newTile.mesh.position.y + 1.2,
+                z: newTile.mesh.position.z,
+              },
             });
           }
         }
@@ -1025,9 +1225,8 @@ export function createGameEngine(opts: EngineOptions) {
 
     // Spin + hover all visible pickups, and check local-player collection.
     const localPlayer = players[localPlayerId];
-    const localPos = ballRigidBody && !isSpectating
-      ? ballRigidBody.translation()
-      : null;
+    const localPos =
+      ballRigidBody && !isSpectating ? ballRigidBody.translation() : null;
     for (const p of powerupPickups) {
       if (p.collected) continue;
       // Spin
@@ -1041,7 +1240,12 @@ export function createGameEngine(opts: EngineOptions) {
       (p.haloMesh.material as THREE.MeshBasicMaterial).opacity = pulse;
 
       // Collision check with local player
-      if (localPos && localPlayer && !localPlayer.eliminated && physicsEnabled) {
+      if (
+        localPos &&
+        localPlayer &&
+        !localPlayer.eliminated &&
+        physicsEnabled
+      ) {
         const dx = localPos.x - p.basePosition.x;
         const dy = localPos.y - p.mesh.position.y;
         const dz = localPos.z - p.basePosition.z;
@@ -1062,7 +1266,11 @@ export function createGameEngine(opts: EngineOptions) {
    * count, so each respawn lands on a different tile (different seed each
    * time) and different pickups land on different tiles (different id hash).
    */
-  function pickRandomAvailableTile(excludeTileId: string, pickupId: string, respawnCount: number): TileClient | null {
+  function pickRandomAvailableTile(
+    excludeTileId: string,
+    pickupId: string,
+    respawnCount: number,
+  ): TileClient | null {
     const available = tiles.filter((t) => {
       if (t.isBreaking) return false;
       if (t.id === excludeTileId) return false;
@@ -1079,7 +1287,12 @@ export function createGameEngine(opts: EngineOptions) {
     for (let i = 0; i < pickupId.length; i++) {
       idHash = ((idHash << 5) - idHash + pickupId.charCodeAt(i)) | 0;
     }
-    const seed = ((islandSeed ^ 0xfeedface) ^ (idHash >>> 0) ^ (respawnCount * 2654435761)) >>> 0;
+    const seed =
+      (islandSeed ^
+        0xfeedface ^
+        (idHash >>> 0) ^
+        (respawnCount * 2654435761)) >>>
+      0;
     const rand = mulberry32(seed);
     // Try a few times to find a tile that's at least minDist away from other
     // visible pickups (so respawns spread out instead of clustering).
@@ -1126,12 +1339,16 @@ export function createGameEngine(opts: EngineOptions) {
     p.haloMesh.visible = false;
     // Apply the effect to the local collector.
     addPowerUp(p.type, POWERUP_DURATION_MS);
-    createParticleEffect(p.basePosition, POWERUP_COLORS[p.type] ?? 0xffffff, 14);
+    createParticleEffect(
+      p.basePosition,
+      POWERUP_COLORS[p.type] ?? 0xffffff,
+      14,
+    );
     addScore(10);
     // Broadcast collection.
-    if (netClient && mode !== 'single') {
+    if (netClient && mode !== "single") {
       netClient.send({
-        kind: 'powerup-collected',
+        kind: "powerup-collected",
         powerupId: p.id,
         playerId: localPlayerId,
         powerupType: p.type,
@@ -1140,7 +1357,11 @@ export function createGameEngine(opts: EngineOptions) {
   }
 
   /** Remote peer collected a pickup — hide it on our side. */
-  function handleRemotePowerupCollected(powerupId: string, playerId: string, powerupType: string) {
+  function handleRemotePowerupCollected(
+    powerupId: string,
+    playerId: string,
+    powerupType: string,
+  ) {
     const p = powerupPickupsById.get(powerupId);
     if (!p) return;
     // Only apply the effect locally if WE are the collector — otherwise just
@@ -1164,7 +1385,11 @@ export function createGameEngine(opts: EngineOptions) {
    * just apply the move. (We don't re-pick — that would desync from the
    * host.)
    */
-  function handleRemotePowerupRespawned(powerupId: string, newTileId: string, position: { x: number; y: number; z: number }) {
+  function handleRemotePowerupRespawned(
+    powerupId: string,
+    newTileId: string,
+    position: { x: number; y: number; z: number },
+  ) {
     const p = powerupPickupsById.get(powerupId);
     if (!p) return;
     // Look up the tile locally — if it's missing (guest hasn't generated it
@@ -1182,7 +1407,11 @@ export function createGameEngine(opts: EngineOptions) {
       p.mesh.position.set(position.x, position.y, position.z);
       // Best-effort halo position (we don't know the tile's surface Y, so
       // estimate from the pickup's hover offset).
-      p.haloMesh.position.set(position.x, position.y - 1.2 + TILE_HEIGHT / 2 + 0.05, position.z);
+      p.haloMesh.position.set(
+        position.x,
+        position.y - 1.2 + TILE_HEIGHT / 2 + 0.05,
+        position.z,
+      );
     }
     p.collected = false;
     p.respawnAt = 0;
@@ -1207,9 +1436,11 @@ export function createGameEngine(opts: EngineOptions) {
         changed = true;
       }
     }
-    if (hasPowerUp('health_regen')) {
+    if (hasPowerUp("health_regen")) {
       playerHealth = Math.min(100, playerHealth + 4 * dt); // 4 hp/s
-      changed = true;
+      // Only wake React when the DISPLAYED value changes (~4x/s), not on
+      // every frame the regen ticks.
+      if (Math.round(playerHealth) !== lastHudHealth) changed = true;
     }
     if (changed) pushHud();
   }
@@ -1217,29 +1448,64 @@ export function createGameEngine(opts: EngineOptions) {
   // Shared geometry for particles — one SphereGeometry reused by all particles
   // instead of creating a new one per particle (saves GPU memory and draw calls).
   const particleGeo = new THREE.SphereGeometry(0.1, 4, 4);
-  const MAX_PARTICLES = 60;
 
-  function createParticleEffect(pos: THREE.Vector3, color: number, count: number) {
+  /** Return a particle to the pool (hidden, stays in the scene graph). */
+  function releaseParticle(p: Particle) {
+    p.mesh.visible = false;
+    particlePool.push(p);
+  }
+
+  function spawnParticles(
+    x: number,
+    y: number,
+    z: number,
+    color: number,
+    count: number,
+  ) {
     // Cap count to avoid particle explosion lag
     const clampedCount = Math.min(count, 8);
     for (let i = 0; i < clampedCount; i++) {
-      // If we're at the particle limit, remove the oldest one
-      if (particles.length >= MAX_PARTICLES) {
+      // If we're at the particle limit, recycle the oldest one
+      if (particles.length >= profile.maxParticles) {
         const oldest = particles.shift();
-        if (oldest) {
-          scene.remove(oldest.mesh);
-          (oldest.mesh.material as THREE.Material).dispose();
-        }
+        if (oldest) releaseParticle(oldest);
       }
-      const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 });
-      const m = new THREE.Mesh(particleGeo, mat);
-      m.position.copy(pos);
-      m.position.add(new THREE.Vector3((Math.random() - 0.5) * 1.5, Math.random() * 1.5, (Math.random() - 0.5) * 1.5));
-      const vel = new THREE.Vector3((Math.random() - 0.5) * 8, Math.random() * 8 + 4, (Math.random() - 0.5) * 8);
-      const life = 0.6 + Math.random() * 0.3;
-      particles.push({ mesh: m, vel, life, maxLife: life });
-      scene.add(m);
+      let p = particlePool.pop();
+      if (!p) {
+        const mat = new THREE.MeshBasicMaterial({
+          color,
+          transparent: true,
+          opacity: 0.9,
+        });
+        const mesh = new THREE.Mesh(particleGeo, mat);
+        scene.add(mesh);
+        p = { mesh, mat, vel: new THREE.Vector3(), life: 0, maxLife: 0 };
+      }
+      p.mat.color.setHex(color);
+      p.mat.opacity = 0.9;
+      p.mesh.visible = true;
+      p.mesh.position.set(
+        x + (Math.random() - 0.5) * 1.5,
+        y + Math.random() * 1.5,
+        z + (Math.random() - 0.5) * 1.5,
+      );
+      p.vel.set(
+        (Math.random() - 0.5) * 8,
+        Math.random() * 8 + 4,
+        (Math.random() - 0.5) * 8,
+      );
+      p.life = 0.6 + Math.random() * 0.3;
+      p.maxLife = p.life;
+      particles.push(p);
     }
+  }
+
+  function createParticleEffect(
+    pos: THREE.Vector3,
+    color: number,
+    count: number,
+  ) {
+    spawnParticles(pos.x, pos.y, pos.z, color, count);
   }
 
   function updateParticles(dt: number) {
@@ -1247,20 +1513,21 @@ export function createGameEngine(opts: EngineOptions) {
       const p = particles[i];
       p.life -= dt;
       if (p.life <= 0) {
-        scene.remove(p.mesh);
-        (p.mesh.material as THREE.Material).dispose();
-        // Don't dispose geometry — it's shared (particleGeo)
+        releaseParticle(p);
         particles.splice(i, 1);
         continue;
       }
       p.mesh.position.addScaledVector(p.vel, dt);
       p.vel.y -= 9.81 * dt;
-      (p.mesh.material as THREE.MeshBasicMaterial).opacity = p.life / p.maxLife;
+      p.mat.opacity = p.life / p.maxLife;
     }
   }
 
   // ---------- Geometry creation ----------
-  function createHexagonGeometry(radius = TILE_RADIUS, height = TILE_HEIGHT): THREE.BufferGeometry {
+  function createHexagonGeometry(
+    radius = TILE_RADIUS,
+    height = TILE_HEIGHT,
+  ): THREE.BufferGeometry {
     const geometry = new THREE.BufferGeometry();
     const vertices: number[] = [];
     const indices: number[] = [];
@@ -1284,7 +1551,10 @@ export function createGameEngine(opts: EngineOptions) {
       indices.push(i, next, 6 + i);
       indices.push(next, 6 + next, 6 + i);
     }
-    geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+    geometry.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(vertices, 3),
+    );
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
     return geometry;
@@ -1296,17 +1566,125 @@ export function createGameEngine(opts: EngineOptions) {
   const groundTileGeo = createHexagonGeometry(TILE_RADIUS, TILE_HEIGHT);
   const wallTileGeo = createHexagonGeometry(TILE_RADIUS, 3.0);
 
+  // ---- Instanced tile rendering ----
+  // The island is ~500 (medium) to ~1000 (large) hex tiles. Drawing each as
+  // its own transparent mesh meant hundreds of draw calls + per-object
+  // sorting every frame, which is the main reason low-end phones crawled.
+  // Intact tiles now live in two InstancedMeshes (ground / wall) = 2 draw
+  // calls total. Per-instance diffuse comes from instanceColor; the emissive
+  // term (which the old per-tile materials animated with tile health) is fed
+  // through an extra instanced attribute patched into the Lambert shader.
+  const tileMaterial = new THREE.MeshLambertMaterial({
+    color: 0xffffff,
+    side: THREE.DoubleSide,
+  });
+  tileMaterial.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        "#include <common>",
+        "#include <common>\nattribute vec3 instanceEmissive;\nvarying vec3 vInstanceEmissive;",
+      )
+      .replace(
+        "#include <begin_vertex>",
+        "#include <begin_vertex>\n\tvInstanceEmissive = instanceEmissive;",
+      );
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        "#include <common>",
+        "#include <common>\nvarying vec3 vInstanceEmissive;",
+      )
+      .replace(
+        "vec3 totalEmissiveRadiance = emissive;",
+        "vec3 totalEmissiveRadiance = vInstanceEmissive;",
+      );
+  };
+
+  interface TileBatch {
+    mesh: THREE.InstancedMesh;
+    emissive: THREE.InstancedBufferAttribute;
+    /** instance index -> tile (kept dense; removal swaps with the last). */
+    tiles: TileClient[];
+  }
+
+  function createTileBatch(
+    geo: THREE.BufferGeometry,
+    capacity: number,
+  ): TileBatch {
+    const mesh = new THREE.InstancedMesh(geo, tileMaterial, capacity);
+    mesh.count = 0;
+    // The island surrounds the camera; per-instance bounds aren't tracked, and
+    // it's a single draw call anyway.
+    mesh.frustumCulled = false;
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    const color = new THREE.InstancedBufferAttribute(
+      new Float32Array(capacity * 3),
+      3,
+    );
+    color.setUsage(THREE.DynamicDrawUsage);
+    mesh.instanceColor = color;
+    const emissive = new THREE.InstancedBufferAttribute(
+      new Float32Array(capacity * 3),
+      3,
+    );
+    emissive.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute("instanceEmissive", emissive);
+    scene.add(mesh);
+    return { mesh, emissive, tiles: [] };
+  }
+
+  const groundBatch = createTileBatch(groundTileGeo, MAX_GROUND_TILES);
+  const wallBatch = createTileBatch(wallTileGeo, MAX_WALL_TILES);
+
+  function setTileInstanceColors(
+    tile: TileClient,
+    color: THREE.Color,
+    emissive: THREE.Color,
+  ) {
+    const batch = tile.isWall ? wallBatch : groundBatch;
+    const i = tile.instanceIndex;
+    if (i < 0) return;
+    color.toArray(batch.mesh.instanceColor!.array, i * 3);
+    emissive.toArray(batch.emissive.array, i * 3);
+    batch.mesh.instanceColor!.needsUpdate = true;
+    batch.emissive.needsUpdate = true;
+  }
+
+  /** Detach a tile from its batch (swap-remove keeps instances contiguous). */
+  function removeTileInstance(tile: TileClient) {
+    const batch = tile.isWall ? wallBatch : groundBatch;
+    const idx = tile.instanceIndex;
+    if (idx < 0) return;
+    const last = batch.tiles.length - 1;
+    if (idx !== last) {
+      const moved = batch.tiles[last];
+      batch.mesh.getMatrixAt(last, _instMatrix);
+      batch.mesh.setMatrixAt(idx, _instMatrix);
+      const colorArr = batch.mesh.instanceColor!.array as Float32Array;
+      const emissiveArr = batch.emissive.array as Float32Array;
+      for (let k = 0; k < 3; k++) {
+        colorArr[idx * 3 + k] = colorArr[last * 3 + k];
+        emissiveArr[idx * 3 + k] = emissiveArr[last * 3 + k];
+      }
+      batch.tiles[idx] = moved;
+      moved.instanceIndex = idx;
+    }
+    batch.tiles.pop();
+    batch.mesh.count = batch.tiles.length;
+    tile.instanceIndex = -1;
+    batch.mesh.instanceMatrix.needsUpdate = true;
+    batch.mesh.instanceColor!.needsUpdate = true;
+    batch.emissive.needsUpdate = true;
+  }
+
   function createTile(pos: { x: number; y: number; z: number }, id: string) {
     if (tilesById.has(id)) return; // dedupe — stable IDs mean this can be called twice in multiplayer
 
     // Wall tiles (IDs start with "w-") are taller, have a stone color,
     // and are much harder to break than regular ground tiles.
-    const isWall = id.startsWith('w-');
+    const isWall = id.startsWith("w-");
     const tileHeight = isWall ? 3.0 : TILE_HEIGHT;
     const tileHealth = isWall ? 500 : TILE_MAX_HEALTH;
 
-    // Reuse shared geometry for all tiles of the same type
-    const geo = isWall ? wallTileGeo : groundTileGeo;
     // Colour by type and height.
     const baseColor = new THREE.Color();
     if (isWall) {
@@ -1321,37 +1699,45 @@ export function createGameEngine(opts: EngineOptions) {
         baseColor.setHSL(0.08, 0.15, 0.45); // rock grey-brown
       }
     }
-    // Use MeshLambertMaterial instead of MeshStandardMaterial for tiles —
-    // much cheaper per-pixel shading, big FPS win with hundreds of tiles.
-    const mat = new THREE.MeshLambertMaterial({
-      color: baseColor.clone(),
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: 1,
-      emissive: baseColor.clone(),
-    });
-    const mesh = new THREE.Mesh(geo, mat);
+    // Position carrier — the actual drawing happens in the instanced batch.
+    const mesh = new THREE.Object3D();
     mesh.position.set(pos.x, pos.y, pos.z);
-    scene.add(mesh);
+
+    const batch = isWall ? wallBatch : groundBatch;
+    const instanceIndex = batch.tiles.length;
+    if (instanceIndex >= batch.mesh.instanceMatrix.count) {
+      console.error("Tile batch capacity exceeded — skipping tile", id);
+      return;
+    }
 
     let rigidBody: RAPIER.RigidBody | undefined;
     let collider: RAPIER.Collider | undefined;
     try {
       // Use a cuboid collider for the tile — much faster than a convex hull
       // and close enough for a small hex. Wall tiles use a taller collider.
-      const desc = RAPIER.ColliderDesc.cuboid(TILE_RADIUS * 0.9, tileHeight / 2, TILE_RADIUS * 0.866)
+      const desc = RAPIER.ColliderDesc.cuboid(
+        TILE_RADIUS * 0.9,
+        tileHeight / 2,
+        TILE_RADIUS * 0.866,
+      )
         .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
         .setCollisionGroups(ALL_INTERACTION | PLAYER_COLLISION_GROUP)
         .setSolverGroups(ALL_INTERACTION | PLAYER_COLLISION_GROUP);
-      const bodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(pos.x, pos.y, pos.z);
+      const bodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(
+        pos.x,
+        pos.y,
+        pos.z,
+      );
       rigidBody = world.createRigidBody(bodyDesc);
       collider = world.createCollider(desc, rigidBody);
     } catch (e) {
-      console.error('Failed to create tile physics', e);
+      console.error("Failed to create tile physics", e);
     }
     const tile: TileClient = {
       id,
       mesh,
+      isWall,
+      instanceIndex,
       rigidBody,
       collider,
       health: tileHealth,
@@ -1359,20 +1745,33 @@ export function createGameEngine(opts: EngineOptions) {
       isBreaking: false,
       baseColor,
     };
+    // Register in the instanced batch (matrix + diffuse + emissive).
+    batch.tiles.push(tile);
+    batch.mesh.count = batch.tiles.length;
+    _instMatrix.makeTranslation(pos.x, pos.y, pos.z);
+    batch.mesh.setMatrixAt(instanceIndex, _instMatrix);
+    batch.mesh.instanceMatrix.needsUpdate = true;
+    // Original look: diffuse and emissive both started at the tile's base colour.
+    setTileInstanceColors(tile, baseColor, baseColor);
     tiles.push(tile);
     tilesById.set(id, tile);
   }
 
+  const _tileEmissive = new THREE.Color();
+
+  /** Tiles currently playing their fade-out (standalone transparent meshes). */
+  const fadingTiles = new Set<{ mesh: THREE.Mesh; mat: THREE.Material }>();
+
   /** Update a tile's colour to reflect its current health (green → yellow → red). */
   function updateTileColor(tile: TileClient) {
     const pct = Math.max(0, tile.health / tile.maxHealth);
-    const mat = tile.mesh.material as THREE.MeshLambertMaterial;
     // Hue from 0.33 (green) at full health → 0.0 (red) at zero.
     const hue = pct * 0.33;
     // Darken slightly as the tile gets damaged.
     const lightness = 0.42 + pct * 0.12;
-    mat.color.setHSL(hue, 0.7, lightness);
-    mat.emissive.setHSL(hue, 0.7, 0.08 + (1 - pct) * 0.15);
+    _instColor.setHSL(hue, 0.7, lightness);
+    _tileEmissive.setHSL(hue, 0.7, 0.08 + (1 - pct) * 0.15);
+    setTileInstanceColors(tile, _instColor, _tileEmissive);
   }
 
   function applyTileDamage(tile: TileClient, damage: number) {
@@ -1388,7 +1787,12 @@ export function createGameEngine(opts: EngineOptions) {
    * Damage all tiles within `radius` of `point`. Damage falls off linearly
    * from the centre to the edge of the blast radius.
    */
-  function damageTilesAt(point: THREE.Vector3, radius: number, damage: number, sourcePeer: string | null) {
+  function damageTilesAt(
+    point: THREE.Vector3,
+    radius: number,
+    damage: number,
+    sourcePeer: string | null,
+  ) {
     const damaged: { tile: TileClient; amount: number }[] = [];
     for (const tile of tiles) {
       if (tile.isBreaking) continue;
@@ -1396,7 +1800,7 @@ export function createGameEngine(opts: EngineOptions) {
       const dz = tile.mesh.position.z - point.z;
       const dist = Math.sqrt(dx * dx + dz * dz);
       if (dist > radius) continue;
-      const falloff = 1 - (dist / radius);
+      const falloff = 1 - dist / radius;
       const amount = damage * falloff;
       if (amount > 0.5) {
         applyTileDamage(tile, amount);
@@ -1405,9 +1809,18 @@ export function createGameEngine(opts: EngineOptions) {
     }
     // If this impact came from the local player, broadcast damage to peers
     // so they apply the same damage to their copy of the island.
-    if (sourcePeer === null && netClient && mode !== 'single' && damaged.length > 0) {
+    if (
+      sourcePeer === null &&
+      netClient &&
+      mode !== "single" &&
+      damaged.length > 0
+    ) {
       for (const { tile, amount } of damaged) {
-        netClient.send({ kind: 'damage-tile', tileId: tile.id, damage: amount });
+        netClient.send({
+          kind: "damage-tile",
+          tileId: tile.id,
+          damage: amount,
+        });
       }
     }
     if (damaged.length > 0) {
@@ -1433,19 +1846,45 @@ export function createGameEngine(opts: EngineOptions) {
     playSound(breakSound, 0.6);
     createParticleEffect(tile.mesh.position, tile.baseColor.getHex(), 14);
     addScore(5);
-    const mat = tile.mesh.material as THREE.MeshStandardMaterial;
+
+    // Hand the tile over from the opaque instanced batch to a short-lived
+    // standalone transparent mesh so the original fade + drop still plays.
+    const batch = tile.isWall ? wallBatch : groundBatch;
+    const fadeMat = new THREE.MeshLambertMaterial({
+      color: _instColor
+        .fromArray(batch.mesh.instanceColor!.array, tile.instanceIndex * 3)
+        .clone(),
+      emissive: new THREE.Color().fromArray(
+        batch.emissive.array,
+        tile.instanceIndex * 3,
+      ),
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 1,
+    });
+    const fadeMesh = new THREE.Mesh(
+      tile.isWall ? wallTileGeo : groundTileGeo,
+      fadeMat,
+    );
+    fadeMesh.position.copy(tile.mesh.position);
+    scene.add(fadeMesh);
+    const fade = { mesh: fadeMesh, mat: fadeMat };
+    fadingTiles.add(fade);
+    removeTileInstance(tile);
+
     const startY = tile.mesh.position.y;
     const tw = new Tween({ opacity: 1, y: startY })
       .to({ opacity: 0, y: startY - 1.5 }, 600)
       .easing(Easing.Quadratic.InOut)
       .onUpdate(({ opacity, y }) => {
-        mat.opacity = opacity;
-        tile.mesh.position.y = y;
+        fadeMat.opacity = opacity;
+        fadeMesh.position.y = y;
       })
       .onComplete(() => {
-        scene.remove(tile.mesh);
-        mat.dispose();
-        tile.mesh.geometry.dispose();
+        fadingTiles.delete(fade);
+        scene.remove(fadeMesh);
+        fadeMat.dispose();
+        // Geometry is shared by every tile — never dispose it here.
         try {
           if (tile.rigidBody) world.removeRigidBody(tile.rigidBody);
         } catch {
@@ -1486,13 +1925,25 @@ export function createGameEngine(opts: EngineOptions) {
     return positions;
   }
 
-  function createSphere(id: string, pos: { x: number; y: number; z: number }, isLocal: boolean) {
+  function createSphere(
+    id: string,
+    pos: { x: number; y: number; z: number },
+    isLocal: boolean,
+  ) {
     if (players[id]) return;
-    const color = id === localPlayerId ? 0xff5252 : PLAYER_COLORS[Object.keys(players).length % PLAYER_COLORS.length];
-    const geo = new THREE.SphereGeometry(PLAYER_RADIUS, 12, 12);
-    const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.4, metalness: 0.3, emissive: new THREE.Color(color), emissiveIntensity: 0.2 });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.castShadow = settings.graphicsQuality === 'high';
+    const color =
+      id === localPlayerId
+        ? 0xff5252
+        : PLAYER_COLORS[Object.keys(players).length % PLAYER_COLORS.length];
+    const mat = new THREE.MeshStandardMaterial({
+      color,
+      roughness: 0.4,
+      metalness: 0.3,
+      emissive: new THREE.Color(color),
+      emissiveIntensity: 0.2,
+    });
+    const mesh = new THREE.Mesh(playerSphereGeo, mat);
+    mesh.castShadow = settings.graphicsQuality === "high";
     mesh.position.set(pos.x, pos.y, pos.z);
     scene.add(mesh);
 
@@ -1500,10 +1951,11 @@ export function createGameEngine(opts: EngineOptions) {
     // Added directly to the scene (NOT as a child of the mesh) so it stays
     // upright and doesn't orbit with the ball's rotation. Position is updated
     // in interpolateRemotePlayers().
-    const nameDiv = document.createElement('div');
-    nameDiv.className = 'player-name-label';
-    nameDiv.textContent = id.length > 10 ? id.slice(0, 10) + '...' : id;
-    nameDiv.style.cssText = 'background: rgba(0,0,0,0.6); color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-family: monospace; white-space: nowrap; text-align: center; pointer-events: none; user-select: none;';
+    const nameDiv = document.createElement("div");
+    nameDiv.className = "player-name-label";
+    nameDiv.textContent = id.length > 10 ? id.slice(0, 10) + "..." : id;
+    nameDiv.style.cssText =
+      "background: rgba(0,0,0,0.6); color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-family: monospace; white-space: nowrap; text-align: center; pointer-events: none; user-select: none;";
     const nameLabel = new CSS2DObject(nameDiv);
     nameLabel.position.set(pos.x, pos.y + PLAYER_RADIUS + 0.6, pos.z);
     scene.add(nameLabel);
@@ -1516,8 +1968,8 @@ export function createGameEngine(opts: EngineOptions) {
     const weaponGroup = new THREE.Group();
     // Initial position: above the ball center, offset forward (negative Z)
     const weaponHeight = PLAYER_RADIUS + 0.35; // well above the ball surface
-    const weaponForward = 0.4;  // how far in front of the ball center
-    const weaponSide = 0.25;    // slight offset to the right
+    const weaponForward = 0.4; // how far in front of the ball center
+    const weaponSide = 0.25; // slight offset to the right
     weaponGroup.position.set(
       pos.x + weaponSide,
       pos.y + weaponHeight,
@@ -1525,14 +1977,8 @@ export function createGameEngine(opts: EngineOptions) {
     );
     scene.add(weaponGroup);
 
-    // Muzzle flash light — also scene-level, positioned relative to the weapon
-    const muzzleFlash = new THREE.PointLight(0xffaa00, 0, 5);
-    muzzleFlash.position.set(pos.x + weaponSide, pos.y + weaponHeight, pos.z - weaponForward - 0.5);
-    scene.add(muzzleFlash);
-
-    // Build a simple weapon mesh for remote players
-    const remoteWeaponMesh = buildWeaponMesh('ak47');
-    weaponGroup.add(remoteWeaponMesh);
+    // Static (merged, shared-geometry) weapon mesh for remote players
+    weaponGroup.add(getRemoteWeaponMesh("ak47"));
 
     let rigidBody: RAPIER.RigidBody | undefined;
     let collider: RAPIER.Collider | undefined;
@@ -1552,7 +1998,12 @@ export function createGameEngine(opts: EngineOptions) {
         ballCollider = collider;
         ballRigidBody.setEnabled(false);
       } else {
-        const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(pos.x, pos.y, pos.z);
+        const bodyDesc =
+          RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(
+            pos.x,
+            pos.y,
+            pos.z,
+          );
         rigidBody = world.createRigidBody(bodyDesc);
         const cd = RAPIER.ColliderDesc.ball(PLAYER_RADIUS)
           .setRestitution(0.6)
@@ -1563,10 +2014,61 @@ export function createGameEngine(opts: EngineOptions) {
       }
       if (collider) colliderHandleToPlayerId[collider.handle] = id;
     } catch (e) {
-      console.error('Failed to create sphere physics', e);
+      console.error("Failed to create sphere physics", e);
     }
-    players[id] = { id, mesh, rigidBody, collider, eliminated: false, color, targetPosition: pos, targetRotation: { x: 0, y: 0, z: 0, w: 1 }, targetAzimuth: 0, nameLabel, weaponGroup, muzzleFlash };
+    players[id] = {
+      id,
+      mesh,
+      rigidBody,
+      collider,
+      eliminated: false,
+      color,
+      targetPosition: pos,
+      targetRotation: { x: 0, y: 0, z: 0, w: 1 },
+      targetAzimuth: 0,
+      nameLabel,
+      weaponGroup,
+    };
     pushHud();
+  }
+
+  // One sphere geometry shared by every player ball.
+  const playerSphereGeo = new THREE.SphereGeometry(PLAYER_RADIUS, 12, 12);
+
+  /** Remote players only ever need a static gun, so the ~18 primitive meshes
+   *  of the animated first-person model are baked into one mesh per material
+   *  (4-5 draw calls instead of 18) once per weapon type, then cloned —
+   *  clones share the merged geometry and materials. */
+  const remoteWeaponTemplates: Partial<Record<WeaponType, THREE.Group>> = {};
+  function getRemoteWeaponMesh(type: WeaponType): THREE.Group {
+    let template = remoteWeaponTemplates[type];
+    if (!template) {
+      const source = buildWeaponMesh(type);
+      source.updateMatrixWorld(true);
+      const byMaterial = new Map<THREE.Material, THREE.BufferGeometry[]>();
+      source.traverse((obj) => {
+        const m = obj as THREE.Mesh;
+        if (!m.isMesh) return;
+        const g = m.geometry.clone();
+        g.applyMatrix4(m.matrixWorld);
+        const mat = m.material as THREE.Material;
+        const list = byMaterial.get(mat);
+        if (list) list.push(g);
+        else byMaterial.set(mat, [g]);
+      });
+      template = new THREE.Group();
+      byMaterial.forEach((geos, mat) => {
+        const merged = mergeGeometries(geos, false);
+        geos.forEach((g) => g.dispose());
+        if (merged) template!.add(new THREE.Mesh(merged, mat));
+      });
+      source.traverse((obj) => {
+        const m = obj as THREE.Mesh;
+        if (m.isMesh) m.geometry.dispose();
+      });
+      remoteWeaponTemplates[type] = template;
+    }
+    return template.clone();
   }
 
   /** Build a detailed geometric weapon mesh with animation groups.
@@ -1574,148 +2076,275 @@ export function createGameEngine(opts: EngineOptions) {
    *  named children so updateFpsWeapon can find and animate them. */
   function buildWeaponMesh(type: WeaponType): THREE.Group {
     const group = new THREE.Group();
-    if (type === 'ak47') {
-      const gunMetal = new THREE.MeshStandardMaterial({ color: 0x4a4a4a, roughness: 0.4, metalness: 0.5 });
-      const darkMetal = new THREE.MeshStandardMaterial({ color: 0x3a3a3a, roughness: 0.45, metalness: 0.45 });
-      const wood = new THREE.MeshStandardMaterial({ color: 0x8B5A2B, roughness: 0.65, metalness: 0.0 });
-      const brass = new THREE.MeshStandardMaterial({ color: 0xb8860b, roughness: 0.35, metalness: 0.5 });
-      const orangeTip = new THREE.MeshStandardMaterial({ color: 0xff6600, roughness: 0.5, metalness: 0.1, emissive: new THREE.Color(0xff6600), emissiveIntensity: 0.5 });
+    if (type === "ak47") {
+      const gunMetal = new THREE.MeshStandardMaterial({
+        color: 0x4a4a4a,
+        roughness: 0.4,
+        metalness: 0.5,
+      });
+      const darkMetal = new THREE.MeshStandardMaterial({
+        color: 0x3a3a3a,
+        roughness: 0.45,
+        metalness: 0.45,
+      });
+      const wood = new THREE.MeshStandardMaterial({
+        color: 0x8b5a2b,
+        roughness: 0.65,
+        metalness: 0.0,
+      });
+      const brass = new THREE.MeshStandardMaterial({
+        color: 0xb8860b,
+        roughness: 0.35,
+        metalness: 0.5,
+      });
+      const orangeTip = new THREE.MeshStandardMaterial({
+        color: 0xff6600,
+        roughness: 0.5,
+        metalness: 0.1,
+        emissive: new THREE.Color(0xff6600),
+        emissiveIntensity: 0.5,
+      });
 
       // Barrel
-      const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.018, 0.55, 8), darkMetal);
+      const barrel = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.015, 0.018, 0.55, 8),
+        darkMetal,
+      );
       barrel.rotation.x = Math.PI / 2;
       barrel.position.set(0, 0.01, -0.38);
       group.add(barrel);
       // Muzzle tip
-      const muzzle = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.015, 0.05, 8), orangeTip);
+      const muzzle = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.012, 0.015, 0.05, 8),
+        orangeTip,
+      );
       muzzle.rotation.x = Math.PI / 2;
       muzzle.position.set(0, 0.01, -0.66);
       group.add(muzzle);
       // Receiver body
-      const body = new THREE.Mesh(new THREE.BoxGeometry(0.055, 0.06, 0.28), gunMetal);
+      const body = new THREE.Mesh(
+        new THREE.BoxGeometry(0.055, 0.06, 0.28),
+        gunMetal,
+      );
       body.position.set(0, 0, 0.0);
       group.add(body);
       // Dust cover (top) — part of the bolt carrier group, animates on rack
-      const dustCover = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.015, 0.18), darkMetal);
+      const dustCover = new THREE.Mesh(
+        new THREE.BoxGeometry(0.04, 0.015, 0.18),
+        darkMetal,
+      );
       dustCover.position.set(0, 0.037, -0.03);
-      dustCover.name = 'slide';
+      dustCover.name = "slide";
       group.add(dustCover);
       // Wooden handguard
-      const handguard = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.04, 0.18), wood);
+      const handguard = new THREE.Mesh(
+        new THREE.BoxGeometry(0.045, 0.04, 0.18),
+        wood,
+      );
       handguard.position.set(0, -0.01, -0.18);
       group.add(handguard);
       // Stock
-      const stock = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.055, 0.22), wood);
+      const stock = new THREE.Mesh(
+        new THREE.BoxGeometry(0.04, 0.055, 0.22),
+        wood,
+      );
       stock.position.set(0, -0.01, 0.24);
       group.add(stock);
       // Butt plate
-      const butt = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.06, 0.02), darkMetal);
+      const butt = new THREE.Mesh(
+        new THREE.BoxGeometry(0.035, 0.06, 0.02),
+        darkMetal,
+      );
       butt.position.set(0, -0.01, 0.35);
       group.add(butt);
       // Magazine (curved AK mag) — animates during reload
       const magGroup = new THREE.Group();
-      magGroup.name = 'magazine';
-      const mag = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.13, 0.055), brass);
+      magGroup.name = "magazine";
+      const mag = new THREE.Mesh(
+        new THREE.BoxGeometry(0.035, 0.13, 0.055),
+        brass,
+      );
       mag.position.set(0, -0.09, 0.02);
       mag.rotation.x = 0.2;
       magGroup.add(mag);
       // Magazine base plate
-      const magBase = new THREE.Mesh(new THREE.BoxGeometry(0.037, 0.012, 0.02), darkMetal);
+      const magBase = new THREE.Mesh(
+        new THREE.BoxGeometry(0.037, 0.012, 0.02),
+        darkMetal,
+      );
       magBase.position.set(0, -0.155, 0.05);
       magBase.rotation.x = 0.2;
       magGroup.add(magBase);
       group.add(magGroup);
       // Pistol grip
-      const grip = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.08, 0.035), darkMetal);
+      const grip = new THREE.Mesh(
+        new THREE.BoxGeometry(0.03, 0.08, 0.035),
+        darkMetal,
+      );
       grip.position.set(0, -0.06, 0.12);
       grip.rotation.x = 0.3;
       group.add(grip);
       // Gas tube (above barrel)
-      const gasTube = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.2, 6), darkMetal);
+      const gasTube = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.008, 0.008, 0.2, 6),
+        darkMetal,
+      );
       gasTube.rotation.x = Math.PI / 2;
       gasTube.position.set(0, 0.025, -0.2);
       group.add(gasTube);
       // Front sight post
-      const frontSight = new THREE.Mesh(new THREE.BoxGeometry(0.004, 0.025, 0.004), darkMetal);
+      const frontSight = new THREE.Mesh(
+        new THREE.BoxGeometry(0.004, 0.025, 0.004),
+        darkMetal,
+      );
       frontSight.position.set(0, 0.04, -0.44);
       group.add(frontSight);
       // Rear sight
-      const rearSight = new THREE.Mesh(new THREE.BoxGeometry(0.025, 0.02, 0.006), darkMetal);
+      const rearSight = new THREE.Mesh(
+        new THREE.BoxGeometry(0.025, 0.02, 0.006),
+        darkMetal,
+      );
       rearSight.position.set(0, 0.04, -0.05);
       group.add(rearSight);
     } else {
       // Desert Eagle - big chrome pistol
-      const chrome = new THREE.MeshStandardMaterial({ color: 0xd0d0d0, roughness: 0.2, metalness: 0.5 });
-      const darkSteel = new THREE.MeshStandardMaterial({ color: 0x555555, roughness: 0.4, metalness: 0.45 });
-      const blackGrip = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, roughness: 0.8, metalness: 0.0 });
-      const goldAccent = new THREE.MeshStandardMaterial({ color: 0xdaa520, roughness: 0.25, metalness: 0.5, emissive: new THREE.Color(0xdaa520), emissiveIntensity: 0.3 });
-      const orangeTip = new THREE.MeshStandardMaterial({ color: 0xff6600, roughness: 0.5, metalness: 0.1, emissive: new THREE.Color(0xff6600), emissiveIntensity: 0.5 });
+      const chrome = new THREE.MeshStandardMaterial({
+        color: 0xd0d0d0,
+        roughness: 0.2,
+        metalness: 0.5,
+      });
+      const darkSteel = new THREE.MeshStandardMaterial({
+        color: 0x555555,
+        roughness: 0.4,
+        metalness: 0.45,
+      });
+      const blackGrip = new THREE.MeshStandardMaterial({
+        color: 0x2a2a2a,
+        roughness: 0.8,
+        metalness: 0.0,
+      });
+      const goldAccent = new THREE.MeshStandardMaterial({
+        color: 0xdaa520,
+        roughness: 0.25,
+        metalness: 0.5,
+        emissive: new THREE.Color(0xdaa520),
+        emissiveIntensity: 0.3,
+      });
+      const orangeTip = new THREE.MeshStandardMaterial({
+        color: 0xff6600,
+        roughness: 0.5,
+        metalness: 0.1,
+        emissive: new THREE.Color(0xff6600),
+        emissiveIntensity: 0.5,
+      });
 
       // Barrel (thick, iconic DEagle)
-      const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.016, 0.32, 8), chrome);
+      const barrel = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.014, 0.016, 0.32, 8),
+        chrome,
+      );
       barrel.rotation.x = Math.PI / 2;
       barrel.position.set(0, 0.015, -0.22);
       group.add(barrel);
       // Muzzle brake
-      const muzzleBrake = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.014, 0.06, 8), darkSteel);
+      const muzzleBrake = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.018, 0.014, 0.06, 8),
+        darkSteel,
+      );
       muzzleBrake.rotation.x = Math.PI / 2;
-      muzzleBrake.position.set(0, 0.015, -0.40);
+      muzzleBrake.position.set(0, 0.015, -0.4);
       group.add(muzzleBrake);
       // Muzzle tip
-      const muzzleTip = new THREE.Mesh(new THREE.CylinderGeometry(0.01, 0.018, 0.02, 8), orangeTip);
+      const muzzleTip = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.01, 0.018, 0.02, 8),
+        orangeTip,
+      );
       muzzleTip.rotation.x = Math.PI / 2;
       muzzleTip.position.set(0, 0.015, -0.43);
       group.add(muzzleTip);
       // Slide (top part, chrome) — animates during reload (racks back)
       const slideGroup = new THREE.Group();
-      slideGroup.name = 'slide';
-      const slide = new THREE.Mesh(new THREE.BoxGeometry(0.042, 0.04, 0.28), chrome);
+      slideGroup.name = "slide";
+      const slide = new THREE.Mesh(
+        new THREE.BoxGeometry(0.042, 0.04, 0.28),
+        chrome,
+      );
       slide.position.set(0, 0.01, -0.04);
       slideGroup.add(slide);
       // Gold accent line on slide
-      const accentLine = new THREE.Mesh(new THREE.BoxGeometry(0.044, 0.005, 0.04), goldAccent);
+      const accentLine = new THREE.Mesh(
+        new THREE.BoxGeometry(0.044, 0.005, 0.04),
+        goldAccent,
+      );
       accentLine.position.set(0, 0.032, -0.04);
       slideGroup.add(accentLine);
       // Front sight on slide
-      const frontSight = new THREE.Mesh(new THREE.BoxGeometry(0.004, 0.018, 0.004), darkSteel);
+      const frontSight = new THREE.Mesh(
+        new THREE.BoxGeometry(0.004, 0.018, 0.004),
+        darkSteel,
+      );
       frontSight.position.set(0, 0.035, -0.18);
       slideGroup.add(frontSight);
       // Rear sight on slide
-      const rearSight = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.015, 0.006), darkSteel);
+      const rearSight = new THREE.Mesh(
+        new THREE.BoxGeometry(0.02, 0.015, 0.006),
+        darkSteel,
+      );
       rearSight.position.set(0, 0.035, 0.08);
       slideGroup.add(rearSight);
       group.add(slideGroup);
       // Frame (lower receiver)
-      const frame = new THREE.Mesh(new THREE.BoxGeometry(0.038, 0.025, 0.16), darkSteel);
+      const frame = new THREE.Mesh(
+        new THREE.BoxGeometry(0.038, 0.025, 0.16),
+        darkSteel,
+      );
       frame.position.set(0, -0.015, 0.02);
       group.add(frame);
       // Trigger guard
-      const triggerGuard = new THREE.Mesh(new THREE.BoxGeometry(0.005, 0.025, 0.05), darkSteel);
+      const triggerGuard = new THREE.Mesh(
+        new THREE.BoxGeometry(0.005, 0.025, 0.05),
+        darkSteel,
+      );
       triggerGuard.position.set(0, -0.035, 0.05);
       group.add(triggerGuard);
       // Magazine well + mag — animates during reload
       const magGroup = new THREE.Group();
-      magGroup.name = 'magazine';
-      const mag = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.055, 0.038), darkSteel);
+      magGroup.name = "magazine";
+      const mag = new THREE.Mesh(
+        new THREE.BoxGeometry(0.035, 0.055, 0.038),
+        darkSteel,
+      );
       mag.position.set(0, -0.05, 0.02);
       magGroup.add(mag);
       // Magazine base plate
-      const magBase = new THREE.Mesh(new THREE.BoxGeometry(0.037, 0.008, 0.006), chrome);
+      const magBase = new THREE.Mesh(
+        new THREE.BoxGeometry(0.037, 0.008, 0.006),
+        chrome,
+      );
       magBase.position.set(0, -0.08, 0.02);
       magGroup.add(magBase);
       group.add(magGroup);
       // Grip (black rubberized)
-      const grip = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.09, 0.04), blackGrip);
+      const grip = new THREE.Mesh(
+        new THREE.BoxGeometry(0.035, 0.09, 0.04),
+        blackGrip,
+      );
       grip.position.set(0, -0.06, 0.09);
       grip.rotation.x = 0.25;
       group.add(grip);
       // Grip gold insert
-      const gripInsert = new THREE.Mesh(new THREE.BoxGeometry(0.036, 0.03, 0.005), goldAccent);
+      const gripInsert = new THREE.Mesh(
+        new THREE.BoxGeometry(0.036, 0.03, 0.005),
+        goldAccent,
+      );
       gripInsert.position.set(0, -0.06, 0.07);
       gripInsert.rotation.x = 0.25;
       group.add(gripInsert);
       // Barrel wedge (distinctive DE top rail)
-      const topRail = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.008, 0.12), chrome);
+      const topRail = new THREE.Mesh(
+        new THREE.BoxGeometry(0.022, 0.008, 0.12),
+        chrome,
+      );
       topRail.position.set(0, 0.038, -0.12);
       group.add(topRail);
     }
@@ -1725,7 +2354,12 @@ export function createGameEngine(opts: EngineOptions) {
   // ---------- FPS Weapon View Model ----------
   // A separate scene rendered on top for the first-person weapon
   const fpsWeaponScene = new THREE.Scene();
-  const fpsWeaponCamera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 10);
+  const fpsWeaponCamera = new THREE.PerspectiveCamera(
+    70,
+    window.innerWidth / window.innerHeight,
+    0.01,
+    10,
+  );
   fpsWeaponCamera.position.set(0, 0, 0);
   const fpsAmbient = new THREE.AmbientLight(0xffffff, 1.8);
   fpsWeaponScene.add(fpsAmbient);
@@ -1740,16 +2374,55 @@ export function createGameEngine(opts: EngineOptions) {
   fpsWeaponScene.add(fpsWeaponGroup);
   let currentFpsWeaponMesh: THREE.Group | null = null;
 
+  // The animated first-person models are built once per weapon type and
+  // swapped in/out (previously every switch/restart rebuilt ~18 meshes and
+  // leaked the old geometry + materials). The animated sub-parts are looked
+  // up once here instead of via traverse() on every frame.
+  interface FpsWeaponModel {
+    mesh: THREE.Group;
+    mag: THREE.Object3D | null;
+    slide: THREE.Object3D | null;
+    slideBaseZ: number;
+  }
+  const fpsWeaponModels: Partial<Record<WeaponType, FpsWeaponModel>> = {};
+  let fpsMagPart: THREE.Object3D | null = null;
+  let fpsSlidePart: THREE.Object3D | null = null;
+
   function setFpsWeapon(type: WeaponType) {
     if (currentFpsWeaponMesh) {
       fpsWeaponGroup.remove(currentFpsWeaponMesh);
     }
-    currentFpsWeaponMesh = buildWeaponMesh(type);
-    // Scale up for first-person view
-    currentFpsWeaponMesh.scale.set(2.5, 2.5, 2.5);
+    let model = fpsWeaponModels[type];
+    if (!model) {
+      const mesh = buildWeaponMesh(type);
+      // Scale up for first-person view
+      mesh.scale.set(2.5, 2.5, 2.5);
+      const found = {
+        mag: null as THREE.Object3D | null,
+        slide: null as THREE.Object3D | null,
+      };
+      mesh.traverse((child) => {
+        if (child.name === "magazine" && child instanceof THREE.Group)
+          found.mag = child;
+        if (child.name === "slide") found.slide = child;
+      });
+      model = {
+        mesh,
+        mag: found.mag,
+        slide: found.slide,
+        slideBaseZ: found.slide ? found.slide.position.z : 0,
+      };
+      fpsWeaponModels[type] = model;
+    }
+    // Reset animation state the previous use may have left behind.
+    model.mag?.position.set(0, 0, 0);
+    if (model.slide) model.slide.position.z = model.slideBaseZ;
+    currentFpsWeaponMesh = model.mesh;
+    fpsMagPart = model.mag;
+    fpsSlidePart = model.slide;
     fpsWeaponGroup.add(currentFpsWeaponMesh);
   }
-  setFpsWeapon('ak47');
+  setFpsWeapon("ak47");
 
   // ---------- Shooting System ----------
   function handleShooting(dt: number) {
@@ -1832,7 +2505,7 @@ export function createGameEngine(opts: EngineOptions) {
     // Camera recoil — push the view up and slightly sideways
     // AK-47: moderate kick per shot, fires fast so it stacks
     // Desert Eagle: heavy kick per shot, fires slow
-    const isAk = currentWeapon === 'ak47';
+    const isAk = currentWeapon === "ak47";
     const pitchRecoil = isAk ? 0.012 : 0.035; // radians upward
     const yawRecoil = (Math.random() - 0.5) * (isAk ? 0.008 : 0.02); // random sideways
     cameraPitch += pitchRecoil;
@@ -1849,10 +2522,10 @@ export function createGameEngine(opts: EngineOptions) {
 
     // Calculate shot direction from camera
     const pos = ballRigidBody.translation();
-    const direction = new THREE.Vector3(0, 0, -1);
+    const direction = _shotDir.set(0, 0, -1);
     // Apply camera azimuth and pitch — negate azimuth to match camera convention
-    const euler = new THREE.Euler(cameraPitch, -cameraAzimuth, 0, 'YXZ');
-    direction.applyEuler(euler);
+    _shotEuler.set(cameraPitch, -cameraAzimuth, 0, "YXZ");
+    direction.applyEuler(_shotEuler);
 
     // Add spread
     const spreadX = (Math.random() - 0.5) * wdef.spread;
@@ -1860,23 +2533,32 @@ export function createGameEngine(opts: EngineOptions) {
     direction.x += spreadX;
     direction.y += spreadY;
     direction.normalize();
+    const dirX = direction.x;
+    const dirY = direction.y;
+    const dirZ = direction.z;
 
     // Raycaster origin for hit detection
-    const rayOrigin = new THREE.Vector3(pos.x, pos.y + 0.8, pos.z); // eye level
+    const originX = pos.x;
+    const originY = pos.y + 0.8; // eye level
+    const originZ = pos.z;
 
-    // Check hits against other players
+    // Check hits against other players (allocation-free sphere-ray test)
     let hitPlayer: PlayerClient | null = null;
     let hitDistance = wdef.range;
 
-    for (const [id, p] of Object.entries(players)) {
+    for (const id in players) {
+      const p = players[id];
       if (id === localPlayerId || p.eliminated) continue;
-      // Simple sphere-ray intersection
-      const playerPos = new THREE.Vector3(p.mesh.position.x, p.mesh.position.y, p.mesh.position.z);
-      const toPlayer = playerPos.clone().sub(rayOrigin);
-      const projLen = toPlayer.dot(direction);
+      const px = p.mesh.position.x;
+      const py = p.mesh.position.y;
+      const pz = p.mesh.position.z;
+      const projLen =
+        (px - originX) * dirX + (py - originY) * dirY + (pz - originZ) * dirZ;
       if (projLen < 0 || projLen > wdef.range) continue;
-      const closestPoint = rayOrigin.clone().add(direction.clone().multiplyScalar(projLen));
-      const distToCenter = closestPoint.distanceTo(playerPos);
+      const cx = originX + dirX * projLen - px;
+      const cy = originY + dirY * projLen - py;
+      const cz = originZ + dirZ * projLen - pz;
+      const distToCenter = Math.sqrt(cx * cx + cy * cy + cz * cz);
       if (distToCenter < PLAYER_RADIUS && projLen < hitDistance) {
         hitPlayer = p;
         hitDistance = projLen;
@@ -1887,7 +2569,7 @@ export function createGameEngine(opts: EngineOptions) {
       const hitId = hitPlayer.id;
 
       // Apply health damage to the hit player
-      if (mode === 'single') {
+      if (mode === "single") {
         // Single player: we're authoritative — apply damage directly
         applyDamageToRemotePlayer(hitId, wdef.damage);
       } else if (isHost) {
@@ -1899,25 +2581,52 @@ export function createGameEngine(opts: EngineOptions) {
       // We include damage in our message so the host can use it.
 
       // Deal knockback impulse to hit player
-      const knockbackDir = direction.clone().multiplyScalar(wdef.knockback);
+      const knockbackDir = {
+        x: dirX * wdef.knockback,
+        y: dirY * wdef.knockback,
+        z: dirZ * wdef.knockback,
+      };
       knockbackDir.y = Math.max(knockbackDir.y, 2.0); // minimum upward impulse
 
-      if (netClient && mode !== 'single') {
+      if (netClient && mode !== "single") {
         // Include damage in the network message so the host/target can apply it
-        netClient.send({ kind: 'player-hit', targetId: hitId, impulse: { x: knockbackDir.x, y: knockbackDir.y, z: knockbackDir.z }, damage: wdef.damage });
-      } else if (hitPlayer.rigidBody && mode === 'single') {
-        try { hitPlayer.rigidBody.applyImpulse({ x: knockbackDir.x, y: knockbackDir.y, z: knockbackDir.z }, true); } catch { /* ignore */ }
+        netClient.send({
+          kind: "player-hit",
+          targetId: hitId,
+          impulse: { x: knockbackDir.x, y: knockbackDir.y, z: knockbackDir.z },
+          damage: wdef.damage,
+        });
+      } else if (hitPlayer.rigidBody && mode === "single") {
+        try {
+          hitPlayer.rigidBody.applyImpulse(
+            { x: knockbackDir.x, y: knockbackDir.y, z: knockbackDir.z },
+            true,
+          );
+        } catch {
+          /* ignore */
+        }
       }
 
       // Hit effect
-      createParticleEffect(hitPlayer.mesh.position.clone().add(new THREE.Vector3(0, 0.5, 0)), 0xff0000, 6);
+      spawnParticles(
+        hitPlayer.mesh.position.x,
+        hitPlayer.mesh.position.y + 0.5,
+        hitPlayer.mesh.position.z,
+        0xff0000,
+        6,
+      );
       addScore(25);
     }
 
     // Hit particles at impact point or end of range
-    const impactPoint = rayOrigin.clone().add(direction.clone().multiplyScalar(hitDistance));
     if (!hitPlayer) {
-      createParticleEffect(impactPoint, 0xffaa00, 3);
+      spawnParticles(
+        originX + dirX * hitDistance,
+        originY + dirY * hitDistance,
+        originZ + dirZ * hitDistance,
+        0xffaa00,
+        3,
+      );
     }
 
     // Weapon damage to tiles — raycast against tile positions to find what
@@ -1932,36 +2641,47 @@ export function createGameEngine(opts: EngineOptions) {
       // Find the closest tile along the ray
       let closestTileDist = hitDistance; // don't shoot through players
       let closestTile: TileClient | null = null;
-      for (const tile of tiles) {
+      for (let ti = 0; ti < tiles.length; ti++) {
+        const tile = tiles[ti];
         if (tile.isBreaking) continue;
         const tilePos = tile.mesh.position;
-        const toTile = new THREE.Vector3(tilePos.x - rayOrigin.x, tilePos.y - rayOrigin.y, tilePos.z - rayOrigin.z);
-        const projLen = toTile.dot(direction);
+        const projLen =
+          (tilePos.x - originX) * dirX +
+          (tilePos.y - originY) * dirY +
+          (tilePos.z - originZ) * dirZ;
         if (projLen < 0 || projLen > closestTileDist) continue;
-        const closestPoint = rayOrigin.clone().add(direction.clone().multiplyScalar(projLen));
-        const distToCenter = closestPoint.distanceTo(tilePos);
+        const cx = originX + dirX * projLen - tilePos.x;
+        const cy = originY + dirY * projLen - tilePos.y;
+        const cz = originZ + dirZ * projLen - tilePos.z;
         // Hex tile has radius ~0.6, height ~0.5 (walls 3.0). Use a generous
         // hit radius so bullets hit tiles reliably.
         const hitRadius = tilePos.y > 2 ? 1.4 : 1.0; // walls are taller → easier to hit
-        if (distToCenter < hitRadius && projLen < closestTileDist) {
+        if (
+          cx * cx + cy * cy + cz * cz < hitRadius * hitRadius &&
+          projLen < closestTileDist
+        ) {
           closestTileDist = projLen;
           closestTile = tile;
         }
       }
       if (closestTile) {
-        const impactPos = rayOrigin.clone().add(direction.clone().multiplyScalar(closestTileDist));
-        damageTilesAt(impactPos, tileDamageRadius, tileDamage, null);
+        _tmpVec.set(
+          originX + dirX * closestTileDist,
+          originY + dirY * closestTileDist,
+          originZ + dirZ * closestTileDist,
+        );
+        damageTilesAt(_tmpVec, tileDamageRadius, tileDamage, null);
       }
     }
 
     // Broadcast shot
-    if (netClient && mode !== 'single') {
+    if (netClient && mode !== "single") {
       netClient.send({
-        kind: 'player-shot',
+        kind: "player-shot",
         id: localPlayerId,
         weapon: currentWeapon,
-        direction: { x: direction.x, y: direction.y, z: direction.z },
-        origin: { x: rayOrigin.x, y: rayOrigin.y, z: rayOrigin.z },
+        direction: { x: dirX, y: dirY, z: dirZ },
+        origin: { x: originX, y: originY, z: originZ },
       });
     }
 
@@ -1990,13 +2710,23 @@ export function createGameEngine(opts: EngineOptions) {
   }
 
   // Shell ejection particles — brass casings that fly out of the weapon
-  const shellParticles: { mesh: THREE.Mesh; vel: THREE.Vector3; life: number; maxLife: number }[] = [];
+  const shellParticles: {
+    mesh: THREE.Mesh;
+    vel: THREE.Vector3;
+    life: number;
+    maxLife: number;
+  }[] = [];
   const shellGeo = new THREE.CylinderGeometry(0.003, 0.003, 0.015, 4);
-  const shellMat = new THREE.MeshStandardMaterial({ color: 0xd4a017, metalness: 0.9, roughness: 0.2 });
+  const shellMat = new THREE.MeshStandardMaterial({
+    color: 0xd4a017,
+    metalness: 0.9,
+    roughness: 0.2,
+    transparent: true,
+  });
 
   function ejectShell() {
     if (!currentFpsWeaponMesh || shellParticles.length >= 8) return;
-    const isAk = currentWeapon === 'ak47';
+    const isAk = currentWeapon === "ak47";
     const shell = new THREE.Mesh(shellGeo, shellMat);
     // Start from ejection port position (right side of receiver)
     const ejectX = 0.25 + (isAk ? 0.02 : 0.01);
@@ -2004,12 +2734,16 @@ export function createGameEngine(opts: EngineOptions) {
     const ejectZ = -0.25;
     shell.position.set(ejectX, ejectY, ejectZ);
     // Random rotation for tumbling brass
-    shell.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+    shell.rotation.set(
+      Math.random() * Math.PI,
+      Math.random() * Math.PI,
+      Math.random() * Math.PI,
+    );
     // Velocity: right and slightly up + back
     const vel = new THREE.Vector3(
       0.8 + Math.random() * 0.5,
       0.3 + Math.random() * 0.3,
-      -0.2 + Math.random() * 0.2
+      -0.2 + Math.random() * 0.2,
     );
     const life = 0.8 + Math.random() * 0.4;
     shellParticles.push({ mesh: shell, vel, life, maxLife: life });
@@ -2026,7 +2760,13 @@ export function createGameEngine(opts: EngineOptions) {
     // Weapon position
     const bobSpeed = 8;
     const bobAmount = 0.02;
-    const isMoving = keys.w || keys.a || keys.s || keys.d || Math.abs(joystickX) > 0.15 || Math.abs(joystickY) > 0.15;
+    const isMoving =
+      keys.w ||
+      keys.a ||
+      keys.s ||
+      keys.d ||
+      Math.abs(joystickX) > 0.15 ||
+      Math.abs(joystickY) > 0.15;
 
     if (isMoving && physicsEnabled) {
       weaponBobTime += dt * bobSpeed;
@@ -2034,8 +2774,11 @@ export function createGameEngine(opts: EngineOptions) {
       weaponBobTime += dt * 1.5;
     }
 
-    const bobX = Math.sin(weaponBobTime) * (isMoving ? bobAmount * 3 : bobAmount);
-    const bobY = Math.abs(Math.cos(weaponBobTime)) * (isMoving ? bobAmount * 2 : bobAmount * 0.5);
+    const bobX =
+      Math.sin(weaponBobTime) * (isMoving ? bobAmount * 3 : bobAmount);
+    const bobY =
+      Math.abs(Math.cos(weaponBobTime)) *
+      (isMoving ? bobAmount * 2 : bobAmount * 0.5);
 
     // Recoil recovery
     weaponRecoilOffset *= 0.85;
@@ -2044,7 +2787,7 @@ export function createGameEngine(opts: EngineOptions) {
     fpsWeaponGroup.position.set(
       0.25 + bobX,
       -0.2 + bobY,
-      -0.4 + weaponRecoilOffset
+      -0.4 + weaponRecoilOffset,
     );
 
     // Default rotation reset
@@ -2052,23 +2795,15 @@ export function createGameEngine(opts: EngineOptions) {
     fpsWeaponGroup.rotation.z = 0;
 
     // ---- Per-part weapon animations ----
-    // Find animated parts in the weapon mesh
-    let magPart: THREE.Group | null = null;
-    let slidePart: THREE.Object3D | null = null;
-    if (currentFpsWeaponMesh) {
-      // Use type assertion since traverse callback makes TS lose narrowing
-      const foundParts = { mag: null as THREE.Group | null, slide: null as THREE.Object3D | null };
-      currentFpsWeaponMesh.traverse((child) => {
-        if (child.name === 'magazine' && child instanceof THREE.Group) foundParts.mag = child;
-        if (child.name === 'slide') foundParts.slide = child;
-      });
-      magPart = foundParts.mag;
-      slidePart = foundParts.slide;
-    }
+    // Animated parts are cached in setFpsWeapon()
+    const magPart = fpsMagPart;
+    const slidePart = fpsSlidePart;
 
     // Weapon switch animation (lower weapon)
     if (isSwitchingWeapon) {
-      const progress = (performance.now() - weaponSwitchStartTime) / (WEAPON_SWITCH_TIME * 1000);
+      const progress =
+        (performance.now() - weaponSwitchStartTime) /
+        (WEAPON_SWITCH_TIME * 1000);
       if (progress < 0.5) {
         fpsWeaponGroup.position.y -= progress * 0.8;
       } else {
@@ -2079,8 +2814,10 @@ export function createGameEngine(opts: EngineOptions) {
     // Fire recoil per-part animation — slide/bolt kicks back briefly
     if (weaponRecoilOffset > 0.02 && slidePart) {
       // Slide/bolt kicks back with recoil
-      const isAk = currentWeapon === 'ak47';
-      const slideOffset = isAk ? -weaponRecoilOffset * 0.8 : -weaponRecoilOffset * 0.6;
+      const isAk = currentWeapon === "ak47";
+      const slideOffset = isAk
+        ? -weaponRecoilOffset * 0.8
+        : -weaponRecoilOffset * 0.6;
       slidePart!.position.z = slideOffset * 2.5; // scale with FPS weapon scale
     } else if (slidePart) {
       // Return slide to original position
@@ -2090,8 +2827,11 @@ export function createGameEngine(opts: EngineOptions) {
     // Reload animation — magazine drops out, new mag in, slide/bolt racks
     if (isReloading && magPart) {
       const wdef = WEAPONS[currentWeapon];
-      const progress = Math.min(1, (performance.now() - reloadStartTime) / (wdef.reloadTime * 1000));
-      const isAk = currentWeapon === 'ak47';
+      const progress = Math.min(
+        1,
+        (performance.now() - reloadStartTime) / (wdef.reloadTime * 1000),
+      );
+      const isAk = currentWeapon === "ak47";
 
       if (progress < 0.3) {
         // Phase 1: Tilt weapon slightly, magazine starts to drop
@@ -2127,7 +2867,7 @@ export function createGameEngine(opts: EngineOptions) {
         fpsWeaponGroup.rotation.x = 0;
         const t = (progress - 0.7) / 0.3;
         if (slidePart) {
-          const isAkGun = currentWeapon === 'ak47';
+          const isAkGun = currentWeapon === "ak47";
           const rackDist = isAkGun ? 0.08 : 0.06;
           if (t < 0.5) {
             // Pull slide/bolt back
@@ -2152,10 +2892,17 @@ export function createGameEngine(opts: EngineOptions) {
     // Muzzle flash timer
     if (muzzleFlashTimer > 0) {
       muzzleFlashTimer -= dt * 1000;
-      const lp = players[localPlayerId];
-      if (lp?.muzzleFlash) {
-        lp.muzzleFlash.intensity = muzzleFlashTimer > 0 ? 3 : 0;
-      }
+      const light = flashLights[0];
+      if (light) light.intensity = muzzleFlashTimer > 0 ? 3 : 0;
+    }
+    // Remote flash (slot 1) is switched off by wall-clock time.
+    const remoteLight = flashLights[1];
+    if (
+      remoteLight &&
+      remoteLight.intensity > 0 &&
+      performance.now() >= flashUntil[1]
+    ) {
+      remoteLight.intensity = 0;
     }
 
     // Update shell ejection particles
@@ -2172,17 +2919,10 @@ export function createGameEngine(opts: EngineOptions) {
       // Tumble the shell
       sp.mesh.rotation.x += dt * 15;
       sp.mesh.rotation.z += dt * 10;
-      // Fade out
-      const opacity = sp.life / sp.maxLife;
-      (sp.mesh.material as THREE.MeshStandardMaterial).transparent = true;
-      (sp.mesh.material as THREE.MeshStandardMaterial).opacity = opacity;
-    }
-
-    // Hide local player mesh from own camera (first-person)
-    const lp = players[localPlayerId];
-    if (lp) {
-      // Hide the sphere mesh but keep it in scene for physics
-      // We'll handle visibility in the camera update
+      // Fade out — the transparent flag is set once when the shell is
+      // created; toggling it here every frame forced a material update.
+      (sp.mesh.material as THREE.MeshStandardMaterial).opacity =
+        sp.life / sp.maxLife;
     }
   }
 
@@ -2198,21 +2938,25 @@ export function createGameEngine(opts: EngineOptions) {
       // landing), keep the higher bounce power. This mirrors the original
       // game's feel and lets players chain bounces off hexagons.
       if (canJumpUntil + 1600 > now) jumpPower = 10;
-      if (hasPowerUp('high_jump')) jumpPower *= 1.5;
+      if (hasPowerUp("high_jump")) jumpPower *= 1.5;
       try {
         ballRigidBody.applyImpulse({ x: 0, y: jumpPower, z: 0 }, true);
       } catch {
         /* ignore */
       }
       if (ballCollider) {
-        try { ballCollider.setRestitution(0); } catch { /* ignore */ }
+        try {
+          ballCollider.setRestitution(0);
+        } catch {
+          /* ignore */
+        }
       }
       playSound(jumpSound, 0.6);
       keys.space = false;
       canJump = false;
       canJumpUntil = 0;
-      if (netClient && mode !== 'single') {
-        netClient.send({ kind: 'jump', id: localPlayerId });
+      if (netClient && mode !== "single") {
+        netClient.send({ kind: "jump", id: localPlayerId });
       }
     }
     // Jump buffering: if the player pressed jump while airborne, remember it
@@ -2234,7 +2978,7 @@ export function createGameEngine(opts: EngineOptions) {
     // We use acceleration scaled by dt (not by frame count) — that is the
     // crucial change that makes movement FPS-independent.
     let moveAccel = 18.0;
-    if (hasPowerUp('speed_boost')) moveAccel *= 1.5;
+    if (hasPowerUp("speed_boost")) moveAccel *= 1.5;
 
     let moveX = 0;
     let moveZ = 0;
@@ -2253,14 +2997,25 @@ export function createGameEngine(opts: EngineOptions) {
     // Also scale by analog stick magnitude so partial nudges move slower.
     const stickMagX = Math.abs(joystickX) > 0.15 ? joystickX : 0;
     const stickMagY = Math.abs(joystickY) > 0.15 ? joystickY : 0;
-    const stickMag = Math.min(1, Math.sqrt(stickMagX * stickMagX + stickMagY * stickMagY));
-    const analogScale = (keys.w || keys.a || keys.s || keys.d) ? 1 : stickMag;
+    const stickMag = Math.min(
+      1,
+      Math.sqrt(stickMagX * stickMagX + stickMagY * stickMagY),
+    );
+    const analogScale = keys.w || keys.a || keys.s || keys.d ? 1 : stickMag;
     // FPS movement: forward = (sin(az), 0, -cos(az)), right = (cos(az), 0, sin(az))
     // direction = moveX * right + (-moveZ) * forward
     //   X: moveX * cos(az) - moveZ * sin(az)
     //   Z: moveX * sin(az) + moveZ * cos(az)
-    const ax = (moveX * Math.cos(cameraAzimuth) - moveZ * Math.sin(cameraAzimuth)) * moveAccel * dt * analogScale;
-    const az = (moveX * Math.sin(cameraAzimuth) + moveZ * Math.cos(cameraAzimuth)) * moveAccel * dt * analogScale;
+    const ax =
+      (moveX * Math.cos(cameraAzimuth) - moveZ * Math.sin(cameraAzimuth)) *
+      moveAccel *
+      dt *
+      analogScale;
+    const az =
+      (moveX * Math.sin(cameraAzimuth) + moveZ * Math.cos(cameraAzimuth)) *
+      moveAccel *
+      dt *
+      analogScale;
     if (ax !== 0 || az !== 0) {
       try {
         ballRigidBody.applyImpulse({ x: ax, y: 0, z: az }, true);
@@ -2282,7 +3037,11 @@ export function createGameEngine(opts: EngineOptions) {
         const vd = p.y - tile.mesh.position.y;
         // Player centre must be within ~1 tile radius horizontally and
         // close to the tile's top surface vertically.
-        if (hd < TILE_RADIUS * 1.3 && vd <= TILE_HEIGHT / 2 + PLAYER_RADIUS + 0.1 && vd >= -(TILE_HEIGHT / 2 + 0.5)) {
+        if (
+          hd < TILE_RADIUS * 1.3 &&
+          vd <= TILE_HEIGHT / 2 + PLAYER_RADIUS + 0.1 &&
+          vd >= -(TILE_HEIGHT / 2 + 0.5)
+        ) {
           return tile;
         }
       }
@@ -2316,21 +3075,44 @@ export function createGameEngine(opts: EngineOptions) {
       isSpectating = true;
       callbacks.onSpectatingChange(true);
       if (ballRigidBody) {
-        try { ballRigidBody.setEnabled(false); } catch { /* ignore */ }
+        try {
+          ballRigidBody.setEnabled(false);
+        } catch {
+          /* ignore */
+        }
       }
       // Pick the first alive player to spectate.
-      const aliveForSpectate = Object.values(players).filter((pp) => !pp.eliminated);
+      const aliveForSpectate = Object.values(players).filter(
+        (pp) => !pp.eliminated,
+      );
       spectateTargetId = aliveForSpectate[0]?.id ?? null;
     }
-    try { scene.remove(p.mesh); } catch { /* ignore */ }
-    // Also remove scene-level children (weaponGroup, nameLabel, muzzleFlash)
+    try {
+      scene.remove(p.mesh);
+    } catch {
+      /* ignore */
+    }
+    // Also remove scene-level children (weaponGroup, nameLabel)
     // that are NOT children of the mesh.
-    if (p.weaponGroup) { try { scene.remove(p.weaponGroup); } catch { /* ignore */ } }
-    if (p.nameLabel) { try { scene.remove(p.nameLabel); } catch { /* ignore */ } }
-    if (p.muzzleFlash) { try { scene.remove(p.muzzleFlash); } catch { /* ignore */ } }
+    if (p.weaponGroup) {
+      try {
+        scene.remove(p.weaponGroup);
+      } catch {
+        /* ignore */
+      }
+    }
+    if (p.nameLabel) {
+      try {
+        scene.remove(p.nameLabel);
+      } catch {
+        /* ignore */
+      }
+    }
     try {
       if (p.rigidBody) world.removeRigidBody(p.rigidBody);
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
     if (p.collider) delete colliderHandleToPlayerId[p.collider.handle];
     // CRITICAL: After removing the rigid body from the world, null out the
     // local ball references. The WASM object backing ballRigidBody is freed
@@ -2348,20 +3130,22 @@ export function createGameEngine(opts: EngineOptions) {
     // E.g. 4 players, one dies → 3 alive → rank = 4 (last place).
     //      2 players, one dies → 1 alive → rank = 2 (second place).
     //      The last alive player gets rank 1 (winner) in endGame().
-    if (isHost || mode === 'single') {
+    if (isHost || mode === "single") {
       const alive = Object.values(players).filter((pp) => !pp.eliminated);
       p.rank = alive.length + 1;
-      console.log(`[ENGINE] Player ${id.slice(0, 8)} eliminated. Rank: ${p.rank}. Alive: ${alive.length}`);
+      console.log(
+        `[ENGINE] Player ${id.slice(0, 8)} eliminated. Rank: ${p.rank}. Alive: ${alive.length}`,
+      );
     }
 
-    if (netClient && mode !== 'single') {
+    if (netClient && mode !== "single") {
       if (isHost) {
         // Host broadcasts the AUTHORITATIVE elimination with the computed rank.
-        netClient.send({ kind: 'player-eliminated', id, rank: p.rank ?? 0 });
+        netClient.send({ kind: "player-eliminated", id, rank: p.rank ?? 0 });
       } else {
         // Guest tells the host it died (rank=0 = "please compute my rank").
         // The host will call eliminatePlayer(id) and broadcast the real rank.
-        netClient.send({ kind: 'player-eliminated', id, rank: 0 });
+        netClient.send({ kind: "player-eliminated", id, rank: 0 });
       }
     }
 
@@ -2390,11 +3174,16 @@ export function createGameEngine(opts: EngineOptions) {
     const rankings = Object.values(players)
       .map((p) => ({ id: p.id, rank: p.rank ?? null }))
       .sort((a, b) => (a.rank ?? 99) - (b.rank ?? 99));
-    console.log('[ENGINE] endGame. Winner:', winner?.slice(0, 8) ?? 'none', 'Rankings:', rankings.map((r) => `${r.id.slice(0, 6)}:#${r.rank}`).join(', '));
+    console.log(
+      "[ENGINE] endGame. Winner:",
+      winner?.slice(0, 8) ?? "none",
+      "Rankings:",
+      rankings.map((r) => `${r.id.slice(0, 6)}:#${r.rank}`).join(", "),
+    );
     callbacks.onEndGame(rankings, winner);
     // Host broadcasts game-ended so all guests show the end screen.
-    if (netClient && mode !== 'single' && isHost) {
-      netClient.send({ kind: 'game-ended', winner });
+    if (netClient && mode !== "single" && isHost) {
+      netClient.send({ kind: "game-ended", winner });
     }
   }
 
@@ -2409,14 +3198,14 @@ export function createGameEngine(opts: EngineOptions) {
     if (!netClient) return;
     engineNetListener = (ev: NetEvent) => {
       switch (ev.type) {
-        case 'open':
+        case "open":
           // In server mode, adopt the server-assigned socket id as our local
           // player id. This is critical because the server's `init` event
           // references players by their socket.id, and our `localPlayerId`
           // started as 'local-host' (a placeholder). Without this update, the
           // host never creates its own sphere (the init handler's
           // `if (p.id === localPlayerId)` check never matches).
-          if (mode === 'server' && ev.id && ev.id !== localPlayerId) {
+          if (mode === "server" && ev.id && ev.id !== localPlayerId) {
             // Migrate any existing local player state to the new id.
             const oldEntry = players[localPlayerId];
             if (oldEntry) {
@@ -2426,15 +3215,27 @@ export function createGameEngine(opts: EngineOptions) {
             localPlayerId = ev.id;
             // Update the netClient's id too (defensive — socket.ts already
             // does this, but LAN mode doesn't).
-            try { (netClient as any).id = ev.id; } catch { /* ignore */ }
-            console.log('[ENGINE] Adopted server-assigned id:', localPlayerId);
+            try {
+              (netClient as any).id = ev.id;
+            } catch {
+              /* ignore */
+            }
+            console.log("[ENGINE] Adopted server-assigned id:", localPlayerId);
           }
           // For LAN/server guests: send join request
           if (!isHost) {
-            netClient.send({ kind: 'new-player', id: localPlayerId, position: { x: (Math.random() - 0.5) * 6, y: 5, z: (Math.random() - 0.5) * 6 } });
+            netClient.send({
+              kind: "new-player",
+              id: localPlayerId,
+              position: {
+                x: (Math.random() - 0.5) * 6,
+                y: 5,
+                z: (Math.random() - 0.5) * 6,
+              },
+            });
           }
           break;
-        case 'new-player': {
+        case "new-player": {
           if (ev.data.id !== localPlayerId && !players[ev.data.id]) {
             createSphere(ev.data.id, ev.data.position, false);
           }
@@ -2446,32 +3247,41 @@ export function createGameEngine(opts: EngineOptions) {
           // both early-return on duplicate ids), so re-sending is safe.
           if (isHost) {
             netClient.send({
-              kind: 'init',
-              gameId: 'lan',
+              kind: "init",
+              gameId: "lan",
               creatorId: localPlayerId,
-              players: Object.values(players).map((pp) => ({ id: pp.id, position: pp.targetPosition })),
+              players: Object.values(players).map((pp) => ({
+                id: pp.id,
+                position: pp.targetPosition,
+              })),
               islandSeed,
               islandSize,
               startTimer: startTimerValue,
-              serverStartTime: serverStartTime ?? Date.now() + startTimerValue * 1000,
+              serverStartTime:
+                serverStartTime ?? Date.now() + startTimerValue * 1000,
             });
           }
           break;
         }
-        case 'init': {
+        case "init": {
           // In server mode, BOTH host and guest receive 'init' from the server
           // (the server generates the island seed and sends it to everyone).
           // In LAN mode, only the guest receives 'init' from the host (the
           // host generated its own island in start()).
-          const shouldProcessInit = !isHost || mode === 'server';
+          const shouldProcessInit = !isHost || mode === "server";
           if (shouldProcessInit) {
             // RESTART DETECTION: if we already have tiles / players / a ball,
             // this is a re-init (the host restarted the match). Tear down all
             // existing game state BEFORE applying the new init so the new
             // island / spawn positions are clean.
-            const isReinit = tiles.length > 0 || Object.keys(players).length > 0 || ballRigidBody !== null;
+            const isReinit =
+              tiles.length > 0 ||
+              Object.keys(players).length > 0 ||
+              ballRigidBody !== null;
             if (isReinit) {
-              console.log('[ENGINE] Re-init received — tearing down previous match state for restart.');
+              console.log(
+                "[ENGINE] Re-init received — tearing down previous match state for restart.",
+              );
               resetGameState({ keepListeners: true });
             }
             // CLOCK-SKEW FIX: do NOT copy the host's `serverStartTime` verbatim.
@@ -2492,13 +3302,14 @@ export function createGameEngine(opts: EngineOptions) {
             // Re-generate the island from the host's/server's seed + size so
             // both peers have the exact same layout.
             islandSeed = ev.data.islandSeed;
-            islandSize = (ev.data.islandSize as IslandSize) || 'medium';
+            islandSize = (ev.data.islandSize as IslandSize) || "medium";
             // Only generate the island if we haven't already (the LAN host
             // generates it in start(); server-mode host and all guests get
             // it here). We check tiles.length to avoid double-generating.
             if (tiles.length === 0) {
               const islandTiles = generateIsland(islandSize, islandSeed);
-              for (const t of islandTiles) createTile({ x: t.x, y: t.y, z: t.z }, t.id);
+              for (const t of islandTiles)
+                createTile({ x: t.x, y: t.y, z: t.z }, t.id);
               // Spawn the deterministic powerup pickups — same positions on
               // every peer because they're derived from the island seed.
               spawnPowerupPickups();
@@ -2518,7 +3329,7 @@ export function createGameEngine(opts: EngineOptions) {
           }
           break;
         }
-        case 'move': {
+        case "move": {
           const p = players[ev.data.id];
           if (p && ev.data.id !== localPlayerId && !p.eliminated) {
             p.targetPosition = ev.data.position;
@@ -2530,16 +3341,16 @@ export function createGameEngine(opts: EngineOptions) {
           }
           break;
         }
-        case 'jump': {
+        case "jump": {
           // Someone jumped — we only need this on the host side to relay/ack.
           // No physics sync needed since each peer is authoritative for its own ball.
           break;
         }
-        case 'rotate': {
+        case "rotate": {
           // Reserved for future cosmetic use (e.g. arrow above head).
           break;
         }
-        case 'damage-tile': {
+        case "damage-tile": {
           // A remote peer damaged a tile — apply the same damage locally so
           // the island stays in sync across all peers. sourcePeer is non-null
           // so we don't re-broadcast (avoids infinite loop).
@@ -2549,18 +3360,25 @@ export function createGameEngine(opts: EngineOptions) {
           }
           break;
         }
-        case 'hexagon-collided':
-        case 'hexagon-broken': {
+        case "hexagon-collided":
+        case "hexagon-broken": {
           // Legacy messages from the old hexagon system — no longer used but
           // we ignore them gracefully if an older peer sends one.
           break;
         }
-        case 'player-hit': {
+        case "player-hit": {
           // Invincibility powerup: ignore knockback + damage from other players.
-          if (ev.data.targetId === localPlayerId && !hasPowerUp('invincibility')) {
+          if (
+            ev.data.targetId === localPlayerId &&
+            !hasPowerUp("invincibility")
+          ) {
             // Apply knockback
             if (ballRigidBody) {
-              try { ballRigidBody.applyImpulse(ev.data.impulse, true); } catch { /* ignore */ }
+              try {
+                ballRigidBody.applyImpulse(ev.data.impulse, true);
+              } catch {
+                /* ignore */
+              }
             }
             // Apply health damage from the shot
             const dmg = ev.data.damage ?? 0;
@@ -2568,7 +3386,7 @@ export function createGameEngine(opts: EngineOptions) {
           }
           break;
         }
-        case 'player-eliminated': {
+        case "player-eliminated": {
           const p = players[ev.data.id];
           if (p && !p.eliminated) {
             if (isHost && ev.data.rank === 0) {
@@ -2591,18 +3409,40 @@ export function createGameEngine(opts: EngineOptions) {
                 callbacks.onSpectatingChange(true);
                 if (ballRigidBody) ballRigidBody.setEnabled(false);
                 // Pick the first alive player to spectate.
-                const aliveForSpectate = Object.values(players).filter((pp) => !pp.eliminated);
+                const aliveForSpectate = Object.values(players).filter(
+                  (pp) => !pp.eliminated,
+                );
                 spectateTargetId = aliveForSpectate[0]?.id ?? null;
               }
-              try { scene.remove(p.mesh); } catch { /* ignore */ }
-              if (p.weaponGroup) { try { scene.remove(p.weaponGroup); } catch { /* ignore */ } }
-              if (p.nameLabel) { try { scene.remove(p.nameLabel); } catch { /* ignore */ } }
-              if (p.muzzleFlash) { try { scene.remove(p.muzzleFlash); } catch { /* ignore */ } }
+              try {
+                scene.remove(p.mesh);
+              } catch {
+                /* ignore */
+              }
+              if (p.weaponGroup) {
+                try {
+                  scene.remove(p.weaponGroup);
+                } catch {
+                  /* ignore */
+                }
+              }
+              if (p.nameLabel) {
+                try {
+                  scene.remove(p.nameLabel);
+                } catch {
+                  /* ignore */
+                }
+              }
               try {
                 if (p.rigidBody) world.removeRigidBody(p.rigidBody);
-              } catch { /* ignore */ }
-              if (p.collider) delete colliderHandleToPlayerId[p.collider.handle];
-              const alive = Object.values(players).filter((pp) => !pp.eliminated);
+              } catch {
+                /* ignore */
+              }
+              if (p.collider)
+                delete colliderHandleToPlayerId[p.collider.handle];
+              const alive = Object.values(players).filter(
+                (pp) => !pp.eliminated,
+              );
               if (alive.length <= 1) {
                 if (alive[0]) alive[0].rank = 1;
                 endGame(alive[0]?.id ?? null);
@@ -2614,16 +3454,33 @@ export function createGameEngine(opts: EngineOptions) {
           }
           break;
         }
-        case 'player-disconnected': {
+        case "player-disconnected": {
           const p = players[ev.data.id];
           if (p) {
-            try { scene.remove(p.mesh); } catch { /* ignore */ }
-            if (p.weaponGroup) { try { scene.remove(p.weaponGroup); } catch { /* ignore */ } }
-            if (p.nameLabel) { try { scene.remove(p.nameLabel); } catch { /* ignore */ } }
-            if (p.muzzleFlash) { try { scene.remove(p.muzzleFlash); } catch { /* ignore */ } }
+            try {
+              scene.remove(p.mesh);
+            } catch {
+              /* ignore */
+            }
+            if (p.weaponGroup) {
+              try {
+                scene.remove(p.weaponGroup);
+              } catch {
+                /* ignore */
+              }
+            }
+            if (p.nameLabel) {
+              try {
+                scene.remove(p.nameLabel);
+              } catch {
+                /* ignore */
+              }
+            }
             try {
               if (p.rigidBody) world.removeRigidBody(p.rigidBody);
-            } catch { /* ignore */ }
+            } catch {
+              /* ignore */
+            }
             delete players[ev.data.id];
             // If the spectated target disconnected, auto-switch to another
             // alive player.
@@ -2639,11 +3496,11 @@ export function createGameEngine(opts: EngineOptions) {
           }
           break;
         }
-        case 'game-ended': {
+        case "game-ended": {
           endGame(ev.data.winner ?? null);
           break;
         }
-        case 'game-started': {
+        case "game-started": {
           // Host's countdown expired and physics enabled. Enable physics on
           // our side too AND clear our countdown UI immediately. Without
           // clearing serverStartTime, our own pushCountdown() would keep
@@ -2664,24 +3521,35 @@ export function createGameEngine(opts: EngineOptions) {
           callbacks.onCountdown(null);
           break;
         }
-        case 'powerup-collected': {
+        case "powerup-collected": {
           // A peer collected a pickup — hide it on our side. The collector's
           // own client already applied the effect locally (in collectPowerup).
-          handleRemotePowerupCollected(ev.data.powerupId, ev.data.playerId, ev.data.powerupType);
+          handleRemotePowerupCollected(
+            ev.data.powerupId,
+            ev.data.playerId,
+            ev.data.powerupType,
+          );
           break;
         }
-        case 'powerup-respawned': {
+        case "powerup-respawned": {
           // Host broadcast a respawn at a NEW tile — move the pickup and show it.
-          handleRemotePowerupRespawned(ev.data.powerupId, ev.data.newTileId, ev.data.position);
+          handleRemotePowerupRespawned(
+            ev.data.powerupId,
+            ev.data.newTileId,
+            ev.data.position,
+          );
           break;
         }
-        case 'peer-list': {
+        case "peer-list": {
           // Lobby roster update. The engine doesn't need to act on this — the
           // LanModal handles the lobby UI. We just log it for debugging.
-          console.log('[ENGINE] peer-list update:', ev.data.players.map((p) => p.id).join(', '));
+          console.log(
+            "[ENGINE] peer-list update:",
+            ev.data.players.map((p) => p.id).join(", "),
+          );
           break;
         }
-        case 'start-countdown': {
+        case "start-countdown": {
           // Host triggered the countdown. The engine's own start() should have
           // already set serverStartTime, but if for some reason it didn't
           // (e.g. this is a late-arriving start-countdown), set it now. This
@@ -2690,31 +3558,46 @@ export function createGameEngine(opts: EngineOptions) {
             serverStartTime = Date.now() + (ev.data.startTimer ?? 5) * 1000;
             startTimerValue = ev.data.startTimer ?? 5;
             pushCountdown();
-            console.log('[ENGINE] start-countdown received; serverStartTime set to', serverStartTime);
+            console.log(
+              "[ENGINE] start-countdown received; serverStartTime set to",
+              serverStartTime,
+            );
           }
           break;
         }
-        case 'player-shot': {
+        case "player-shot": {
           // Remote player fired a weapon — show muzzle flash effect
           const shooter = players[ev.data.id];
           if (shooter && ev.data.id !== localPlayerId) {
-            // Flash the muzzle light
-            if (shooter.muzzleFlash) {
-              shooter.muzzleFlash.intensity = 3;
-              setTimeout(() => {
-                if (shooter.muzzleFlash) shooter.muzzleFlash.intensity = 0;
-              }, 50);
+            // Flash the shared remote muzzle light at the shooter's gun
+            const remoteLight = flashLights[1];
+            if (remoteLight) {
+              const sp = shooter.mesh.position;
+              const az = shooter.targetAzimuth;
+              const flashForward = 0.4 + 0.5;
+              remoteLight.position.set(
+                sp.x + Math.cos(az) * 0.25 + Math.sin(az) * flashForward,
+                sp.y + PLAYER_RADIUS + 0.35,
+                sp.z + Math.sin(az) * 0.25 - Math.cos(az) * flashForward,
+              );
+              remoteLight.intensity = 3;
+              flashUntil[1] = performance.now() + 50;
             }
             // Create a small tracer/particle effect
-            const origin = new THREE.Vector3(ev.data.origin.x, ev.data.origin.y, ev.data.origin.z);
-            createParticleEffect(origin, 0xffaa00, 3);
+            spawnParticles(
+              ev.data.origin.x,
+              ev.data.origin.y,
+              ev.data.origin.z,
+              0xffaa00,
+              3,
+            );
           }
           break;
         }
-        case 'error':
+        case "error":
           callbacks.onError(ev.message);
           break;
-        case 'close':
+        case "close":
           if (!disconnected) {
             disconnected = true;
             callbacks.onConnectionLost();
@@ -2729,7 +3612,7 @@ export function createGameEngine(opts: EngineOptions) {
 
   // ---------- Game start logic ----------
   function start() {
-    if (mode === 'single') {
+    if (mode === "single") {
       // Generate the island for single-player mode.
       const islandTiles = generateIsland(islandSize, islandSeed);
       for (const t of islandTiles) createTile({ x: t.x, y: t.y, z: t.z }, t.id);
@@ -2737,11 +3620,11 @@ export function createGameEngine(opts: EngineOptions) {
       // moving the ball over them, not granted randomly.
       spawnPowerupPickups();
       const spawn = getIslandSpawn(islandTiles);
-      createSphere('local', spawn, true);
+      createSphere("local", spawn, true);
       serverStartTime = Date.now() + 5 * 1000;
       startTimerValue = 5;
       pushCountdown();
-    } else if (isHost && mode === 'lan') {
+    } else if (isHost && mode === "lan") {
       // LAN host: generate the island, wait for guests, count down.
       // The seed + size are sent to guests in the init message so they
       // regenerate the exact same island.
@@ -2775,12 +3658,16 @@ export function createGameEngine(opts: EngineOptions) {
     // WebRTCNetGuest catches the race, but we ALSO re-send `new-player` here
     // to be defensive — the host's new-player handler always responds with a
     // fresh `init`, so the guest will get one. (The host side is idempotent.)
-    if (mode !== 'single' && !isHost && netClient) {
+    if (mode !== "single" && !isHost && netClient) {
       try {
         netClient.send({
-          kind: 'new-player',
+          kind: "new-player",
           id: localPlayerId,
-          position: { x: (Math.random() - 0.5) * 6, y: 5, z: (Math.random() - 0.5) * 6 },
+          position: {
+            x: (Math.random() - 0.5) * 6,
+            y: 5,
+            z: (Math.random() - 0.5) * 6,
+          },
         });
       } catch {
         /* ignore — the data channel might not be open yet */
@@ -2790,7 +3677,58 @@ export function createGameEngine(opts: EngineOptions) {
     animationFrameId = requestAnimationFrame(loop);
   }
 
+  // ---------- Adaptive resolution ----------
+  // Low-end phones are fill-rate bound, so the cheapest way to hold a smooth
+  // frame rate is to render fewer pixels. Every ~0.5 s we look at the
+  // measured FPS: if it's struggling we step the pixel ratio down, and if
+  // there's plenty of headroom we step it back up (never past the quality cap).
+  let dprCooldown = 6; // seconds before the next change (warm-up: shader compile + texture upload dip)
+  let dprGoodStreak = 0; // consecutive healthy windows
+  let dprFpsBeforeDrop = 0; // fps measured right before the last reduction
+  let dprAdaptLockedUntil = 0;
+
+  function applyDpr(v: number) {
+    currentDpr = v;
+    renderer.setPixelRatio(v);
+  }
+
+  function adaptResolution(fps: number, nowSec: number) {
+    if (nowSec < dprAdaptLockedUntil || document.hidden) return;
+    dprCooldown -= 0.5;
+    if (dprCooldown > 0) return;
+    if (fps < 42 && currentDpr > profile.minDpr + 0.01) {
+      // Stuck at the same low FPS even after a reduction (e.g. a 30 Hz
+      // power-saver display)? Undo it and stop trying for a while.
+      if (
+        dprFpsBeforeDrop > 0 &&
+        fps - dprFpsBeforeDrop < 3 &&
+        currentDpr <
+          Math.min(window.devicePixelRatio || 1, profile.maxDpr) - 0.01
+      ) {
+        applyDpr(Math.min(currentDpr + 0.15, profile.maxDpr));
+        dprAdaptLockedUntil = nowSec + 30;
+        dprFpsBeforeDrop = 0;
+        return;
+      }
+      dprFpsBeforeDrop = fps;
+      applyDpr(Math.max(profile.minDpr, currentDpr - 0.15));
+      dprCooldown = 1.5;
+      dprGoodStreak = 0;
+    } else if (fps > 57) {
+      dprGoodStreak++;
+      const cap = Math.min(window.devicePixelRatio || 1, profile.maxDpr);
+      if (dprGoodStreak >= 8 && currentDpr < cap - 0.01) {
+        applyDpr(Math.min(cap, currentDpr + 0.1));
+        dprGoodStreak = 0;
+        dprCooldown = 3;
+      }
+    } else {
+      dprGoodStreak = 0;
+    }
+  }
+
   // ---------- Main loop ----------
+  let pausedFrameDrawn = false;
   let lastSecondMarker = 0;
   function loop() {
     animationFrameId = requestAnimationFrame(loop);
@@ -2808,11 +3746,17 @@ export function createGameEngine(opts: EngineOptions) {
       fpsSmoothed = fpsSmoothed * 0.6 + realFps * 0.4;
       fpsAccum = 0;
       fpsFrames = 0;
+      if (!isPaused) adaptResolution(realFps, now);
     }
 
     if (isPaused) {
-      renderer.render(scene, camera);
-      css2dRenderer.render(scene, camera);
+      // Nothing in the scene moves while paused, so draw ONE frame and then
+      // idle instead of re-rendering the same image 60 times a second.
+      if (!pausedFrameDrawn) {
+        renderer.render(scene, camera);
+        renderLabels();
+        pausedFrameDrawn = true;
+      }
       return;
     }
 
@@ -2845,7 +3789,7 @@ export function createGameEngine(opts: EngineOptions) {
       tweenGroup.update(now * 1000);
       updateCamera(realDt);
       renderer.render(scene, camera);
-      css2dRenderer.render(scene, camera);
+      renderLabels();
       return;
     }
 
@@ -2873,7 +3817,7 @@ export function createGameEngine(opts: EngineOptions) {
     tweenGroup.update(now * 1000);
 
     // Per-second survival score
-    const nowSec = Math.floor(now * 1000 / 1000);
+    const nowSec = Math.floor((now * 1000) / 1000);
     if (lastSecondMarker === 0) lastSecondMarker = nowSec;
     if (nowSec > lastSecondMarker) {
       lastSecondMarker = nowSec;
@@ -2887,17 +3831,26 @@ export function createGameEngine(opts: EngineOptions) {
 
     // Send our movement to peers (skipped after the game has ended — see the
     // gameEnded early-return above).
-    if (mode !== 'single' && netClient && ballRigidBody && !isPaused) {
+    if (mode !== "single" && netClient && ballRigidBody && !isPaused) {
       const t = now * 1000;
       if (t - lastSendTime >= SEND_INTERVAL) {
         try {
           const p = ballRigidBody.translation();
           const r = ballRigidBody.rotation();
           netClient.send({
-            kind: 'move',
+            kind: "move",
             id: localPlayerId,
-            position: { x: +p.x.toFixed(2), y: +p.y.toFixed(2), z: +p.z.toFixed(2) },
-            rotation: { x: +r.x.toFixed(2), y: +r.y.toFixed(2), z: +r.z.toFixed(2), w: +r.w.toFixed(2) },
+            position: {
+              x: +p.x.toFixed(2),
+              y: +p.y.toFixed(2),
+              z: +p.z.toFixed(2),
+            },
+            rotation: {
+              x: +r.x.toFixed(2),
+              y: +r.y.toFixed(2),
+              z: +r.z.toFixed(2),
+              w: +r.w.toFixed(2),
+            },
             cameraAzimuth: +cameraAzimuth.toFixed(2),
           });
           lastSendTime = t;
@@ -2914,7 +3867,9 @@ export function createGameEngine(opts: EngineOptions) {
       // still isn't enabled, force it. This handles edge cases where the
       // countdown callback might not fire properly after a restart.
       if (elapsed > startTimerValue * 1000 + 10000 && !physicsEnabled) {
-        console.warn('[ENGINE] Countdown failsafe triggered — forcing physics enable');
+        console.warn(
+          "[ENGINE] Countdown failsafe triggered — forcing physics enable",
+        );
         enablePhysics();
         serverStartTime = null;
         callbacks.onCountdown(null);
@@ -2939,7 +3894,7 @@ export function createGameEngine(opts: EngineOptions) {
       renderer.autoClear = true;
     }
     // Render CSS2D labels
-    css2dRenderer.render(scene, camera);
+    renderLabels();
   }
 
   function stepPhysics(dt: number) {
@@ -2977,7 +3932,7 @@ export function createGameEngine(opts: EngineOptions) {
     try {
       world.step(eventQueue);
     } catch (e) {
-      console.error('world.step failed', e);
+      console.error("world.step failed", e);
     }
 
     // Collision events
@@ -2997,11 +3952,19 @@ export function createGameEngine(opts: EngineOptions) {
           const dz = op.mesh.position.z - myPos.z;
           const dist = Math.sqrt(dx * dx + dz * dz) || 0.01;
           const pushForce = 5.0;
-          const impulse = { x: (dx / dist) * pushForce, y: 2.0, z: (dz / dist) * pushForce };
-          if (netClient && mode !== 'single') {
-            netClient.send({ kind: 'player-hit', targetId: otherId, impulse });
-          } else if (op.rigidBody && mode === 'single') {
-            try { op.rigidBody.applyImpulse(impulse, true); } catch { /* ignore */ }
+          const impulse = {
+            x: (dx / dist) * pushForce,
+            y: 2.0,
+            z: (dz / dist) * pushForce,
+          };
+          if (netClient && mode !== "single") {
+            netClient.send({ kind: "player-hit", targetId: otherId, impulse });
+          } else if (op.rigidBody && mode === "single") {
+            try {
+              op.rigidBody.applyImpulse(impulse, true);
+            } catch {
+              /* ignore */
+            }
           }
         }
       }
@@ -3016,10 +3979,10 @@ export function createGameEngine(opts: EngineOptions) {
         if (lp) {
           lp.mesh.position.set(p.x, p.y, p.z);
           lp.mesh.quaternion.set(r.x, r.y, r.z, r.w);
-          // Also update scene-level children (weaponGroup, nameLabel, muzzleFlash)
+          // Also update scene-level children (weaponGroup, nameLabel)
           // that are not children of the mesh. Even though they're hidden in
-          // first-person, the muzzle flash needs to be near the player to
-          // illuminate nearby surfaces.
+          // first-person, the muzzle flash light needs to be near the player
+          // to illuminate nearby surfaces.
           const weaponHeight = PLAYER_RADIUS + 0.35;
           const weaponForwardDist = 0.4;
           const weaponSideDist = 0.25;
@@ -3038,9 +4001,10 @@ export function createGameEngine(opts: EngineOptions) {
           if (lp.nameLabel) {
             lp.nameLabel.position.set(p.x, p.y + PLAYER_RADIUS + 0.6, p.z);
           }
-          if (lp.muzzleFlash) {
+          const localFlash = flashLights[0];
+          if (localFlash) {
             const flashFwd = weaponForwardDist + 0.5;
-            lp.muzzleFlash.position.set(
+            localFlash.position.set(
               p.x + rgtX * weaponSideDist + fwdX * flashFwd,
               p.y + weaponHeight,
               p.z + rgtZ * weaponSideDist + fwdZ * flashFwd,
@@ -3048,7 +4012,8 @@ export function createGameEngine(opts: EngineOptions) {
           }
         }
         // Death check
-        if (p.y < DEATH_Y_LEVEL && !lp?.eliminated) eliminatePlayer(localPlayerId);
+        if (p.y < DEATH_Y_LEVEL && !lp?.eliminated)
+          eliminatePlayer(localPlayerId);
       } catch {
         /* ignore — body may have been removed during eliminatePlayer */
       }
@@ -3062,7 +4027,7 @@ export function createGameEngine(opts: EngineOptions) {
     // still falls but takes no HP loss from hard landings.)
     try {
       const pos = ballRigidBody.translation();
-      if (pos.y < -5 && !hasPowerUp('invincibility')) {
+      if (pos.y < -5 && !hasPowerUp("invincibility")) {
         const v = ballRigidBody.linvel();
         if (v.y < -10) updateHealth(-5);
       }
@@ -3098,13 +4063,25 @@ export function createGameEngine(opts: EngineOptions) {
               lastImpactTime = now;
               const bp = ballRigidBody.translation();
               // speedFactor: 1× at 10 m/s, up to 3× at 30+ m/s.
-              const speedFactor = Math.min(IMPACT_SPEED_MAX_FACTOR, maxFallSpeed / IMPACT_SPEED_REFERENCE);
-              const damage = BASE_TILE_DAMAGE * settings.islandDamageMultiplier * speedFactor;
-              const radius = IMPACT_RADIUS_BASE + speedFactor * IMPACT_RADIUS_SCALE;
+              const speedFactor = Math.min(
+                IMPACT_SPEED_MAX_FACTOR,
+                maxFallSpeed / IMPACT_SPEED_REFERENCE,
+              );
+              const damage =
+                BASE_TILE_DAMAGE *
+                settings.islandDamageMultiplier *
+                speedFactor;
+              const radius =
+                IMPACT_RADIUS_BASE + speedFactor * IMPACT_RADIUS_SCALE;
               // sourcePeer = null means "this is the local player's impact —
               // broadcast to peers". Remote impacts pass a non-null sourcePeer
               // so we don't re-broadcast.
-              damageTilesAt(new THREE.Vector3(bp.x, bp.y, bp.z), radius, damage, null);
+              damageTilesAt(
+                _tmpVec.set(bp.x, bp.y, bp.z),
+                radius,
+                damage,
+                null,
+              );
               playSound(collisionSound, 0.3 + speedFactor * 0.15);
             }
           }
@@ -3135,14 +4112,24 @@ export function createGameEngine(opts: EngineOptions) {
   }
 
   function updateRemoteKinematics() {
-    for (const [id, p] of Object.entries(players)) {
+    for (const id in players) {
+      const p = players[id];
       if (id === localPlayerId || p.eliminated) continue;
       if (p.rigidBody && p.rigidBody.isKinematic()) {
         const pos = p.mesh.position;
         const q = p.mesh.quaternion;
         try {
-          p.rigidBody.setNextKinematicTranslation({ x: pos.x, y: pos.y, z: pos.z });
-          p.rigidBody.setNextKinematicRotation({ x: q.x, y: q.y, z: q.z, w: q.w });
+          p.rigidBody.setNextKinematicTranslation({
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
+          });
+          p.rigidBody.setNextKinematicRotation({
+            x: q.x,
+            y: q.y,
+            z: q.z,
+            w: q.w,
+          });
         } catch {
           /* ignore */
         }
@@ -3169,11 +4156,21 @@ export function createGameEngine(opts: EngineOptions) {
    * the elimination if it's authoritative).
    */
   function interpolateRemotePlayers() {
-    for (const [id, p] of Object.entries(players)) {
+    for (const id in players) {
+      const p = players[id];
       if (id === localPlayerId || p.eliminated) continue;
-      const tp = new THREE.Vector3(p.targetPosition.x, p.targetPosition.y, p.targetPosition.z);
+      const tp = _tmpVec.set(
+        p.targetPosition.x,
+        p.targetPosition.y,
+        p.targetPosition.z,
+      );
       p.mesh.position.lerp(tp, 0.2);
-      const tq = new THREE.Quaternion(p.targetRotation.x, p.targetRotation.y, p.targetRotation.z, p.targetRotation.w);
+      const tq = _tmpQuat.set(
+        p.targetRotation.x,
+        p.targetRotation.y,
+        p.targetRotation.z,
+        p.targetRotation.w,
+      );
       p.mesh.quaternion.slerp(tq, 0.2);
 
       // Position the weapon group, name label, and muzzle flash in world space.
@@ -3215,19 +4212,15 @@ export function createGameEngine(opts: EngineOptions) {
         p.weaponGroup.rotation.set(0, -az, 0);
       }
       if (p.nameLabel) {
-        p.nameLabel.position.set(ballPos.x, ballPos.y + PLAYER_RADIUS + 0.6, ballPos.z);
-      }
-      if (p.muzzleFlash) {
-        const flashForward = weaponForwardDist + 0.5;
-        p.muzzleFlash.position.set(
-          ballPos.x + rightX * weaponSideDist + forwardX * flashForward,
-          ballPos.y + weaponHeight,
-          ballPos.z + rightZ * weaponSideDist + forwardZ * flashForward,
+        p.nameLabel.position.set(
+          ballPos.x,
+          ballPos.y + PLAYER_RADIUS + 0.6,
+          ballPos.z,
         );
       }
       if (tp.y < DEATH_Y_LEVEL && !p.eliminated) {
         // Remote player fell — host will broadcast, but as a fallback we eliminate locally too.
-        if (isHost || mode === 'single') eliminatePlayer(id);
+        if (isHost || mode === "single") eliminatePlayer(id);
       }
     }
   }
@@ -3239,7 +4232,11 @@ export function createGameEngine(opts: EngineOptions) {
       const alive = Object.values(players).filter((p) => !p.eliminated);
       // If our current spectate target is dead, gone, or unset, auto-pick
       // the first alive player.
-      if (!spectateTargetId || !players[spectateTargetId] || players[spectateTargetId].eliminated) {
+      if (
+        !spectateTargetId ||
+        !players[spectateTargetId] ||
+        players[spectateTargetId].eliminated
+      ) {
         spectateTargetId = alive[0]?.id ?? null;
       }
       targetId = spectateTargetId;
@@ -3266,11 +4263,13 @@ export function createGameEngine(opts: EngineOptions) {
       camera.lookAt(tp.x, tp.y + 0.5, tp.z);
 
       // Show the spectated player
+      visibleLabelCount = 1;
       const spectatedPlayer = players[targetId];
       if (spectatedPlayer) {
         spectatedPlayer.mesh.visible = true;
         if (spectatedPlayer.nameLabel) spectatedPlayer.nameLabel.visible = true;
-        if (spectatedPlayer.weaponGroup) spectatedPlayer.weaponGroup.visible = true;
+        if (spectatedPlayer.weaponGroup)
+          spectatedPlayer.weaponGroup.visible = true;
       }
     } else {
       // First-person camera — no positional smoothing needed because the
@@ -3287,7 +4286,10 @@ export function createGameEngine(opts: EngineOptions) {
       lookDeltaY = 0;
 
       // Clamp pitch
-      cameraPitch = Math.max(-Math.PI / 2.2, Math.min(Math.PI / 2.2, cameraPitch));
+      cameraPitch = Math.max(
+        -Math.PI / 2.2,
+        Math.min(Math.PI / 2.2, cameraPitch),
+      );
 
       // Snap camera directly to ball eye position — no lerp/smoothing.
       // The ball's physics already provide smooth motion; adding a lerp
@@ -3297,12 +4299,12 @@ export function createGameEngine(opts: EngineOptions) {
 
       // Look direction based on azimuth + pitch
       // Positive azimuth = look right, so look target shifts +X with sin(az)
-      const lookTarget = new THREE.Vector3(
+      _lookTarget.set(
         camera.position.x + Math.sin(cameraAzimuth) * Math.cos(cameraPitch),
         camera.position.y + Math.sin(cameraPitch),
         camera.position.z - Math.cos(cameraAzimuth) * Math.cos(cameraPitch),
       );
-      camera.lookAt(lookTarget);
+      camera.lookAt(_lookTarget);
 
       // Hide local player mesh in first-person (don't see your own sphere)
       const localPlayer = players[localPlayerId];
@@ -3313,15 +4315,33 @@ export function createGameEngine(opts: EngineOptions) {
       }
 
       // Show remote player meshes and name labels
-      for (const [id, p] of Object.entries(players)) {
+      let labels = 0;
+      for (const id in players) {
+        const p = players[id];
         if (id !== localPlayerId && !p.eliminated) {
           p.mesh.visible = true;
-          if (p.nameLabel) p.nameLabel.visible = true;
+          if (p.nameLabel) {
+            p.nameLabel.visible = true;
+            labels++;
+          }
           if (p.weaponGroup) p.weaponGroup.visible = true;
         }
       }
+      visibleLabelCount = labels;
     }
     void dt;
+  }
+
+  /** How many name labels are currently shown. CSS2DRenderer walks the whole
+   *  scene and touches the DOM every frame, so it's skipped when this is 0
+   *  (e.g. solo play). */
+  let visibleLabelCount = 0;
+  let labelsWereVisible = false;
+  function renderLabels() {
+    if (visibleLabelCount > 0 || labelsWereVisible) {
+      css2dRenderer.render(scene, camera);
+      labelsWereVisible = visibleLabelCount > 0;
+    }
   }
 
   // ---------- Public API ----------
@@ -3341,8 +4361,13 @@ export function createGameEngine(opts: EngineOptions) {
   }
   function setPaused(p: boolean) {
     isPaused = p;
+    pausedFrameDrawn = false;
     if (ballRigidBody) {
-      try { ballRigidBody.setEnabled(p ? false : physicsEnabled); } catch { /* ignore */ }
+      try {
+        ballRigidBody.setEnabled(p ? false : physicsEnabled);
+      } catch {
+        /* ignore */
+      }
     }
   }
   function switchSpectator() {
@@ -3361,15 +4386,23 @@ export function createGameEngine(opts: EngineOptions) {
       spectateTargetId = next.id;
       // Don't instantly teleport the camera — updateCamera() will smoothly
       // glide to the new target. This avoids the jarring jump of the old code.
-      console.log('[ENGINE] Spectate target switched to:', next.id.slice(0, 8));
+      console.log("[ENGINE] Spectate target switched to:", next.id.slice(0, 8));
     }
   }
   function updateSettings(s: Settings) {
     settings = s;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+    if (s.graphicsQuality !== profile.name) {
+      profile = getQualityProfile(s.graphicsQuality);
+      // Re-seed the adaptive resolution from the new cap; it will walk back
+      // down by itself if the device can't sustain it.
+      applyDpr(Math.min(window.devicePixelRatio || 1, profile.maxDpr));
+      dprCooldown = 6;
+      dprFpsBeforeDrop = 0;
+    }
     // Shadows remain disabled for FPS optimization
   }
   function resize() {
+    pausedFrameDrawn = false;
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -3377,7 +4410,9 @@ export function createGameEngine(opts: EngineOptions) {
     fpsWeaponCamera.aspect = window.innerWidth / window.innerHeight;
     fpsWeaponCamera.updateProjectionMatrix();
   }
-  function getFps() { return Math.round(fpsSmoothed); }
+  function getFps() {
+    return Math.round(fpsSmoothed);
+  }
 
   /**
    * Tear down all per-match state: tiles, players, powerup pickups, particles,
@@ -3400,33 +4435,66 @@ export function createGameEngine(opts: EngineOptions) {
       gameStartedFallbackTimer = null;
     }
 
-    // Remove all particles.
-    for (const p of particles) {
-      try { scene.remove(p.mesh); } catch { /* ignore */ }
-      try { (p.mesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
-      try { p.mesh.geometry.dispose(); } catch { /* ignore */ }
-    }
+    // Return all live particles to the pool.
+    for (const p of particles) releaseParticle(p);
     particles.length = 0;
+
+    // Muzzle-flash lights off.
+    for (const l of flashLights) l.intensity = 0;
 
     // Remove all powerup pickups (mesh + halo + disposals).
     for (const pickup of powerupPickups) {
-      try { scene.remove(pickup.mesh); } catch { /* ignore */ }
-      try { scene.remove(pickup.haloMesh); } catch { /* ignore */ }
-      try { (pickup.mesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
-      try { (pickup.haloMesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
-      try { pickup.mesh.geometry.dispose(); } catch { /* ignore */ }
-      try { pickup.haloMesh.geometry.dispose(); } catch { /* ignore */ }
+      try {
+        scene.remove(pickup.mesh);
+      } catch {
+        /* ignore */
+      }
+      try {
+        scene.remove(pickup.haloMesh);
+      } catch {
+        /* ignore */
+      }
+      try {
+        (pickup.mesh.material as THREE.Material).dispose();
+      } catch {
+        /* ignore */
+      }
+      try {
+        (pickup.haloMesh.material as THREE.Material).dispose();
+      } catch {
+        /* ignore */
+      }
+      try {
+        pickup.mesh.geometry.dispose();
+      } catch {
+        /* ignore */
+      }
+      try {
+        pickup.haloMesh.geometry.dispose();
+      } catch {
+        /* ignore */
+      }
     }
     powerupPickups.length = 0;
     powerupPickupsById.clear();
 
-    // Remove all tile meshes from the scene (no need to remove rigid bodies
-    // individually — we recreate the entire physics World below).
-    // Don't dispose the shared geometries (groundTileGeo, wallTileGeo) —
-    // they're reused across rounds.
-    for (const tile of tiles) {
-      try { scene.remove(tile.mesh); } catch { /* ignore */ }
-      try { (tile.mesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
+    // Drop in-flight break animations. Letting them finish would run their
+    // onComplete against the NEW world / tile map (removing a recycled rigid
+    // body handle or deleting a new tile that reuses the same id).
+    tweenGroup.removeAll();
+    for (const f of fadingTiles) {
+      scene.remove(f.mesh);
+      f.mat.dispose();
+    }
+    fadingTiles.clear();
+
+    // Empty the instanced tile batches (no need to remove rigid bodies
+    // individually — we recreate the entire physics World below). The shared
+    // geometries / material / batches are reused across rounds.
+    for (const batch of [groundBatch, wallBatch]) {
+      for (const t of batch.tiles) t.instanceIndex = -1;
+      batch.tiles.length = 0;
+      batch.mesh.count = 0;
     }
     tiles.length = 0;
     tilesById.clear();
@@ -3434,28 +4502,33 @@ export function createGameEngine(opts: EngineOptions) {
     // Remove all player meshes, weapon groups, name labels, and muzzle flashes from the scene.
     for (const id of Object.keys(players)) {
       const p = players[id];
-      try { scene.remove(p.mesh); } catch { /* ignore */ }
-      try { (p.mesh.material as THREE.Material).dispose(); } catch { /* ignore */ }
-      try { p.mesh.geometry.dispose(); } catch { /* ignore */ }
-      // weaponGroup, nameLabel, and muzzleFlash are direct children of the scene
-      // (not the mesh), so we must remove them separately.
+      try {
+        scene.remove(p.mesh);
+      } catch {
+        /* ignore */
+      }
+      try {
+        (p.mesh.material as THREE.Material).dispose();
+      } catch {
+        /* ignore */
+      }
+      // (sphere geometry is shared by all players — not disposed)
+      // weaponGroup and nameLabel are direct children of the scene (not the
+      // mesh), so we must remove them separately. The weapon meshes share
+      // cached geometry/materials, so they are NOT disposed here.
       if (p.weaponGroup) {
-        try { scene.remove(p.weaponGroup); } catch { /* ignore */ }
-        // Dispose weapon mesh children
-        p.weaponGroup.traverse((child) => {
-          if ((child as any).geometry) try { (child as any).geometry.dispose(); } catch { /* ignore */ }
-          if ((child as any).material) {
-            const mat = (child as any).material;
-            if (Array.isArray(mat)) mat.forEach((m: THREE.Material) => { try { m.dispose(); } catch { /* ignore */ } });
-            else try { mat.dispose(); } catch { /* ignore */ }
-          }
-        });
+        try {
+          scene.remove(p.weaponGroup);
+        } catch {
+          /* ignore */
+        }
       }
       if (p.nameLabel) {
-        try { scene.remove(p.nameLabel); } catch { /* ignore */ }
-      }
-      if (p.muzzleFlash) {
-        try { scene.remove(p.muzzleFlash); } catch { /* ignore */ }
+        try {
+          scene.remove(p.nameLabel);
+        } catch {
+          /* ignore */
+        }
       }
       delete players[id];
     }
@@ -3496,16 +4569,26 @@ export function createGameEngine(opts: EngineOptions) {
     maxFallSpeed = 0;
     lastImpactTime = 0;
     physicsAccumulator = 0;
-    keys.w = false; keys.a = false; keys.s = false; keys.d = false; keys.space = false;
+    keys.w = false;
+    keys.a = false;
+    keys.s = false;
+    keys.d = false;
+    keys.space = false;
     joystickX = 0;
     joystickY = 0;
 
     // Reset weapon state
-    currentWeapon = 'ak47';
+    currentWeapon = "ak47";
     ammo = WEAPONS.ak47.maxAmmo;
     reserveAmmo = WEAPONS.ak47.reserveAmmo;
-    weaponAmmoState.ak47 = { ammo: WEAPONS.ak47.maxAmmo, reserveAmmo: WEAPONS.ak47.reserveAmmo };
-    weaponAmmoState.desert_eagle = { ammo: WEAPONS.desert_eagle.maxAmmo, reserveAmmo: WEAPONS.desert_eagle.reserveAmmo };
+    weaponAmmoState.ak47 = {
+      ammo: WEAPONS.ak47.maxAmmo,
+      reserveAmmo: WEAPONS.ak47.reserveAmmo,
+    };
+    weaponAmmoState.desert_eagle = {
+      ammo: WEAPONS.desert_eagle.maxAmmo,
+      reserveAmmo: WEAPONS.desert_eagle.reserveAmmo,
+    };
     isReloading = false;
     isFiring = false;
     isSwitchingWeapon = false;
@@ -3518,12 +4601,16 @@ export function createGameEngine(opts: EngineOptions) {
     muzzleFlashTimer = 0;
     cameraPitch = -0.3;
     lookDeltaY = 0;
-    setFpsWeapon('ak47');
+    setFpsWeapon("ak47");
     playerHealth = 100;
 
     // Notify the UI to clear its end-game / spectating / pause / countdown
     // state. The new match will re-push all of these as it starts.
-    try { callbacks.onReset?.(); } catch { /* ignore */ }
+    try {
+      callbacks.onReset?.();
+    } catch {
+      /* ignore */
+    }
     callbacks.onSpectatingChange(false);
     callbacks.onCountdown(null);
     pushHud();
@@ -3547,22 +4634,28 @@ export function createGameEngine(opts: EngineOptions) {
    */
   function restart(): boolean {
     // Only the host (or single-player) can initiate a restart.
-    if (mode === 'lan' && !isHost) {
-      console.warn('[ENGINE] restart() called on a LAN guest — only the host can restart. Ignoring.');
+    if (mode === "lan" && !isHost) {
+      console.warn(
+        "[ENGINE] restart() called on a LAN guest — only the host can restart. Ignoring.",
+      );
       return false;
     }
-    if (mode === 'server') {
-      console.warn('[ENGINE] restart() not supported in server mode (server is authoritative).');
+    if (mode === "server") {
+      console.warn(
+        "[ENGINE] restart() not supported in server mode (server is authoritative).",
+      );
       return false;
     }
 
-    console.log('[ENGINE] restart() — tearing down match state and starting a new round.');
+    console.log(
+      "[ENGINE] restart() — tearing down match state and starting a new round.",
+    );
 
     // Capture connected peer IDs BEFORE resetGameState clears the players map.
     // On restart, ALL players spawn at the same point (the island center),
     // regardless of where they died in the previous round.
     const peerIds: string[] = [];
-    if (mode === 'lan' && isHost) {
+    if (mode === "lan" && isHost) {
       for (const id of Object.keys(players)) {
         if (id !== localPlayerId) peerIds.push(id);
       }
@@ -3573,12 +4666,12 @@ export function createGameEngine(opts: EngineOptions) {
     // Generate a brand-new island seed so the new match has a different layout.
     islandSeed = Math.floor(Math.random() * 1e9);
 
-    if (mode === 'single') {
+    if (mode === "single") {
       const islandTiles = generateIsland(islandSize, islandSeed);
       for (const t of islandTiles) createTile({ x: t.x, y: t.y, z: t.z }, t.id);
       spawnPowerupPickups();
       const spawn = getIslandSpawn(islandTiles);
-      createSphere('local', spawn, true);
+      createSphere("local", spawn, true);
       // Immediately position the camera at the new spawn point so the player
       // doesn't see the old death position during the countdown.
       camera.position.set(spawn.x, spawn.y + PLAYER_HEIGHT * 0.4, spawn.z);
@@ -3587,7 +4680,7 @@ export function createGameEngine(opts: EngineOptions) {
       serverStartTime = Date.now() + 5 * 1000;
       startTimerValue = 5;
       pushCountdown();
-    } else if (mode === 'lan' && isHost) {
+    } else if (mode === "lan" && isHost) {
       const islandTiles = generateIsland(islandSize, islandSeed);
       for (const t of islandTiles) createTile({ x: t.x, y: t.y, z: t.z }, t.id);
       spawnPowerupPickups();
@@ -3602,7 +4695,11 @@ export function createGameEngine(opts: EngineOptions) {
         createSphere(pid, pspawn, pid === localPlayerId);
       }
       const hostSpawn = spawns[0];
-      camera.position.set(hostSpawn.x, hostSpawn.y + PLAYER_HEIGHT * 0.4, hostSpawn.z);
+      camera.position.set(
+        hostSpawn.x,
+        hostSpawn.y + PLAYER_HEIGHT * 0.4,
+        hostSpawn.z,
+      );
       cameraAzimuth = 0;
       cameraPitch = -0.3;
       serverStartTime = Date.now() + startTimerValue * 1000;
@@ -3610,10 +4707,13 @@ export function createGameEngine(opts: EngineOptions) {
       if (netClient) {
         try {
           // Send each player their own spawn position (distributed, not overlapping)
-          const allPlayers = allPlayerIds.map((id, i) => ({ id, position: spawns[i] }));
+          const allPlayers = allPlayerIds.map((id, i) => ({
+            id,
+            position: spawns[i],
+          }));
           netClient.send({
-            kind: 'init',
-            gameId: 'lan',
+            kind: "init",
+            gameId: "lan",
             creatorId: localPlayerId,
             players: allPlayers,
             islandSeed,
@@ -3622,7 +4722,7 @@ export function createGameEngine(opts: EngineOptions) {
             serverStartTime: serverStartTime,
           });
         } catch (e) {
-          console.warn('[ENGINE] Failed to broadcast init on restart:', e);
+          console.warn("[ENGINE] Failed to broadcast init on restart:", e);
         }
       }
     }
@@ -3641,22 +4741,55 @@ export function createGameEngine(opts: EngineOptions) {
     // created engine (e.g. on restart) doesn't have its events double-handled
     // by this disposed engine's listener.
     if (netClient && engineNetListener) {
-      try { netClient.offMessage(engineNetListener); } catch { /* ignore */ }
+      try {
+        netClient.offMessage(engineNetListener);
+      } catch {
+        /* ignore */
+      }
       engineNetListener = null;
     }
-    try { renderer.dispose(); } catch { /* ignore */ }
     // NOTE: We deliberately do NOT close the net client here. The Game
     // component owns the net client and may reuse it across StrictMode
     // remounts. The Game component's own cleanup effect closes the client
     // on real unmount.
-    // Drop all meshes / materials
-    scene.traverse((obj) => {
-      const mesh = obj as THREE.Mesh;
-      if (mesh.geometry) mesh.geometry.dispose();
-      const mat = mesh.material as THREE.Material | THREE.Material[] | undefined;
-      if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
-      else if (mat) mat.dispose();
-    });
+    // Drop all meshes / materials (+ the FPS-weapon scene, which the old
+    // code never freed)
+    const disposeTree = (root: THREE.Object3D) => {
+      root.traverse((obj) => {
+        const mesh = obj as THREE.Mesh;
+        if (mesh.geometry) mesh.geometry.dispose();
+        const mat = mesh.material as
+          | THREE.Material
+          | THREE.Material[]
+          | undefined;
+        if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+        else if (mat) mat.dispose();
+      });
+    };
+    disposeTree(scene);
+    disposeTree(fpsWeaponScene);
+    for (const key of Object.keys(remoteWeaponTemplates))
+      disposeTree(remoteWeaponTemplates[key as WeaponType]!);
+    for (const key of Object.keys(fpsWeaponModels))
+      disposeTree(fpsWeaponModels[key as WeaponType]!.mesh);
+    playerSphereGeo.dispose();
+    particleGeo.dispose();
+    shellGeo.dispose();
+    shellMat.dispose();
+    tileMaterial.dispose();
+    texture.dispose();
+    try {
+      renderer.dispose();
+    } catch {
+      /* ignore */
+    }
+    // Free the GL context right away: mobile browsers cap live contexts and
+    // are slow to garbage-collect them after navigating menu <-> game.
+    try {
+      renderer.forceContextLoss();
+    } catch {
+      /* ignore */
+    }
     // Remove canvas from DOM
     const el = renderer.domElement;
     if (el.parentNode) el.parentNode.removeChild(el);
@@ -3667,7 +4800,9 @@ export function createGameEngine(opts: EngineOptions) {
     setInput,
     setJoystick,
     addLookDelta,
-    addLookDeltaY: (dy: number) => { lookDeltaY += dy; },
+    addLookDeltaY: (dy: number) => {
+      lookDeltaY += dy;
+    },
     jump,
     setPaused,
     switchSpectator,
@@ -3683,7 +4818,9 @@ export function createGameEngine(opts: EngineOptions) {
     // Weapon API
     switchWeapon,
     startReload,
-    setFiring: (v: boolean) => { isFiring = v; },
+    setFiring: (v: boolean) => {
+      isFiring = v;
+    },
     getCurrentWeapon: () => currentWeapon,
   };
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, useCallback } from 'react';
+import { lazy, Suspense, useEffect, useState, useRef, useCallback } from 'react';
 import { useSettings } from './store/settings';
 import { t, applyHtmlLang, type TranslationKey } from './i18n/translations';
 
@@ -6,12 +6,22 @@ import MainMenu from './components/MainMenu';
 import GameModeModal from './components/GameModeModal';
 import SettingsModal from './components/SettingsModal';
 import AboutModal from './components/AboutModal';
-import CreateGameModal from './components/CreateGameModal';
-import JoinServerModal from './components/JoinServerModal';
-import LanModal from './components/LanModal';
-import LanCodeModal from './components/LanCodeModal';
-import Game from './components/Game';
 import Toast from './components/Toast';
+
+// Heavy screens are code-split so the menu paints after parsing only a small
+// entry bundle (three.js + Rapier + networking libs are the bulk of the app).
+// They are warmed in the background once the menu is up — see below — which
+// also lets the service worker cache them for fully-offline play.
+const loadGame = () => import('./components/Game');
+const loadCreateGame = () => import('./components/CreateGameModal');
+const loadJoinServer = () => import('./components/JoinServerModal');
+const loadLan = () => import('./components/LanModal');
+const loadLanCode = () => import('./components/LanCodeModal');
+const Game = lazy(loadGame);
+const CreateGameModal = lazy(loadCreateGame);
+const JoinServerModal = lazy(loadJoinServer);
+const LanModal = lazy(loadLan);
+const LanCodeModal = lazy(loadLanCode);
 
 type Screen =
   | { kind: 'menu' }
@@ -38,6 +48,29 @@ export default function App() {
     applyHtmlLang(lang);
   }, [lang]);
 
+  // Once the menu is on screen and the browser is idle, fetch the lazy
+  // chunks so entering a game / LAN lobby is instant and works offline.
+  useEffect(() => {
+    const warm = () => {
+      void loadGame();
+      void loadLanCode();
+      void loadLan();
+      void loadJoinServer();
+      void loadCreateGame();
+      void import('./networking/socket');
+    };
+    const w = window as unknown as {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      cancelIdleCallback?: (h: number) => void;
+    };
+    if (w.requestIdleCallback) {
+      const h = w.requestIdleCallback(warm, { timeout: 5000 });
+      return () => w.cancelIdleCallback?.(h);
+    }
+    const h = window.setTimeout(warm, 3000);
+    return () => window.clearTimeout(h);
+  }, []);
+
   const showToast = useCallback((msg: string) => {
     setToast(msg);
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
@@ -45,7 +78,8 @@ export default function App() {
   }, []);
 
   return (
-    <div className="app">
+    <div className={screen.kind === 'game' ? 'app in-game' : 'app'}>
+      <Suspense fallback={null}>
       {screen.kind === 'menu' && (
         <MainMenu
           onStart={() => setScreen({ kind: 'mode' })}
@@ -107,6 +141,8 @@ export default function App() {
           onError={(m) => showToast(m)}
         />
       )}
+
+      </Suspense>
 
       {toast && <Toast message={toast} />}
     </div>
