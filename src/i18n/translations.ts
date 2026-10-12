@@ -139,6 +139,7 @@ export type TranslationKey =
   | 'lanBadCode'
   | 'lanRoomNotFound'
   | 'lanBrokerError'
+  | 'lanHostUnreachable'
   | 'lanOfflineMode'
   | 'lanOfflineBack';
 
@@ -282,6 +283,7 @@ const en: Dict = {
   lanBadCode: 'Room codes are 5 letters/numbers.',
   lanRoomNotFound: 'No game found with that code. Check it and try again.',
   lanBrokerError: 'Could not reach the matchmaking service. Check your internet, or use offline mode.',
+  lanHostUnreachable: 'Found the room but could not connect to the host. Make sure the host is still in the lobby and try again.',
   lanOfflineMode: 'No internet? Offline / hotspot mode (advanced)',
   lanOfflineBack: 'Back to code mode',
 };
@@ -424,6 +426,7 @@ const fa: Dict = {
   lanBadCode: 'کد اتاق ۵ حرف/عدد است.',
   lanRoomNotFound: 'بازی‌ای با این کد پیدا نشد. کد را بررسی کنید و دوباره تلاش کنید.',
   lanBrokerError: 'اتصال به سرویس بازی برقرار نشد. اینترنت را بررسی کنید یا از حالت آفلاین استفاده کنید.',
+  lanHostUnreachable: 'اتاق پیدا شد اما اتصال به میزبان برقرار نشد. مطمئن شوید میزبان هنوز در لابی است و دوباره تلاش کنید.',
   lanOfflineMode: 'اینترنت ندارید؟ حالت آفلاین / هات‌اسپات (پیشرفته)',
   lanOfflineBack: 'بازگشت به حالت کد',
 };

@@ -55,6 +55,7 @@ export default function LanCodeModal({ onCancel, onStart, onOffline }: Props) {
   const describeError = (e: unknown): string => {
     if (e instanceof PeerSetupError) {
       if (e.kind === 'not-found') return t('lanRoomNotFound', lang);
+      if (e.kind === 'host-unreachable') return t('lanHostUnreachable', lang);
       if (e.kind === 'broker' || e.kind === 'timeout') return t('lanBrokerError', lang);
       return e.message;
     }

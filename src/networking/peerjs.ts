@@ -26,7 +26,32 @@ export const ROOM_CODE_LENGTH = 5;
 const PEER_PREFIX = 'bounceroyale-';
 const MAX_CODE_ATTEMPTS = 6;
 const CONNECT_TIMEOUT_MS = 15000;
+const HOST_CONNECT_TIMEOUT_MS = 25000;
 const MAX_BUFFERED_EVENTS = 200;
+
+/**
+ * ICE servers for host and guest. The PeerJS default is a single Google STUN
+ * server, which fails when either side is behind a strict NAT. Extra STUN plus
+ * a public TURN relay let the data channel open in those cases.
+ */
+const PEER_OPTIONS = {
+  config: {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+      {
+        urls: [
+          'turn:openrelay.metered.ca:80',
+          'turn:openrelay.metered.ca:443',
+          'turns:openrelay.metered.ca:443?transport=tcp',
+        ],
+        username: 'openrelayproject',
+        credential: 'openrelayproject',
+      },
+    ],
+  },
+};
 
 export function generateRoomCode(): string {
   const bytes = new Uint8Array(ROOM_CODE_LENGTH);
@@ -54,7 +79,7 @@ const randomSuffix = (len: number) => Math.random().toString(36).slice(2, 2 + le
 
 /** Error type thrown by host/guest setup, with a stable `kind` the UI can map to a message. */
 export class PeerSetupError extends Error {
-  constructor(public kind: 'not-found' | 'broker' | 'timeout' | 'unknown', message: string) {
+  constructor(public kind: 'not-found' | 'broker' | 'timeout' | 'host-unreachable' | 'unknown', message: string) {
     super(message);
   }
 }
@@ -150,7 +175,7 @@ export class PeerNetHost implements NetClient {
 
   private register(code: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      const peer = new Peer(PEER_PREFIX + code);
+      const peer = new Peer(PEER_PREFIX + code, PEER_OPTIONS);
       let settled = false;
       const timer = window.setTimeout(() => {
         if (settled) return;
@@ -370,12 +395,13 @@ export class PeerNetGuest implements NetClient {
         this.peer = null;
         reject(e);
       };
-      const timer = window.setTimeout(
-        () => fail(new PeerSetupError('timeout', 'Could not reach the host. Check the code and that you have internet.')),
+      // Phase 1: reach the broker. Phase 2 (after `open`): open the data channel to the host.
+      let timer = window.setTimeout(
+        () => fail(new PeerSetupError('timeout', 'Matchmaking service did not respond. Check your internet connection.')),
         CONNECT_TIMEOUT_MS,
       );
 
-      const peer = new Peer(PEER_PREFIX + this.id);
+      const peer = new Peer(PEER_PREFIX + this.id, PEER_OPTIONS);
       this.peer = peer;
 
       peer.on('error', (err: any) => {
@@ -384,6 +410,11 @@ export class PeerNetGuest implements NetClient {
       });
 
       peer.on('open', () => {
+        window.clearTimeout(timer);
+        timer = window.setTimeout(
+          () => fail(new PeerSetupError('host-unreachable', 'Found the room but could not open a connection to the host.')),
+          HOST_CONNECT_TIMEOUT_MS,
+        );
         const conn = peer.connect(PEER_PREFIX + code, { serialization: 'json', reliable: false });
         this.conn = conn;
         conn.on('open', () => {

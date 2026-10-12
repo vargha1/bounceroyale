@@ -7,6 +7,7 @@ dist/
 !.env.example
 .vscode/
 .idea/
+.playwright-mcp/
 *.tsbuildinfo
 branch_structure.json
 temp_auto_push.bat
